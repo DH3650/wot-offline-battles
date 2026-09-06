@@ -9,3 +9,8 @@ src/res/scripts/client/gui/mods/offline_lan_0922/world_collision.py -whitespace
 # Navigation manifests hash the exact LF-normalized JSON payload.  Prevent a
 # Windows checkout from rewriting the final newline before PyInstaller embeds it.
 navgraphs/*.json -text
+
+# The foliage and destructibles manifests hash the exact LF payloads the same
+# way; a CRLF conversion on checkout breaks the build-time checksum audit.
+foliage/*.json -text
+destructibles/*.json -text
