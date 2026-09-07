@@ -3566,7 +3566,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertTrue(lookups)
         self.assertEqual({filename}, set(lookups))
 
-    def test_typed_native_trees_are_transparent_without_skipping_wall(self):
+    def test_typed_native_felled_trees_are_transparent_without_wall(self):
         filenames = (
             'speedtree/45_North_America/Maple.spt',
             'speedtree/45_North_America/Oak.spt')
@@ -3613,18 +3613,11 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         for shell_kind in (
                 'ARMOR_PIERCING', 'ARMOR_PIERCING_CR',
                 'ARMOR_PIERCING_HE', 'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE'):
-            destroyed = set()
             calls = []
-
-            def destroy_tree(*args):
-                calls.append(args)
-                destroyed.add(args[2])
-                return True
-
             authority = types.SimpleNamespace(
-                is_destroyed=lambda unused_chunk, item, unused_mat=None: (
-                    item in destroyed),
-                destroy_tree=destroy_tree)
+                is_destroyed=lambda unused_chunk, unused_item,
+                unused_mat=None: True,
+                destroy_tree=lambda *args: calls.append(args) or True)
             shot = types.SimpleNamespace(shell=types.SimpleNamespace(
                 kind=shell_kind))
             with mock.patch.dict(
@@ -3640,15 +3633,126 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     bigworld, 1, _Vector(), _Vector(0, 0, 20),
                     _Vector(0, 0, 1), shot)
 
+            # Both trees were already felled this round, so no shell family
+            # pays for their residual skin and the wall behind them still
+            # owns the stop.
             for result in (first, repeated):
                 self.assertAlmostEqual(5.1, result['stop_distance'])
                 self.assertIsNone(result['continue_from'])
                 self.assertEqual(0.0, result['piercing_loss'])
                 self.assertFalse(result['stopped_by_destructible'])
-            self.assertEqual(2, len(calls), shell_kind)
-            self.assertEqual(
-                {(1, 22, 1), (1, 22, 2)},
-                {call[:3] for call in calls})
+            self.assertEqual([], calls, shell_kind)
+
+    def _standing_tree_shot(self, tree_health, item_scale, shell_kind):
+        """Fire one shell at a single standing #1513 SpeedTree."""
+        filename = 'speedtree/45_North_America/Maple.spt'
+        tree_point = _Vector(0.0, 0.0, 5.0)
+        wall = _Vector(0.0, 0.0, 9.0)
+        matrix_queries = []
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        bigworld = types.ModuleType('BigWorld')
+
+        def collide(unused_space, unused_start, unused_end, unused_mask,
+                    collision_filter=None):
+            if (collision_filter is None or
+                    collision_filter(71, 0, 1, 22)):
+                return tree_point, _Vector(0.0, 0.0, -1.0)
+            return wall, _Vector(0.0, 0.0, -1.0)
+
+        bigworld.wg_collideSegment = collide
+
+        def material(unused_space, unused_start, unused_stop, point,
+                     unused_callback):
+            if abs(float(point.z) - 5.0) <= 0.01:
+                return _mat_info_1513(
+                    True, point, _Vector(0, 1, 0), 71, filename, 22, 1)
+            return _mat_info_1513(
+                True, point, _Vector(0, 1, 0), 5, '', 0, 0)
+
+        bigworld.wg_getMatInfoNearPoint = material
+
+        def item_matrix(space_id, chunk_id, item_index):
+            matrix_queries.append((space_id, chunk_id, item_index))
+            return _ItemMatrix(scale=item_scale)
+
+        bigworld.wg_getDestructibleMatrix = item_matrix
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = _Manager()
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda value: (
+                {'type': 1, 'health': tree_health}
+                if value == filename else None))
+        cache = types.ModuleType('DestructiblesCache')
+        cache.scaledDestructibleHealth = lambda scale, health: int(
+            math.ceil(scale * scale * health))
+        destructibles_sensor.set_event_sink(lambda unused: True)
+        felled = []
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False,
+            destroy_tree=lambda *args: felled.append(args) or True)
+        shot = types.SimpleNamespace(shell=types.SimpleNamespace(
+            kind=shell_kind))
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld,
+                              'AreaDestructibles': area,
+                              'DestructiblesCache': cache,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = destructibles_sensor.shot_world_distance(
+                bigworld, 1, _Vector(), _Vector(0, 0, 20),
+                _Vector(0, 0, 1), shot)
+        return result, felled, matrix_queries
+
+    def test_standing_tree_below_the_threshold_costs_25mm_and_passes(self):
+        result, felled, queries = self._standing_tree_shot(
+            18, 1.0, 'ARMOR_PIERCING')
+        self.assertEqual(1, len(felled))
+        self.assertEqual((1, 22, 1), felled[0][:3])
+        self.assertEqual([(1, 22, 1)], queries)
+        self.assertIsNone(result['stop_distance'])
+        self.assertEqual(25.0, result['piercing_loss'])
+        self.assertAlmostEqual(5.0, result['loss_distance'])
+        # Trees have no catalog OBB, so the proved next surface is the exit.
+        self.assertLess(result['continue_from'], 9.0)
+        self.assertGreater(result['continue_from'], 8.99)
+
+    def test_standing_tree_above_the_threshold_falls_and_stops_the_shell(self):
+        result, felled, unused_queries = self._standing_tree_shot(
+            20, 1.0, 'ARMOR_PIERCING')
+        self.assertEqual(1, len(felled))
+        self.assertAlmostEqual(5.0, result['stop_distance'])
+        self.assertIsNone(result['continue_from'])
+        self.assertEqual(0.0, result['piercing_loss'])
+        self.assertTrue(result['stopped_by_destructible'])
+        self.assertEqual('above_threshold_hp', result['stop_reason'])
+
+    def test_tree_threshold_uses_the_native_scaled_health(self):
+        """ceil(1.2 * 1.2 * 18) = 26 exceeds maxHpForShootingThrough."""
+        result, felled, queries = self._standing_tree_shot(
+            18, 1.2, 'ARMOR_PIERCING')
+        self.assertEqual([(1, 22, 1)], queries)
+        self.assertEqual(1, len(felled))
+        self.assertAlmostEqual(5.0, result['stop_distance'])
+        self.assertEqual('above_threshold_hp', result['stop_reason'])
+
+    def test_he_and_heat_stop_at_a_tree_without_a_matrix_query(self):
+        for shell_kind in ('HIGH_EXPLOSIVE', 'HOLLOW_CHARGE'):
+            result, felled, queries = self._standing_tree_shot(
+                18, 1.0, shell_kind)
+            self.assertEqual(1, len(felled), shell_kind)
+            self.assertAlmostEqual(5.0, result['stop_distance'], msg=shell_kind)
+            self.assertTrue(result['stopped_by_destructible'], shell_kind)
+            self.assertEqual('shell_family', result['stop_reason'])
+            # The family gate is decided before any native scale is read.
+            self.assertEqual([], queries, shell_kind)
 
     def test_catalog_obstacle_stops_before_native_trees_are_destroyed(self):
         destructibles_sensor.xrange = range
@@ -3833,6 +3937,198 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 self.assertIsNone(result['continue_from'])
                 self.assertEqual(0.0, result['piercing_loss'])
                 self.assertTrue(result['stopped_by_destructible'])
+                self.assertEqual('shell_family', result['stop_reason'])
+
+    def _falling_pole_shot_fixture(self, boxes):
+        """Register one exact #1513 falling atom with a live catalog OBB."""
+        filename = (
+            'content/Environment/envAM_009_Poles/normal/lod0/'
+            'envAM_009_Poles_01.model')
+        destructibles_sensor.xrange = range
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {'kind': 'falling', 'boxes': boxes},
+        }))
+        record = destructibles_sensor._destructible_catalog[
+            'resources'][filename.lower()]
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        instance = {
+            'filename': filename.lower(),
+            'descriptor_filename': filename,
+            'kind': 'falling',
+            'item_scale': 1.0,
+            'boxes': destructibles_sensor._world_catalog_boxes(
+                record, _ItemMatrix(), _Vector(), math_module),
+        }
+        destructibles_sensor.g_offh_destr_instances = {(22, 1): instance}
+        destructibles_sensor.g_offh_destr_contact_bins = {}
+        destructibles_sensor._index_catalog_instance_1513(
+            destructibles_sensor.g_offh_destr_contact_bins,
+            (22, 1), instance)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = object()
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda value: (
+                {'type': 2, 'health': 18} if value == filename else None))
+        cache = types.ModuleType('DestructiblesCache')
+        cache.scaledDestructibleHealth = lambda scale, health: int(
+            math.ceil(scale * scale * health))
+        return filename, math_module, area, cache
+
+    @staticmethod
+    def _filtered_world_ray(surfaces):
+        """Reproduce the #1513 filtered ``wg_collideSegment`` contract.
+
+        ``surfaces`` are ``(distance, chunk, item, material)`` in ray order.
+        The optional fifth argument is the engine's keep-callback, which is
+        invoked with ``(matKind, collFlags, itemIndex, chunkID)``.
+        """
+        def collide(space_id, start, end, flags, keep=None):
+            for distance, chunk, item, material in surfaces:
+                if keep is not None and not keep(material, 0, item, chunk):
+                    continue
+                return (_Vector(0.0, 0.0, distance),
+                        _Vector(0.0, 0.0, -1.0))
+            return None
+        return collide
+
+    def test_broken_falling_atom_skin_no_longer_stops_a_later_shell(self):
+        """A felled pole keeps its native skin; retail stops colliding with it."""
+        filename, math_module, area, cache = self._falling_pole_shot_fixture(
+            [[-0.5, -1.0, 4.0, 0.5, 2.0, 6.0, None]])
+        surfaces = ((4.0, 22, 1, 72), (9.0, 0, 0, 5))
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_collideSegment = self._filtered_world_ray(surfaces)
+        bigworld.time = lambda: 10.0
+
+        def material(space_id, start, near, point, unused_filter):
+            if abs(float(point.z) - 4.0) <= 0.01:
+                return _mat_info_1513(
+                    True, point, _Vector(0, 1, 0), 72, filename, 22, 1)
+            return _mat_info_1513(
+                True, point, _Vector(0, 1, 0), 5, '', 0, 0)
+
+        bigworld.wg_getMatInfoNearPoint = material
+        destructibles_sensor.set_event_sink(lambda unused: True)
+        orders = []
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda chunk, item, mat=None: (
+                (chunk, item) == (22, 1)),
+            destroy_column=lambda *args: orders.append(args) or True)
+        shot = types.SimpleNamespace(shell=types.SimpleNamespace(
+            kind='ARMOR_PIERCING'))
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld,
+                              'AreaDestructibles': area,
+                              'DestructiblesCache': cache,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = destructibles_sensor.shot_world_distance(
+                bigworld, 1, _Vector(), _Vector(0, 0, 20),
+                _Vector(0, 0, 1), shot)
+
+        # The wall behind the debris owns the stop, and the removed pole
+        # neither charges penetration nor is destroyed a second time.
+        self.assertEqual([], orders)
+        self.assertAlmostEqual(9.0, result['stop_distance'])
+        self.assertEqual(0.0, result['piercing_loss'])
+        self.assertFalse(result['stopped_by_destructible'])
+
+    def test_destroyed_item_without_exact_exit_still_passes_the_shell(self):
+        """An admitted shot may not end on an item it has just removed."""
+        filename, math_module, area, cache = self._falling_pole_shot_fixture(
+            [[-0.5, -1.0, 12.0, 0.5, 2.0, 14.0, None]])
+        surfaces = ((4.0, 22, 1, 72), (9.0, 0, 0, 5))
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_collideSegment = self._filtered_world_ray(surfaces)
+        bigworld.time = lambda: 10.0
+
+        def material(space_id, start, near, point, unused_filter):
+            if abs(float(point.z) - 4.0) <= 0.01:
+                return _mat_info_1513(
+                    True, point, _Vector(0, 1, 0), 72, filename, 22, 1)
+            return _mat_info_1513(
+                True, point, _Vector(0, 1, 0), 5, '', 0, 0)
+
+        bigworld.wg_getMatInfoNearPoint = material
+        destructibles_sensor.set_event_sink(lambda unused: True)
+        destroyed = set()
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda chunk, item, mat=None: (
+                (chunk, item) in destroyed),
+            destroy_column=lambda space, chunk, item, yaw, vel, hit: (
+                destroyed.add((chunk, item)) or True))
+        shot = types.SimpleNamespace(shell=types.SimpleNamespace(
+            kind='ARMOR_PIERCING'))
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld,
+                              'AreaDestructibles': area,
+                              'DestructiblesCache': cache,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = destructibles_sensor.shot_world_distance(
+                bigworld, 1, _Vector(), _Vector(0, 0, 20),
+                _Vector(0, 0, 1), shot)
+
+        # The registered OBB does not cover this contact, so no exact exit
+        # exists.  The proved next surface owns the resume distance instead.
+        self.assertEqual({(22, 1)}, destroyed)
+        self.assertIsNone(result['stop_distance'])
+        self.assertEqual(25.0, result['piercing_loss'])
+        self.assertAlmostEqual(4.0, result['loss_distance'])
+        self.assertLess(result['continue_from'], 9.0)
+        self.assertGreater(result['continue_from'], 8.99)
+
+    def test_broken_skin_resume_preserves_catalog_only_obstacles(self):
+        """A native clear interval does not prove a catalog-only prop absent."""
+        self._falling_pole_shot_fixture(
+            [[-0.5, -1.0, 6.0, 0.5, 2.0, 7.0, None]])
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda chunk, item, mat=None: item == 99)
+        for wall_distance, expected_next in ((9.0, 6.0), (None, 6.0),
+                                             (5.0, 5.0)):
+            with self.subTest(wall=wall_distance):
+                surfaces = [(4.0, 22, 99, 71)]
+                if wall_distance is not None:
+                    surfaces.append((wall_distance, 0, 0, 5))
+                bigworld = types.SimpleNamespace(
+                    wg_collideSegment=self._filtered_world_ray(surfaces))
+                ignored = set()
+                keep = destructibles_sensor._transparent_shot_surface_filter_1513(
+                    ignored)
+                with mock.patch.object(destructibles_sensor,
+                                       '_get_destr_authority',
+                                       return_value=authority):
+                    advance = destructibles_sensor._shot_broken_surface_advance_1513(
+                        lambda stage, fn, *args: fn(*args), bigworld, 1,
+                        _Vector(), _Vector(0, 0, 20), (22, 99, None),
+                        4.0, ignored, keep)
+                self.assertGreater(advance, expected_next - 0.01)
+                self.assertLess(advance, expected_next)
+
+    def test_broken_surface_filter_hides_only_the_accepted_material(self):
+        """A broken module may not make its intact siblings transparent."""
+        item_wide = destructibles_sensor._transparent_shot_surface_filter_1513(
+            {(22, 1, None)})
+        self.assertFalse(item_wide(73, 0, 1, 22))
+        self.assertFalse(item_wide(74, 0, 1, 22))
+        self.assertTrue(item_wide(73, 0, 2, 22))
+        module_only = \
+            destructibles_sensor._transparent_shot_surface_filter_1513(
+                {(22, 1, 73)})
+        self.assertFalse(module_only(73, 0, 1, 22))
+        self.assertTrue(module_only(74, 0, 1, 22))
+        # A malformed native tuple never hides a surface.
+        self.assertTrue(module_only('x', 0, 1, 22))
+        self.assertTrue(module_only(73, 0))
 
     def test_unknown_shell_kind_and_missing_descriptor_stop_fail_closed(self):
         self.assertIsNone(destructibles_sensor._shot_kind_1513(
@@ -4474,6 +4770,96 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertIn('chunk=22 item=0', writes[0])
         self.assertIn('native=-1 wire=live_validated', writes[0])
         self.assertIn('repeats=suppressed_for_battle', writes[0])
+
+    def test_shot_query_work_does_not_grow_with_distant_registered_props(self):
+        destructibles_sensor.xrange = range
+        axes = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        authority = types.SimpleNamespace(is_destroyed=lambda *unused: False)
+        for distant_count in (0, 64, 1079):
+            with self.subTest(distant_count=distant_count):
+                centers = [(0.0, 0.0, 5.0)] + [
+                    (1000.0 + index * 8.0, 0.0, 1000.0)
+                    for index in range(distant_count)]
+                instances = {
+                    (22, index): {
+                        'filename': 'test.model', 'kind': 'fragile',
+                        'item_scale': 1.0, 'boxes': ((center, axes, None),),
+                    } for index, center in enumerate(centers)}
+                destructibles_sensor.g_offh_destr_instances = instances
+                bins = destructibles_sensor.g_offh_destr_contact_bins = {}
+                for identity, instance in instances.items():
+                    destructibles_sensor._index_catalog_instance_1513(
+                        bins, identity, instance)
+                with mock.patch.object(
+                        destructibles_sensor, '_get_destr_authority',
+                        return_value=authority), mock.patch.object(
+                        destructibles_sensor, '_segment_world_box_interval',
+                        wraps=destructibles_sensor._segment_world_box_interval
+                        ) as intersections:
+                    hit = destructibles_sensor._catalog_shot_intersection(
+                        1, _Vector(), _Vector(0.0, 0.0, 20.0))
+                self.assertEqual((22, 0), hit['candidate'][:2])
+                self.assertAlmostEqual(4.0, hit['distance'])
+                self.assertEqual(1, intersections.call_count)
+
+    def test_shot_query_keeps_live_modules_at_bin_edges_and_native_cap(self):
+        destructibles_sensor.xrange = range
+        axes = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        instance = {
+            'filename': 'test.model', 'kind': 'structure', 'item_scale': 1.0,
+            'boxes': (((8.0, 0.0, 40.0), axes, 73),
+                      ((8.0, 0.0, 20.0), axes, 74)),
+        }
+        destructibles_sensor.g_offh_destr_instances = {(22, 1): instance}
+        bins = destructibles_sensor.g_offh_destr_contact_bins = {}
+        destructibles_sensor._index_catalog_instance_1513(
+            bins, (22, 1), instance)
+        destroyed = set()
+        authority = types.SimpleNamespace(is_destroyed=lambda *key: (
+            key in destroyed))
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            # Reverse travel on an exact cell edge must include the module
+            # touching the native endpoint, but nothing behind that endpoint.
+            start, end = _Vector(8.0, 0.0, 60.0), _Vector(8.0, 0.0, 0.0)
+            self.assertIsNone(destructibles_sensor._catalog_shot_intersection(
+                1, start, end, 18.0))
+            hit = destructibles_sensor._catalog_shot_intersection(
+                1, start, end, 19.0)
+            self.assertEqual((22, 1, 73), hit['candidate'][:3])
+            self.assertAlmostEqual(19.0, hit['distance'])
+            destroyed.add((22, 1, 73))
+            self.assertIsNone(destructibles_sensor._catalog_shot_intersection(
+                1, start, end, 19.0))
+            hit = destructibles_sensor._catalog_shot_intersection(
+                1, start, end)
+            self.assertEqual((22, 1, 74), hit['candidate'][:3])
+            self.assertAlmostEqual(39.0, hit['distance'])
+            destructibles_sensor._drop_isolated_destructible_1513(22, 1)
+            self.assertIsNone(destructibles_sensor._catalog_shot_intersection(
+                1, start, end))
+
+    def test_shot_query_native_cap_tolerance_crosses_a_spatial_bin_edge(self):
+        destructibles_sensor.xrange = range
+        instance = {
+            'filename': 'test.model', 'kind': 'fragile', 'item_scale': 1.0,
+            'boxes': (((0.0, 0.0, 9.0),
+                       ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+                        (0.0, 0.0, 1.0)), None),),
+        }
+        destructibles_sensor.g_offh_destr_instances = {(22, 1): instance}
+        bins = destructibles_sensor.g_offh_destr_contact_bins = {}
+        destructibles_sensor._index_catalog_instance_1513(
+            bins, (22, 1), instance)
+        authority = types.SimpleNamespace(is_destroyed=lambda *unused: False)
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            hit = destructibles_sensor._catalog_shot_intersection(
+                1, _Vector(), _Vector(0.0, 0.0, 20.0), 8.0 - 0.5e-6)
+        self.assertEqual((22, 1), hit['candidate'][:2])
+        self.assertAlmostEqual(8.0, hit['distance'])
 
     def test_handlerless_effect_category_reaches_shot_intersection(self):
         unused_filename, area, bigworld, math_module = (

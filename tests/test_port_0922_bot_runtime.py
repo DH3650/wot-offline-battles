@@ -9,6 +9,8 @@ import sys
 import types
 import unittest
 
+import bot_state_rows
+
 ROOT = Path(__file__).resolve().parents[1]
 PORT_ROOT = ROOT
 sys.path.insert(0, str(PORT_ROOT / 'server'))
@@ -483,21 +485,54 @@ class ServerBotStateRevisionTests(unittest.TestCase):
             'battle_result': copy.deepcopy(server.battle_result),
         }
 
+    def test_lost_lineage_sections_are_republished_on_a_cadence(self):
+        # Every lineage section is recorded as delivered when it is written to
+        # the socket. Without a periodic republication one frame a replica
+        # could not consume cost it that section for the whole round.
+        from lan_battle_server import (
+            BOT_MANIFEST_REFRESH_TICKS, LEAN_SNAPSHOT_MANIFEST_CAPABILITY)
+
+        server, unused_manifest_bot, unused_socket = self._server()
+        player = server.players[1]
+        player.capabilities = (LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(self._publication(server, 1.0))))
+
+        def sent_snapshots():
+            return [json.loads(payload.decode('utf-8'))
+                    for payload in player.conn.payloads
+                    if json.loads(
+                        payload.decode('utf-8')).get('type') == 'snapshot']
+
+        server.tick_once(1.0 / 30.0)
+        self.assertIn('bot_manifest', sent_snapshots()[-1])
+
+        before = len(sent_snapshots())
+        for unused in range(4):
+            server.tick_once(1.0 / 30.0)
+        self.assertGreater(len(sent_snapshots()), before)
+        self.assertNotIn('bot_manifest', sent_snapshots()[-1])
+
+        server.tick += BOT_MANIFEST_REFRESH_TICKS
+        server.tick_once(1.0 / 30.0)
+        self.assertIn('bot_manifest', sent_snapshots()[-1])
+
     def test_revision_survives_player_departure_and_resets(self):
         server, manifest_bot, authority_socket = self._server()
         self.assertEqual(0, server.bot_state_revision)
 
         self.assertFalse(server.update_bot_states(
-            2, self._publication(server, 1.0)))
+            2, bot_state_rows.publication(self._publication(server, 1.0))))
         self.assertEqual(0, server.bot_state_revision)
         self.assertFalse(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, {
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication({
                 'round_id': server.round_id, 'bots': [],
-            }))
+            })))
         self.assertEqual(0, server.bot_state_revision)
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID,
-            self._publication(server, 1.0)))
+            bot_state_rows.publication(self._publication(server, 1.0))))
         self.assertEqual(1, server.bot_state_revision)
 
         server.tick_once(1.0 / 30.0)
@@ -514,7 +549,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(1, server.bot_state_revision)
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID,
-            self._publication(server, 2.0)))
+            bot_state_rows.publication(self._publication(server, 2.0))))
         self.assertEqual(2, server.bot_state_revision)
 
         server._reset_round()
@@ -551,7 +586,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         publication['bots'][0]['equipment_states'] = [
             equipment.snapshot(0.0) for equipment in restored]
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, publication),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(publication)),
             server.last_bot_state_reject)
 
         takeover = server.current_battle_message()
@@ -560,14 +595,21 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertAlmostEqual(90.0, persisted[1]['cooldownTimeLeft'])
         self.assertAlmostEqual(78.0, persisted[2]['cooldownTimeLeft'])
 
+        # A Bot never gains a consumable use. The publication still lands so
+        # the room keeps moving, but this Bot holds its admitted inventory.
+        admitted = copy.deepcopy(server.bot_states[11]['equipment_states'])
         invalid = self._publication(server, 2.0)
         invalid['bots'][0]['equipment_states'] = json.loads(json.dumps(
             invalid['bots'][0]['equipment_states']))
         invalid['bots'][0]['equipment_states'][1]['usesLeft'] = 2
-        self.assertFalse(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, invalid))
-        self.assertEqual('combat_contract',
-                         server.last_bot_state_reject_code)
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(invalid)))
+        self.assertEqual(2.0, server.bot_states[11]['x'])
+        self.assertEqual(
+            [snapshot['usesLeft'] for snapshot in admitted],
+            [snapshot['usesLeft']
+             for snapshot in server.bot_states[11]['equipment_states']])
 
     def test_bot_large_medkit_clears_stun_once_and_survives_takeover(self):
         module = _load()
@@ -593,7 +635,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         publication['bots'][0]['combat_seq'] = (
             server.bot_states[11]['combat_ack_seq'] + 1)
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, publication),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(publication)),
             server.last_bot_state_reject)
         self.assertEqual(0, server.bot_states[11][
             'stun_end_server_time_ms'])
@@ -606,7 +648,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         repeated = self._publication(server, 2.0)
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, repeated),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(repeated)),
             server.last_bot_state_reject)
         clear_events = [event for event in server.pending_events
                         if event.get('kind') == 'stun' and
@@ -625,7 +667,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         self.assertEqual(1, server._expire_stuns(stun_end))
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, delayed),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(delayed)),
             server.last_bot_state_reject)
         self.assertEqual(0, server.bot_states[11][
             'stun_end_server_time_ms'])
@@ -641,7 +683,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertTrue(server._set_canonical_stun(
             ('player', 2), ('bot', 11), second_end))
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, delayed),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(delayed)),
             server.last_bot_state_reject)
         self.assertEqual(second_end, server.bot_states[11][
             'stun_end_server_time_ms'])
@@ -656,7 +698,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.065
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID,
-            self._publication(server, 1.0)))
+            bot_state_rows.publication(self._publication(server, 1.0))))
         self.assertEqual(65000, server.bot_state_time_us)
         self.assertIsNone(server.bot_source_time_us)
 
@@ -681,7 +723,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         first['sample_time_us'] = 40000
         first['source_batch_horizon_us'] = 40000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, first))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(first)))
         first_mapped_time = server.bot_state_time_us
         self.assertEqual(65000, first_mapped_time)
 
@@ -692,7 +734,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         delayed['sample_time_us'] = 80000
         delayed['source_batch_horizon_us'] = 80000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, delayed))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(delayed)))
         self.assertEqual(first_mapped_time + 40000,
                          server.bot_state_time_us)
 
@@ -703,7 +745,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         fast['sample_time_us'] = 120000
         fast['source_batch_horizon_us'] = 120000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, fast))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(fast)))
         self.assertEqual(first_mapped_time + 80000,
                          server.bot_state_time_us)
 
@@ -720,13 +762,13 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         repeated['sample_time_us'] = 120000
         repeated['source_batch_horizon_us'] = 120000
         self.assertFalse(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, repeated))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(repeated)))
         self.assertEqual('sample_time_order',
                          server.last_bot_state_reject_code)
 
         self.assertFalse(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID,
-            self._publication(server, 1.6)))
+            bot_state_rows.publication(self._publication(server, 1.6))))
         self.assertEqual('sample_time_missing',
                          server.last_bot_state_reject_code)
 
@@ -748,7 +790,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         slow['sample_time_us'] = 40000
         slow['source_batch_horizon_us'] = 40000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, slow))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(slow)))
         self.assertEqual(200000, server.bot_state_time_us)
         self.assertEqual(0, server.motion_time_offset_us)
 
@@ -759,7 +801,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         fast['sample_time_us'] = 140000
         fast['source_batch_horizon_us'] = 140000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, fast))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(fast)))
         self.assertEqual(300000, server.bot_state_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
@@ -778,7 +820,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         steady['sample_time_us'] = 180000
         steady['source_batch_horizon_us'] = 180000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, steady))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(steady)))
         self.assertEqual(340000, server.bot_state_time_us)
         server.tick_once(1.0 / 30.0)
         snapshots = [
@@ -806,7 +848,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         skipped['sample_time_us'] = 420000
         skipped['source_batch_horizon_us'] = 420000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, skipped))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(skipped)))
         self.assertEqual(580000, server.bot_state_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
@@ -821,7 +863,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         oversized['sample_time_us'] = 1000000
         oversized['source_batch_horizon_us'] = 1000000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, oversized))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(oversized)))
         self.assertEqual('', server.last_bot_state_reject_code)
         self.assertEqual(590000, server.bot_state_time_us)
         self.assertEqual(1000000, server.bot_source_time_us)
@@ -840,7 +882,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         recovered['sample_time_us'] = 1040000
         recovered['source_batch_horizon_us'] = 1040000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, recovered))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(recovered)))
         self.assertEqual(630000, server.bot_state_time_us)
         self.assertEqual(1040000, server.bot_source_time_us)
         self.assertEqual(530000, server.bot_source_receipt_time_us)
@@ -870,33 +912,21 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         baseline['sample_time_us'] = 40000
         baseline['source_batch_horizon_us'] = 40000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, baseline))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(baseline)))
         committed = self._canonical_bot_commit_snapshot(server)
 
+        # Only a failure of the message itself can cost the whole batch. A
+        # per-Bot contract failure is contained by the next test, because
+        # rejecting the batch would freeze every Bot in the room.
         malformed = []
 
         empty_batch = self._publication(server, 1.0)
         empty_batch['bots'] = []
         malformed.append(('batch_shape', empty_batch))
 
-        bad_row = self._publication(server, 1.0)
-        bad_row['bots'][0].pop('x')
-        malformed.append(('bot_shape', bad_row))
-
         bad_ram = self._publication(server, 1.0)
         bad_ram['human_ram_armors'] = [{}]
         malformed.append(('human_ram_armors', bad_ram))
-
-        bad_combat = self._publication(server, 1.0)
-        bad_combat['bots'][0]['combat_seq'] = (
-            bad_combat['bots'][0]['combat_ack_seq'] + 2)
-        malformed.append(('combat_contract', bad_combat))
-
-        bad_ammo = self._publication(server, 1.0)
-        bad_ammo['bots'][0]['ammo_remaining'] = list(
-            bad_ammo['bots'][0]['ammo_remaining'])
-        bad_ammo['bots'][0]['ammo_remaining'][0] += 1
-        malformed.append(('ammo_contract', bad_ammo))
 
         for index, (reject_code, publication) in enumerate(malformed):
             now[0] = 100.210 + index * 0.005
@@ -904,11 +934,23 @@ class ServerBotStateRevisionTests(unittest.TestCase):
             publication['source_batch_horizon_us'] = (
                 publication['sample_time_us'])
             self.assertFalse(server.update_bot_states(
-                SIMULATION_WORKER_AUTHORITY_ID, publication))
+                SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(publication)))
             self.assertEqual(reject_code, server.last_bot_state_reject_code)
             self.assertEqual(
                 committed, self._canonical_bot_commit_snapshot(server),
                 reject_code)
+
+        truncated = self._publication(server, 1.0)
+        truncated['sample_time_us'] = 1030000
+        truncated['source_batch_horizon_us'] = 1030000
+        truncated = bot_state_rows.publication(truncated)
+        truncated['rows'][0] = truncated['rows'][0][:-1]
+        now[0] = 100.225
+        self.assertFalse(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, truncated))
+        self.assertEqual('row_shape', server.last_bot_state_reject_code)
+        self.assertEqual(
+            committed, self._canonical_bot_commit_snapshot(server))
 
         # Because every malformed future packet left the accepted source
         # frontier untouched, the producer can resume from its last-good clock.
@@ -917,11 +959,133 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         recovered['sample_time_us'] = 80000
         recovered['source_batch_horizon_us'] = 80000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, recovered),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(recovered)),
             server.last_bot_state_reject)
         self.assertEqual(80000, server.bot_source_time_us)
         self.assertEqual(2, server.bot_state_revision)
         self.assertEqual(0.8, server.bot_states[11]['x'])
+
+    def test_a_fenced_bot_combat_lineage_reopens_instead_of_freezing(self):
+        """A combat lineage the server cannot follow rebases the authority.
+
+        Rejecting the publication would leave this Bot's stored state behind
+        its own next publication, so the same failure would repeat and freeze
+        it -- and every other Bot -- for the rest of the round. Holding the
+        acknowledged sequence without opening a new canonical revision has the
+        same shape: the authority keeps proposing past a sequence the server
+        will never acknowledge.
+        """
+        now = [100.0]
+        server, _, unused_socket = self._server(
+            clock=lambda: now[0],
+            before_manifest=lambda: now.__setitem__(0, 100.025))
+        now[0] = 100.200
+        baseline = self._publication(server, 0.4)
+        baseline['sample_time_us'] = 40000
+        baseline['source_batch_horizon_us'] = 40000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(baseline)),
+            server.last_bot_state_reject)
+        admitted = copy.deepcopy(server.bot_states[11])
+        revision = server.bot_state_revision
+
+        now[0] = 100.210
+        broken = self._publication(server, 1.5)
+        broken['sample_time_us'] = 50000
+        broken['source_batch_horizon_us'] = 50000
+        bot_state_rows.bots(broken)[0]['combat_seq'] = (
+            admitted['combat_ack_seq'] + 2)
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(broken)),
+            'a single Bot contract must not cost the publication')
+        fenced = server.bot_states[11]
+        self.assertEqual(1.5, fenced['x'])
+        self.assertEqual(
+            admitted['combat_ack_seq'], fenced['combat_ack_seq'])
+        self.assertEqual(admitted['critical'], fenced['critical'])
+        self.assertGreater(
+            fenced['combat_base_revision'],
+            admitted['combat_base_revision'])
+        self.assertEqual(
+            fenced['combat_revision'], fenced['combat_base_revision'])
+        self.assertGreater(server.bot_state_revision, revision)
+
+        # That new base is what the authority rebases onto, so its very next
+        # proposal is contiguous again and the Bot is live authority.
+        now[0] = 100.240
+        healthy = self._publication(server, 3.0)
+        healthy['sample_time_us'] = 90000
+        healthy['source_batch_horizon_us'] = 90000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(healthy)),
+            server.last_bot_state_reject)
+        self.assertEqual(3.0, server.bot_states[11]['x'])
+        self.assertEqual('', server.last_bot_state_reject_code)
+
+    def test_a_disagreeing_bot_magazine_rebases_so_the_bot_fires_again(self):
+        """An inventory step the server cannot derive becomes the new baseline.
+
+        Holding the previously admitted magazine would make every later
+        publication disagree with it exactly the same way, so the Bot would
+        never have another shot admitted for the rest of the round.
+        """
+        now = [100.0]
+        server, _, unused_socket = self._server(
+            clock=lambda: now[0],
+            before_manifest=lambda: now.__setitem__(0, 100.025))
+        now[0] = 100.200
+        baseline = self._publication(server, 0.4)
+        baseline['sample_time_us'] = 40000
+        baseline['source_batch_horizon_us'] = 40000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(baseline)),
+            server.last_bot_state_reject)
+        revision = server.bot_state_revision
+
+        now[0] = 100.210
+        broken = self._publication(server, 1.5)
+        broken['sample_time_us'] = 50000
+        broken['source_batch_horizon_us'] = 50000
+        bot = bot_state_rows.bots(broken)[0]
+        bot['fire_seq'] = int(bot['fire_seq']) + 1
+        bot['ammo_reload_pending'] = True
+        bot['clip'] = 0
+        bot.update(BattleState._ordinary_bot_burst(bot['fire_seq'], 0))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(broken)),
+            'a single Bot contract must not cost the publication')
+        contained = server.bot_states[11]
+        self.assertEqual(1.5, contained['x'])
+        self.assertEqual(bot['fire_seq'], contained['fire_seq'])
+        self.assertEqual(bot['ammo_remaining'], contained['ammo_remaining'])
+        # No projectile edge is invented from a step the server could not
+        # derive; only the inventory it now trusts is carried forward.
+        self.assertEqual(set(), server.bot_pending_projectile_launches)
+        self.assertGreater(server.bot_state_revision, revision)
+
+        # The very next legal shot from that baseline is admitted and launches.
+        now[0] = 100.240
+        healthy = self._publication(server, 3.0)
+        healthy['sample_time_us'] = 90000
+        healthy['source_batch_horizon_us'] = 90000
+        bot = bot_state_rows.bots(healthy)[0]
+        shot_seq = int(bot['fire_seq']) + 1
+        bot['fire_seq'] = shot_seq
+        bot['ammo_remaining'] = [int(bot['ammo_remaining'][0]) - 1]
+        bot['ammo_reload_pending'] = True
+        bot['clip'] = 0
+        bot.update(BattleState._ordinary_bot_burst(shot_seq, 0))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            bot_state_rows.publication(healthy)),
+            server.last_bot_state_reject)
+        self.assertEqual('', server.last_bot_state_reject_code)
+        self.assertIn((11, shot_seq), server.bot_pending_projectile_launches)
 
     def test_dispatcher_counts_validated_clock_rebase_as_advancement(self):
         now = [100.0]
@@ -933,7 +1097,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         baseline['sample_time_us'] = 40000
         baseline['source_batch_horizon_us'] = 40000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, baseline))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(baseline)))
 
         handler = object.__new__(ClientHandler)
         wrapper = types.SimpleNamespace(state=server)
@@ -946,7 +1110,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         now[0] = 100.210
         self.assertFalse(handler._dispatch_simulation_worker_message(
-            wrapper, server.simulation_worker, malformed))
+            wrapper, server.simulation_worker, bot_state_rows.publication(malformed)))
         self.assertEqual('batch_shape', server.last_bot_state_reject_code)
         self.assertEqual(
             committed, self._canonical_bot_commit_snapshot(server))
@@ -959,7 +1123,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         complete['source_batch_horizon_us'] = 1000000
         complete['type'] = 'bot_state'
         self.assertTrue(handler._dispatch_simulation_worker_message(
-            wrapper, server.simulation_worker, complete))
+            wrapper, server.simulation_worker, bot_state_rows.publication(complete)))
         self.assertEqual('', server.last_bot_state_reject_code)
         self.assertEqual(1000000, server.bot_source_time_us)
         self.assertEqual(1.0, server.bot_states[11]['x'])
@@ -974,13 +1138,13 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         baseline['sample_time_us'] = 40000
         baseline['source_batch_horizon_us'] = 40000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, baseline))
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(baseline)))
 
         now[0] = 100.210
         rebased = self._publication(server, 1.0)
         rebased['sample_time_us'] = 1000000
         rebased['source_batch_horizon_us'] = 1000000
-        bot = rebased['bots'][0]
+        bot = bot_state_rows.bots(rebased)[0]
         bot['fire_seq'] = 2
         bot['ammo_remaining'] = [18]
         bot['ammo_reload_pending'] = True
@@ -988,7 +1152,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         bot.update(BattleState._ordinary_bot_burst(2, 0))
 
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, rebased),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(rebased)),
             server.last_bot_state_reject)
         self.assertEqual(2, server.bot_states[11]['fire_seq'])
         self.assertEqual([18], server.bot_states[11]['ammo_remaining'])
@@ -999,21 +1163,21 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         recovered['sample_time_us'] = 1040000
         recovered['source_batch_horizon_us'] = 1040000
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, recovered),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(recovered)),
             server.last_bot_state_reject)
 
         now[0] = 100.270
         next_shot = self._publication(server, 1.8)
         next_shot['sample_time_us'] = 1080000
         next_shot['source_batch_horizon_us'] = 1080000
-        bot = next_shot['bots'][0]
+        bot = bot_state_rows.bots(next_shot)[0]
         bot['fire_seq'] = 3
         bot['ammo_remaining'] = [17]
         bot['ammo_reload_pending'] = True
         bot['clip'] = 0
         bot.update(BattleState._ordinary_bot_burst(3, 0))
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, next_shot),
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication(next_shot)),
             server.last_bot_state_reject)
         self.assertEqual(3, server.bot_states[11]['fire_seq'])
         self.assertIn((11, 3), server.bot_pending_projectile_launches)
@@ -1027,7 +1191,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID,
-            self._publication(server, 99.0)))
+            bot_state_rows.publication(self._publication(server, 99.0))))
         self.assertEqual(revision, server.bot_state_revision)
         self.assertEqual(states, server.bot_states)
         self.assertEqual('', server.last_bot_state_reject_code)
@@ -1040,11 +1204,11 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID,
-            self._publication(server, 1.0)))
+            bot_state_rows.publication(self._publication(server, 1.0))))
         first_time_us = server.bot_state_time_us
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID,
-            self._publication(server, 2.0)))
+            bot_state_rows.publication(self._publication(server, 2.0))))
 
         self.assertEqual(2, server.bot_state_revision)
         self.assertGreater(server.bot_state_time_us, first_time_us)
@@ -2060,7 +2224,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIsNone(state['target_id'])
         self.assertNotIn(11, runtime._friendly_repositions)
         self.assertTrue(runtime._mark_combat_publication(state))
-        projected = self.module.lan_client.project_bot_state(state)
+        projected = bot_state_rows.decoded(bot_state_rows.rows([state]), 0)
         self.assertEqual((0, False, 640, 5), (
             projected['health'], projected['alive'],
             projected['display_health'], projected['death_reason']))
@@ -2070,9 +2234,9 @@ class BotRuntimeTests(unittest.TestCase):
                      'ammo_reload_pending', 'clip', 'clip_size'):
             server.bot_states[11][name] = projected[name]
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, {
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication({
                 'round_id': server.round_id, 'bots': [projected],
-            }),
+            })),
             server.last_bot_state_reject)
         self.assertEqual((0, False, 640, 5), (
             server.bot_states[11]['health'],
@@ -3853,7 +4017,9 @@ class BotRuntimeTests(unittest.TestCase):
                 if mode == 'broken':
                     raise RuntimeError('diagnostic clock failed')
                 return reads[0] * 0.000001
-            diagnostic = WorkerCombatDiagnostics(clock) if mode else None
+            diagnostic = (WorkerCombatDiagnostics(
+                clock, detail_stride=4 if mode == 'sampled' else 1)
+                          if mode else None)
             queries = []
             def lane(source, target):
                 queries.append(('lane', source['id'], target['network_id']))
@@ -3906,9 +4072,14 @@ class BotRuntimeTests(unittest.TestCase):
 
         baseline, unused = exercise(None)
         measured, traces = exercise('active')
+        sampled, sampled_traces = exercise('sampled')
         failed, unused = exercise('broken')
         self.assertEqual(baseline, measured)
+        self.assertEqual(baseline, sampled)
         self.assertEqual(baseline, failed)
+        detailed_frames = sum(row['detail_sampled'] for row in sampled_traces)
+        self.assertGreater(detailed_frames, 0)
+        self.assertLess(detailed_frames, len(sampled_traces))
         stages = set(name for row in traces for name in row['stages'])
         self.assertTrue({'bot.slice', 'bot.targets', 'bot.lane_service',
                          'bot.probe.lane'}.issubset(stages))
@@ -5294,16 +5465,16 @@ class BotRuntimeTests(unittest.TestCase):
             resolved.append(vehicle) or resolver(vehicle))
         first = self.runtime.battle_start(self.start)
         self.assertEqual('bot_manifest', first[0]['type'])
-        self.assertEqual(11, first[0]['bots'][0]['id'])
+        self.assertEqual(11, bot_state_rows.bots(first[0])[0]['id'])
         self.assertFalse(self.runtime._manifest_sent)
         self.assertEqual(['ussr:R11_MS-1'], resolved)
 
-        first[0]['bots'][0]['name'] = 'mutated caller copy'
+        bot_state_rows.bots(first[0])[0]['name'] = 'mutated caller copy'
         repeated = self.runtime.battle_start(dict(
             self.start, bots=[dict(
-                self.start['bots'][0], name='rebuilt roster')]))
+                bot_state_rows.bots(self.start)[0], name='rebuilt roster')]))
 
-        self.assertEqual('Bot', repeated[0]['bots'][0]['name'])
+        self.assertEqual('Bot', bot_state_rows.bots(repeated[0])[0]['name'])
         self.assertEqual(['ussr:R11_MS-1'], resolved)
         self.assertFalse(self.runtime.mark_manifest_enqueued({
             'type': 'bot_manifest', 'bots': []}))
@@ -5328,7 +5499,7 @@ class BotRuntimeTests(unittest.TestCase):
         current = self.runtime.battle_start(next_round)[0]
 
         self.assertFalse(self.runtime.mark_manifest_enqueued(resumed))
-        self.assertEqual([12], [row['id'] for row in current['bots']])
+        self.assertEqual([12], [row['id'] for row in bot_state_rows.bots(current)])
         self.assertEqual(current, self.runtime.pending_manifest())
 
     def test_manifest_descriptor_preflight_failure_is_atomic(self):
@@ -5397,7 +5568,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.module._bot_physics_params = bot_physics
         try:
             initial = new_runtime()
-            manifest = initial.battle_start(self.start)[0]['bots'][0]
+            manifest = bot_state_rows.bots(initial.battle_start(self.start)[0])[0]
             restored = new_runtime()
             restored.battle_start(dict(
                 self.start, bots=[], bot_manifest=[manifest]))
@@ -5674,7 +5845,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.runtime.update(.20, 1.22, players=player)
         self.runtime.update(.20, 1.42, players=player)
         result = self.runtime.update(.04, 1.46, players=player)
-        bot = result[0]['bots'][0]
+        bot = bot_state_rows.bots(result[0])[0]
         self.assertEqual('bot_state', result[0]['type'])
         self.assertGreater(bot['z'], 0.0)
         self.assertEqual(0, bot['shell_index'])
@@ -5773,15 +5944,16 @@ class BotRuntimeTests(unittest.TestCase):
         outgoing = runtime.update(1.0, 10.0)
         publications = [message for message in outgoing
                         if message.get('type') == 'bot_state']
-        snapshots = [message['bots'][0]['equipment_states']
+        snapshots = [bot_state_rows.decoded(message, 0)['equipment_states']
                      for message in publications]
 
         self.assertEqual(
             [200000, 1000000],
             [message['sample_time_us'] for message in publications])
-        self.assertEqual(2, len(set(id(snapshot) for snapshot in snapshots)))
-        self.assertIs(initial_wire, snapshots[0])
-        self.assertIs(state['equipment_states'], snapshots[-1])
+        self.assertNotEqual(snapshots[0], snapshots[-1])
+        self.assertEqual(
+            [snapshot['cooldownTimeLeft'] for snapshot in initial_wire],
+            [snapshot['cooldownTimeLeft'] for snapshot in snapshots[0]])
         for expected, snapshot in zip(
                 (89.8, 89.0), snapshots):
             self.assertAlmostEqual(
@@ -5870,9 +6042,18 @@ class BotRuntimeTests(unittest.TestCase):
             'gun_pitch', 'speed', 'movement_dir', 'rotation_dir',
             'reload_time', 'burst_time_left', 'siege_time_left_ms',
             'combat_fire_elapsed', 'combat_fire_timer'))
-        represented = set(('critical', 'equipment_states', 'ammo_remaining'))
+        represented = set(('critical', 'equipment_states', 'ammo_remaining',
+                           'shot_yaw', 'shot_pitch'))
+        codec = self.module.bot_state_codec
+        carried = set(name for name, unused in codec.SCALARS
+                      if not name.startswith('_'))
+        carried |= set(('alive', 'world_pose', 'ammo_reload_pending',
+                        'burst_active', 'movement_dir', 'rotation_dir'))
+        carried |= represented
+        for unused_bit, names in codec.OPTIONAL_GROUPS:
+            carried |= set(names)
         self.assertEqual(
-            set(self.module.lan_client._BOT_STATE_WIRE_FIELDS),
+            carried,
             continuous | represented |
             set(self.module._PUBLICATION_EDGE_SCALAR_FIELDS))
 
@@ -6614,7 +6795,7 @@ class BotRuntimeTests(unittest.TestCase):
         server.bot_roster = list(roster)
         self.assertTrue(server.update_bot_manifest(
             1, {'round_id': server.round_id,
-                'bots': manifest_message['bots']}))
+                'bots': bot_state_rows.bots(manifest_message)}))
 
         player = {
             'id': 1, 'team': 1, 'alive': True,
@@ -6633,17 +6814,17 @@ class BotRuntimeTests(unittest.TestCase):
                           if message['type'] == 'bot_state']
             self.assertLessEqual(len(bot_states), 1)
             for bot_state in bot_states:
-                self.assertEqual(29, len(bot_state['bots']))
+                self.assertEqual(29, len(bot_state_rows.bots(bot_state)))
                 published += 1
-                self.assertTrue(server.update_bot_states(1, {
+                self.assertTrue(server.update_bot_states(1, bot_state_rows.publication({
                     'round_id': server.round_id,
                     'sample_time_us': bot_state['sample_time_us'],
                     'source_batch_horizon_us':
                         bot_state['source_batch_horizon_us'],
-                    'bots': bot_state['bots'],
-                }))
+                    'bots': bot_state_rows.bots(bot_state),
+                })))
                 accepted += 1
-                for published_bot in bot_state['bots']:
+                for published_bot in bot_state_rows.bots(bot_state):
                     server_bot = server.bot_states[published_bot['id']]
                     self.assertEqual(published_bot['combat_seq'],
                                      server_bot['combat_ack_seq'])
@@ -6700,8 +6881,8 @@ class BotRuntimeTests(unittest.TestCase):
              'name': 'Autoloader-%d' % index}
             for index in range(29)
         ]
-        manifest = runtime.battle_start(
-            dict(self.start, bots=roster))[0]['bots']
+        manifest = bot_state_rows.bots(runtime.battle_start(
+            dict(self.start, bots=roster))[0])
         for state in runtime.states.values():
             state.update(
                 x=0.0, y=0.0, z=0.0, yaw=0.0, aim_yaw=0.0)
@@ -6733,18 +6914,18 @@ class BotRuntimeTests(unittest.TestCase):
                 if message['type'] != 'bot_state':
                     continue
                 publications += 1
-                for bot in message['bots']:
+                for bot in bot_state_rows.bots(message):
                     current_fire = bot['fire_seq']
                     self.assertLessEqual(
                         current_fire - previous_fire[bot['id']], 1)
                     previous_fire[bot['id']] = current_fire
-                self.assertTrue(server.update_bot_states(1, {
+                self.assertTrue(server.update_bot_states(1, bot_state_rows.publication({
                     'round_id': server.round_id,
                     'sample_time_us': message['sample_time_us'],
                     'source_batch_horizon_us':
                         message['source_batch_horizon_us'],
-                    'bots': message['bots'],
-                }), server.last_bot_state_reject)
+                    'bots': bot_state_rows.bots(message),
+                })), server.last_bot_state_reject)
                 runtime.apply_snapshot({
                     'server_tick': frame,
                     'bots': [dict(server.bot_states[bot_id])
@@ -6786,7 +6967,7 @@ class BotRuntimeTests(unittest.TestCase):
                     physics_ground_probe=lambda *unused: 0.0,
                     spawn_resolver=_spawn_resolver,
                     baked_graph=_graph())
-                roster = [dict(self.start['bots'][0])]
+                roster = [dict(bot_state_rows.bots(self.start)[0])]
                 start = dict(self.start, bots=roster)
                 manifest = runtime.battle_start(start)[0]
                 runtime.states[11]['critical'] = dict(burning)
@@ -6801,7 +6982,7 @@ class BotRuntimeTests(unittest.TestCase):
                 server.bot_roster = list(roster)
                 self.assertTrue(server.update_bot_manifest(1, {
                     'round_id': server.round_id,
-                    'bots': manifest['bots'],
+                    'bots': bot_state_rows.bots(manifest),
                 }))
 
                 dt = 1.0 / float(fps)
@@ -6829,13 +7010,13 @@ class BotRuntimeTests(unittest.TestCase):
                     self.assertLessEqual(len(publications_now), 1)
                     for publication in publications_now:
                         publications += 1
-                        published = publication['bots'][0]
+                        published = bot_state_rows.bots(publication)[0]
                         self.assertEqual(last_ack + 1,
                                          published['combat_seq'])
-                        self.assertTrue(server.update_bot_states(1, {
+                        self.assertTrue(server.update_bot_states(1, bot_state_rows.publication({
                             'round_id': server.round_id,
-                            'bots': publication['bots'],
-                        }))
+                            'bots': bot_state_rows.bots(publication),
+                        })))
                         canonical = server.bot_states[11]
                         self.assertEqual(published['combat_seq'],
                                          canonical['combat_ack_seq'])
@@ -6922,7 +7103,7 @@ class BotRuntimeTests(unittest.TestCase):
                 self.assertLessEqual(len(publications), 61)
                 self.assertEqual(29 * (len(publications) - 1), changed)
                 self.assertTrue(all(
-                    len(message['bots']) == 29
+                    len(bot_state_rows.bots(message)) == 29
                     for message in publications))
                 # The isolated selected-motion seam probes all 29 bots on the
                 # first authority tick; later deadlines stay staggered.
@@ -7328,40 +7509,23 @@ class BotRuntimeTests(unittest.TestCase):
             spawn_resolver=_spawn_resolver, baked_graph=_graph())
         runtime.battle_start(dict(self.start, bots=roster))
         calls = []
-        original = self.module.lan_client.project_owned_bot_state
-        strict_projection = self.module.lan_client.project_bot_state
+        codec = self.module.bot_state_codec
+        original = codec.encode_row
 
         def counted(state):
             calls.append(state['id'])
             return original(state)
 
-        self.module.lan_client.project_owned_bot_state = counted
+        codec.encode_row = counted
         try:
             publication = runtime.update(.04, 1.0)[0]
         finally:
-            self.module.lan_client.project_owned_bot_state = original
+            codec.encode_row = original
 
         internal = runtime._ordered_states()
         self.assertEqual([state['id'] for state in internal], calls)
         self.assertEqual(
-            [original(state) for state in internal], publication['bots'])
-        self.assertEqual(
-            [strict_projection(state) for state in internal],
-            publication['bots'])
-        self.assertNotIn('launches', publication)
-        self.assertTrue(all(
-            len(projected) < len(state)
-            for projected, state in zip(publication['bots'], internal)))
-        self.assertTrue(all(
-            projected['pitch'] == state['pitch'] and
-            projected['roll'] == state['roll'] and
-            projected['speed'] == state['speed']
-            for projected, state in zip(publication['bots'], internal)))
-        self.assertTrue(all(
-            'profile' not in state and
-            state['reload_duration'] > 0.0 and
-            0.0 <= state['reload_time'] <= state['reload_duration']
-            for state in publication['bots']))
+            [original(state) for state in internal], publication['rows'])
 
     def test_contact_resolution_uses_the_banked_global_simulation_step(self):
         runtime = self.module.BotRuntime(
@@ -7970,7 +8134,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.battle_start(self.start)
         runtime.states[11]['speed'] = -1.0
 
-        state = runtime.update(.04, 1.0)[0]['bots'][0]
+        state = bot_state_rows.bots(runtime.update(.04, 1.0)[0])[0]
 
         self.assertEqual(-1, state['rotation_dir'])
         # Reverse motion flips track steering inside the copied physics law, so
@@ -7997,7 +8161,7 @@ class BotRuntimeTests(unittest.TestCase):
             baked_graph=_graph())
         runtime.battle_start(self.start)
 
-        state = runtime.update(.04, 1.0)[0]['bots'][0]
+        state = bot_state_rows.bots(runtime.update(.04, 1.0)[0])[0]
 
         self.assertEqual(1, state['rotation_dir'])
         self.assertAlmostEqual(
@@ -8027,11 +8191,11 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.battle_start(self.start)
         runtime.states[11]['yaw'] = 0.0
 
-        state = runtime.update(.04, 1.0, players=[
+        state = bot_state_rows.bots(runtime.update(.04, 1.0, players=[
             {'id': 2, 'team': 1, 'alive': True,
              'x': 100.0, 'y': 0.5, 'z': 0.0,
              'effective_params': _effective_params_snapshot()}
-        ])[0]['bots'][0]
+        ])[0])[0]
 
         self.assertEqual(0, state['movement_dir'])
         self.assertEqual(1, state['rotation_dir'])
@@ -8252,7 +8416,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 0.0, 'y': 1.0, 'z': 100.0,
         })
 
-        stale = runtime.update(0.2, 1.0, players=[player])[0]['bots'][0]
+        stale = bot_state_rows.bots(runtime.update(0.2, 1.0, players=[player])[0])[0]
         self.assertEqual(0, stale['fire_seq'])
 
         # A fresh solution admits exactly one shot, once the gunner has also
@@ -8398,11 +8562,11 @@ class BotRuntimeTests(unittest.TestCase):
         server.bot_roster = [
             {'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot'}]
         self.assertTrue(server.update_bot_manifest(1, {
-            'round_id': server.round_id, 'bots': manifest['bots'],
+            'round_id': server.round_id, 'bots': bot_state_rows.bots(manifest),
         }))
         relayed = server.current_battle_message()['bot_manifest']
         self.assertEqual('elite', relayed[0].get('skill'))
-        invalid = dict(manifest['bots'][0], skill='unsupported')
+        invalid = dict(bot_state_rows.bots(manifest)[0], skill='unsupported')
         self.assertFalse(server.update_bot_manifest(1, {
             'round_id': server.round_id, 'bots': [invalid],
         }))
@@ -8449,7 +8613,7 @@ class BotRuntimeTests(unittest.TestCase):
             dict(self.start, bot_skill_mode='mixed'))[0]
         expected = self.runtime.bot_rating(11)
         self.assertNotIn(expected, self.module.bot_gunnery.RATING_ANCHORS)
-        entry = manifest['bots'][0]
+        entry = bot_state_rows.bots(manifest)[0]
 
         successor = self.module.BotRuntime(
             2, descriptor_resolver=lambda unused: _combat_descriptor(),
@@ -8530,7 +8694,7 @@ class BotRuntimeTests(unittest.TestCase):
             for unused_step in range(200):
                 now += 0.05
                 published = runtime.update(0.05, now, players=[player])
-                shots[skill] = published[0]['bots'][0]['fire_seq']
+                shots[skill] = bot_state_rows.bots(published[0])[0]['fire_seq']
 
         self.assertGreater(shots['rookie'], 0)
         self.assertGreaterEqual(shots['elite'], shots['rookie'])
@@ -8580,15 +8744,15 @@ class BotRuntimeTests(unittest.TestCase):
             now += 0.05
             published = runtime.update(0.05, now, players=[player])
             self.assertEqual(
-                0, published[0]['bots'][0]['fire_seq'],
+                0, bot_state_rows.bots(published[0])[0]['fire_seq'],
                 'a Bot fired %.2fs into a %.2fs reaction delay' % (
                     now - 1.0, reaction))
 
         fired = 0
         while now < 1.0 + reaction + 4.0 and not fired:
             now += 0.05
-            fired = runtime.update(
-                0.05, now, players=[player])[0]['bots'][0]['fire_seq']
+            fired = bot_state_rows.bots(runtime.update(
+                0.05, now, players=[player])[0])[0]['fire_seq']
         self.assertEqual(1, fired)
 
     def test_the_hold_survives_one_missing_target_frame(self):
@@ -8683,7 +8847,7 @@ class BotRuntimeTests(unittest.TestCase):
 
         # The gun first slews to the visible elevated target; it cannot fire
         # merely because the strategic order says fire_allowed.
-        first = runtime.update(.20, 1.0, players=[player])[0]['bots'][0]
+        first = bot_state_rows.bots(runtime.update(.20, 1.0, players=[player])[0])[0]
         self.assertEqual(0, first['fire_seq'])
         self.assertNotIn('shot_yaw', first)
         self.assertNotIn('shot_pitch', first)
@@ -8691,13 +8855,13 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.states[11]['gun_aligned'])
 
         # The second slew tick aligns, but the full reload is not complete.
-        aligned = runtime.update(.20, 1.2, players=[player])[0]['bots'][0]
+        aligned = bot_state_rows.bots(runtime.update(.20, 1.2, players=[player])[0])[0]
         self.assertEqual(0, aligned['fire_seq'])
         self.assertTrue(runtime.states[11]['gun_aligned'])
         self.assertEqual(0, len(lane_probes))
 
         # Once aligned and reloaded, a fresh static-lane probe still blocks.
-        blocked = runtime.update(.11, 1.31, players=[player])[0]['bots'][0]
+        blocked = bot_state_rows.bots(runtime.update(.11, 1.31, players=[player])[0])[0]
         self.assertEqual(0, blocked['fire_seq'])
         self.assertNotIn('shot_yaw', blocked)
         self.assertNotIn('shot_pitch', blocked)
@@ -8706,7 +8870,7 @@ class BotRuntimeTests(unittest.TestCase):
 
         # The next fresh lane is clear. The emitted shot angles are the actual
         # dispersed barrel ray and the clip selects the intra-clip delay.
-        fired = runtime.update(.20, 1.52, players=[player])[0]['bots'][0]
+        fired = bot_state_rows.bots(runtime.update(.20, 1.52, players=[player])[0])[0]
         self.assertEqual(1, fired['fire_seq'])
         self.assertIn('shot_yaw', fired)
         self.assertIn('shot_pitch', fired)
@@ -8722,7 +8886,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(0.2, runtime.states[11]['reload_duration'])
 
         runtime.update(.20, 1.72, players=[player])
-        second = runtime.update(.11, 1.83, players=[player])[0]['bots'][0]
+        second = bot_state_rows.bots(runtime.update(.11, 1.83, players=[player])[0])[0]
         self.assertEqual(2, second['fire_seq'])
         self.assertEqual(0, runtime.states[11]['clip'])
         full_reload = runtime._gun_states[11].reload_full
@@ -8736,7 +8900,7 @@ class BotRuntimeTests(unittest.TestCase):
             runtime.update(step, now, players=[player])
         step = full_reload * 0.19
         now += step
-        early = runtime.update(step, now, players=[player])[0]['bots'][0]
+        early = bot_state_rows.bots(runtime.update(step, now, players=[player])[0])[0]
         self.assertEqual(2, early['fire_seq'])
         step = max(full_reload * 0.02, 0.04)
         now += step
@@ -8825,12 +8989,12 @@ class BotRuntimeTests(unittest.TestCase):
                                 'x': 0.0, 'y': 0.0, 'z': 100.0})
         runtime.states[11].update(x=0.0, y=0.0, z=0.0, yaw=0.0)
         now = self._spend_gunner_delay(runtime, [player])
-        blocked = runtime.update(
-            0.15, now + 0.15, players=[player])[0]['bots'][0]
+        blocked = bot_state_rows.bots(runtime.update(
+            0.15, now + 0.15, players=[player])[0])[0]
         self.assertEqual(0, blocked['fire_seq'])
         self.assertNotIn(11, runtime._ballistic_solution_cache)
-        fired = runtime.update(
-            0.15, now + 0.30, players=[player])[0]['bots'][0]
+        fired = bot_state_rows.bots(runtime.update(
+            0.15, now + 0.30, players=[player])[0])[0]
         self.assertEqual(1, fired['fire_seq'])
         self.assertTrue(runtime.states[11]['gun_aligned'])
         self.assertLess(fired['gun_pitch'], 0.0)
@@ -8983,8 +9147,8 @@ class BotRuntimeTests(unittest.TestCase):
         # for the gunner to spend its tier reaction.  The SPG is stationary,
         # so its aiming circle is already converged.
         runtime.update(0.04, 1.0, players=[player])
-        pending = runtime.update(
-            0.40, 1.40, players=[player])[0]['bots'][0]
+        pending = bot_state_rows.bots(runtime.update(
+            0.40, 1.40, players=[player])[0])[0]
         self.assertEqual(0, pending['fire_seq'])
         self.assertEqual((0, 1), (
             pending['shell_index'], pending['next_shell_index']))
@@ -8993,7 +9157,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(0, calls[0][2])
 
         fired_message = runtime.update(0.04, 1.44, players=[player])[0]
-        fired = fired_message['bots'][0]
+        fired = bot_state_rows.bots(fired_message)[0]
         launch = fired_message['launches'][0]
         self.assertEqual(1, fired['fire_seq'])
         self.assertEqual((0, 1), (
@@ -10219,7 +10383,7 @@ class BotRuntimeTests(unittest.TestCase):
                 physics_ground_probe=lambda *unused: 0.0,
                 spawn_resolver=_spawn_resolver, baked_graph=_graph())
             start = dict(self.start, bots=[dict(
-                self.start['bots'][0],
+                bot_state_rows.bots(self.start)[0],
                 vehicle='sweden:S10_Strv_103_0_Series')])
             runtime.battle_start(start)
             state = runtime.states[11]
@@ -10563,19 +10727,19 @@ class BotRuntimeTests(unittest.TestCase):
 
         now = self._spend_gunner_delay(runtime, [player])
         self.assertEqual([], probes)
-        blocked = runtime.update(
-            .15, now + .15, players=[player])[0]['bots'][0]
+        blocked = bot_state_rows.bots(runtime.update(
+            .15, now + .15, players=[player])[0])[0]
         self.assertEqual(0, blocked['fire_seq'])
         self.assertEqual(1, probes[0][2]['fire_seq'])
         self.assertNotIn(11, runtime._friendly_repositions)
-        fired = runtime.update(
-            .15, now + .30, players=[player])[0]['bots'][0]
+        fired = bot_state_rows.bots(runtime.update(
+            .15, now + .30, players=[player])[0])[0]
         self.assertEqual(1, fired['fire_seq'])
         self.assertEqual([1, 1], [item[2]['fire_seq'] for item in probes])
-        self.assertEqual(
-            probes[1][2]['shot_yaw'], fired['shot_yaw'])
-        self.assertEqual(
-            probes[1][2]['shot_pitch'], fired['shot_pitch'])
+        self.assertAlmostEqual(
+            probes[1][2]['shot_yaw'], fired['shot_yaw'], places=5)
+        self.assertAlmostEqual(
+            probes[1][2]['shot_pitch'], fired['shot_pitch'], places=5)
         self.assertEqual([(11, 2), (11, 2)], [
             item[:2] for item in probes])
 
@@ -10908,13 +11072,13 @@ class BotRuntimeTests(unittest.TestCase):
         # for the gunner to spend its tier reaction.  The SPG is stationary,
         # so its aiming circle is already converged.
         runtime.update(.04, 1.0, players=[player])
-        blocked = runtime.update(.40, 1.40, players=[player])[0]['bots'][0]
+        blocked = bot_state_rows.bots(runtime.update(.40, 1.40, players=[player])[0])[0]
         self.assertEqual(0, blocked['fire_seq'])
         self.assertNotIn(11, runtime._artillery_intents)
         self.assertNotIn(11, runtime._artillery_reproofs)
         destination = runtime._friendly_repositions[11]['destination']
         state['x'], state['y'], state['z'] = destination
-        fired = runtime.update(.15, 1.55, players=[player])[0]['bots'][0]
+        fired = bot_state_rows.bots(runtime.update(.15, 1.55, players=[player])[0])[0]
         self.assertEqual(1, fired['fire_seq'])
         self.assertEqual(2, len(probes))
 
@@ -11183,19 +11347,19 @@ class BotRuntimeTests(unittest.TestCase):
             device_damage.CREW_KO_TIME_FACTOR)
         last = None
         for index in range(4):
-            last = runtime.update(.20, 1.0 + index * .20,
-                                  players=[player])[0]['bots'][0]
+            last = bot_state_rows.bots(runtime.update(.20, 1.0 + index * .20,
+                                  players=[player])[0])[0]
         self.assertEqual(0, last['fire_seq'])
         self.assertAlmostEqual(
             expected_reload, runtime.states[11]['reload_duration'])
-        fired = runtime.update(.20, 1.8, players=[player])[0]['bots'][0]
+        fired = bot_state_rows.bots(runtime.update(.20, 1.8, players=[player])[0])[0]
         self.assertEqual(1, fired['fire_seq'])
 
         runtime.states[11]['critical'] = {
             'crew_ko': [], 'devices': [], 'destroyed': ['gunHealth']}
         for index in range(5):
-            blocked = runtime.update(
-                .20, 2.4 + index * .20, players=[player])[0]['bots'][0]
+            blocked = bot_state_rows.bots(runtime.update(
+                .20, 2.4 + index * .20, players=[player])[0])[0]
         self.assertEqual(1, blocked['fire_seq'])
 
     def test_critical_parts_tick_cache_reuses_only_unchanged_payload(self):
@@ -11238,10 +11402,10 @@ class BotRuntimeTests(unittest.TestCase):
         self.module._cache_critical_parts_for_tick(state)
         self.assertIn(key, state)
 
-        projected = self.module.lan_client.project_bot_state(state)
-        self.assertNotIn(key, projected)
+        row = bot_state_rows.rows([state])[0]
+        self.assertNotIn(key, bot_state_rows.decoded([row], 0))
         self.assertNotIn(key, self.runtime.presentation_states()[0])
-        json.dumps(projected)
+        json.dumps(row)
 
         # Repair/fire advancement is a mutation boundary even when this slice
         # happens not to alter the canonical payload.
@@ -11252,7 +11416,7 @@ class BotRuntimeTests(unittest.TestCase):
         wire = next(message for message in outgoing
                     if message['type'] == 'bot_state')
         self.assertNotIn(key, state)
-        self.assertTrue(all(key not in value for value in wire['bots']))
+        self.assertTrue(all(key not in value for value in bot_state_rows.bots(wire)))
 
     def test_bot_consumables_use_independent_inventory_and_cooldowns(self):
         contracts = _bot_equipment_contracts(self.module)
@@ -11310,12 +11474,13 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(
             base_repair * 1.10,
             runtime._bot_repair_factor(11, descriptor))
-        projected = self.module.lan_client.project_bot_state(state)
+        projected = bot_state_rows.decoded(bot_state_rows.rows([state]), 0)
         self.assertEqual(3, len(projected['equipment_states']))
         malformed = dict(state)
-        malformed['equipment_states'] = [{}]
-        self.assertIsNone(
-            self.module.lan_client.project_bot_state(malformed))
+        malformed['equipment_states'] = [{}] * 4
+        with self.assertRaises(
+                self.module.bot_state_codec.BotStateCodecError):
+            bot_state_rows.rows([malformed])
 
     def test_trusted_equipment_projection_reuses_rows_between_edges(self):
         contracts = _bot_equipment_contracts(self.module, reuse_count=-1)
@@ -11684,10 +11849,10 @@ class BotRuntimeTests(unittest.TestCase):
         # seconds rather than the five a fully trained crew would need.
         outgoing = None
         for index in range(25):
-            outgoing = runtime.update(.20, 1.0 + index * .20)[0]['bots'][0]
+            outgoing = bot_state_rows.bots(runtime.update(.20, 1.0 + index * .20)[0])[0]
         self.assertLess(outgoing['critical']['devices'][0]['hp'], 130.0)
         for index in range(25, 45):
-            outgoing = runtime.update(.20, 1.0 + index * .20)[0]['bots'][0]
+            outgoing = bot_state_rows.bots(runtime.update(.20, 1.0 + index * .20)[0])[0]
 
         device = outgoing['critical']['devices'][0]
         self.assertEqual('leftTrackHealth', device['name'])
@@ -11784,11 +11949,11 @@ class BotRuntimeTests(unittest.TestCase):
 
         outgoing = None
         for index in range(49):
-            outgoing = runtime.update(.20, index * .20)[0]['bots'][0]
+            outgoing = bot_state_rows.bots(runtime.update(.20, index * .20)[0])[0]
         self.assertEqual(550, outgoing['health'])
         self.assertTrue(outgoing['critical']['fire'])
 
-        outgoing = runtime.update(.20, 9.8)[0]['bots'][0]
+        outgoing = bot_state_rows.bots(runtime.update(.20, 9.8)[0])[0]
         fuel = outgoing['critical']['devices'][0]
         self.assertEqual(500, outgoing['health'])
         self.assertFalse(outgoing['critical']['fire'])
@@ -11812,7 +11977,7 @@ class BotRuntimeTests(unittest.TestCase):
             physics_ground_probe=lambda *unused: 0.0,
             spawn_resolver=_spawn_resolver, baked_graph=_graph())
 
-        manifest = runtime.battle_start(self.start)[0]['bots'][0]
+        manifest = bot_state_rows.bots(runtime.battle_start(self.start)[0])[0]
         terminal = manifest['terminal_critical']
         expected_devices = set(
             self.module.critical_damage._OFFH_DEATH_DEVICES)
@@ -11868,7 +12033,7 @@ class BotRuntimeTests(unittest.TestCase):
 
         first = None
         for index in range(5):
-            first = runtime.update(.20, index * .20)[0]['bots'][0]
+            first = bot_state_rows.bots(runtime.update(.20, index * .20)[0])[0]
         first_seq = runtime._combat_sync[11]['next_seq']
         first_track = dict((record['name'], record['hp'])
                            for record in first['critical']['devices'])[
@@ -11889,7 +12054,7 @@ class BotRuntimeTests(unittest.TestCase):
 
         second = None
         for index in range(5, 10):
-            second = runtime.update(.20, index * .20)[0]['bots'][0]
+            second = bot_state_rows.bots(runtime.update(.20, index * .20)[0])[0]
         second_track = dict((record['name'], record['hp'])
                             for record in second['critical']['devices'])[
                                 'leftTrackHealth']
@@ -11934,10 +12099,10 @@ class BotRuntimeTests(unittest.TestCase):
         server.players[1] = Player(
             1, object(), ('127.0.0.1', 1), team=1, slot=0)
         server.bot_authority_id = 1
-        server.bot_roster = list(self.start['bots'])
+        server.bot_roster = list(bot_state_rows.bots(self.start))
         self.assertTrue(server.update_bot_manifest(1, {
             'round_id': server.round_id,
-            'bots': manifest_message['bots'],
+            'bots': bot_state_rows.bots(manifest_message),
         }))
         burning = _critical_payload({
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
@@ -11950,8 +12115,8 @@ class BotRuntimeTests(unittest.TestCase):
 
         publication = None
         for index in range(5):
-            publication = runtime.update(
-                .20, .20 + index * .20)[0]['bots'][0]
+            publication = bot_state_rows.bots(runtime.update(
+                .20, .20 + index * .20)[0])[0]
         self.assertEqual((900, 5),
                          (publication['health'], publication['combat_seq']))
         runtime.apply_snapshot({
@@ -11977,7 +12142,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([], sync['pending'])
         self.assertEqual(5, len(sync['unpublished_steps']))
 
-        next_publication = runtime.update(.20, 1.20)[0]['bots'][0]
+        next_publication = bot_state_rows.bots(runtime.update(.20, 1.20)[0])[0]
 
         # The five replayed slices plus this render slice's fire-clock advance
         # are one full-state publication on the new base.  The current slice
@@ -11992,10 +12157,10 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([1], [entry['seq'] for entry in sync['pending']])
         self.assertEqual([], sync['unpublished_steps'])
 
-        self.assertTrue(server.update_bot_states(1, {
+        self.assertTrue(server.update_bot_states(1, bot_state_rows.publication({
             'round_id': server.round_id,
             'bots': [next_publication],
-        }))
+        })))
         self.assertEqual(1, server.bot_states[11]['combat_ack_seq'])
 
         # Acknowledged snapshots and later fire-clock publications stay
@@ -12011,16 +12176,106 @@ class BotRuntimeTests(unittest.TestCase):
             publication_message = next(
                 message for message in outgoing
                 if message['type'] == 'bot_state')
-            published = publication_message['bots'][0]
+            published = bot_state_rows.bots(publication_message)[0]
             self.assertEqual(server_ack + 1, published['combat_seq'])
-            self.assertTrue(server.update_bot_states(1, {
+            self.assertTrue(server.update_bot_states(1, bot_state_rows.publication({
                 'round_id': server.round_id,
-                'bots': publication_message['bots'],
-            }))
+                'bots': bot_state_rows.bots(publication_message),
+            })))
             self.assertEqual(
                 published['combat_seq'],
                 server.bot_states[11]['combat_ack_seq'])
         self.assertEqual(700, server.bot_states[11]['health'])
+
+    def test_a_server_fenced_combat_lineage_is_rebased_by_the_authority(self):
+        """The server's fence must close its own gap, not freeze the Bot.
+
+        When the server cannot follow a Bot's combat lineage it holds the
+        acknowledged sequence and opens a new canonical revision. That new base
+        is only useful if the authority actually rebases onto it; otherwise the
+        authority keeps proposing past a sequence the server will never
+        acknowledge and the Bot's combat state is frozen for the round.
+        """
+        descriptor = _critical_descriptor()
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *args, **kwargs: _Adapter(*args),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        manifest_message = runtime.battle_start(self.start)[0]
+        server = BattleState(map_name='01_karelia')
+        server.client_build = CLIENT_BUILD_0922
+        server.phase = 'battle'
+        server.tick = 100000
+        server.round_id = self.start['round_id']
+        server.players[1] = Player(
+            1, object(), ('127.0.0.1', 1), team=1, slot=0)
+        server.bot_authority_id = 1
+        server.bot_roster = list(bot_state_rows.bots(self.start))
+        self.assertTrue(server.update_bot_manifest(1, {
+            'round_id': server.round_id,
+            'bots': bot_state_rows.bots(manifest_message),
+        }))
+        burning = _critical_payload({
+            'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
+            'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
+        runtime.apply_snapshot({
+            'server_tick': 1,
+            'bots': [_snapshot_bot(
+                health=950, critical=burning,
+                revision=1, base_revision=1)]})
+
+        # Mirror that external hit as the server's canonical combat base, so
+        # the only thing the server cannot follow below is the sequence.
+        server.bot_states[11].update(
+            health=950, display_health=950, critical=dict(burning),
+            combat_revision=1, combat_base_revision=1, combat_ack_seq=0,
+            combat_fire_elapsed=0.0, combat_fire_timer=0.0)
+        publication_message = runtime.update(.20, .20)[0]
+        published = bot_state_rows.bots(publication_message)[0]
+        self.assertEqual(1, published['combat_seq'])
+        server_base = server.bot_states[11]['combat_base_revision']
+
+        # A proposal that skips a sequence the server never acknowledged.
+        published['combat_seq'] = (
+            server.bot_states[11]['combat_ack_seq'] + 2)
+        self.assertTrue(server.update_bot_states(1, bot_state_rows.publication({
+            'round_id': server.round_id,
+            'bots': [published],
+        })), server.last_bot_state_reject)
+        fenced = server.bot_states[11]
+        self.assertEqual(0, fenced['combat_ack_seq'])
+        self.assertGreater(fenced['combat_base_revision'], server_base)
+        self.assertEqual(
+            fenced['combat_revision'], fenced['combat_base_revision'])
+
+        # The authority accepts that new base and resets its own sequence to
+        # the server's ack, so the very next proposal is contiguous again.
+        runtime.apply_snapshot({
+            'server_tick': 2, 'bots': [dict(fenced)]})
+        sync = runtime._combat_sync[11]
+        self.assertEqual(fenced['combat_ack_seq'], sync['next_seq'])
+        self.assertEqual(
+            fenced['combat_base_revision'], sync['base_revision'])
+        self.assertEqual([], sync['pending'])
+
+        # This Bot's combat is live for the rest of the round: its fire clock
+        # keeps advancing on the fenced base, and the very next proposal is
+        # ack+1 and acknowledged.
+        recovered_message = runtime.update(.20, .40)[0]
+        recovered = bot_state_rows.bots(recovered_message)[0]
+        self.assertEqual(
+            fenced['combat_ack_seq'] + 1, recovered['combat_seq'])
+        self.assertTrue(server.update_bot_states(1, bot_state_rows.publication({
+            'round_id': server.round_id,
+            'bots': bot_state_rows.bots(recovered_message),
+        })), server.last_bot_state_reject)
+        self.assertEqual('', server.last_bot_state_reject_code)
+        self.assertEqual(
+            recovered['combat_seq'],
+            server.bot_states[11]['combat_ack_seq'])
 
     def test_external_base_replay_waits_for_wire_before_reserving_sequence(self):
         descriptor = _critical_descriptor()
@@ -12041,7 +12296,7 @@ class BotRuntimeTests(unittest.TestCase):
                 health=950, critical=burning,
                 revision=1, base_revision=1)]})
 
-        first = runtime.update(.20, .20)[0]['bots'][0]
+        first = bot_state_rows.bots(runtime.update(.20, .20)[0])[0]
         self.assertEqual(1, first['combat_seq'])
         runtime.apply_snapshot({
             'server_tick': 2,
@@ -12055,7 +12310,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(sync['unpublished_steps']))
         self.assertEqual(0, runtime.states[11]['combat_seq'])
 
-        publication = runtime.update(.20, .40)[0]['bots'][0]
+        publication = bot_state_rows.bots(runtime.update(.20, .40)[0])[0]
 
         self.assertEqual(1, publication['combat_seq'])
         self.assertEqual(1, sync['next_seq'])
@@ -12098,7 +12353,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(first_replay, sync['unpublished_steps'])
         self.assertEqual(0, sync['next_seq'])
         self.assertEqual([], sync['pending'])
-        publication = runtime.update(.20, .40)[0]['bots'][0]
+        publication = bot_state_rows.bots(runtime.update(.20, .40)[0])[0]
         self.assertEqual(1, publication['combat_seq'])
 
     def test_external_hit_after_publication_ack_does_not_double_apply_fire(self):
@@ -12122,8 +12377,8 @@ class BotRuntimeTests(unittest.TestCase):
 
         publication = None
         for index in range(5):
-            publication = runtime.update(
-                .20, .20 + index * .20)[0]['bots'][0]
+            publication = bot_state_rows.bots(runtime.update(
+                .20, .20 + index * .20)[0])[0]
         self.assertEqual(900, publication['health'])
         runtime.apply_snapshot({
             'server_tick': 2,
@@ -12185,7 +12440,7 @@ class BotRuntimeTests(unittest.TestCase):
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
             'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
         takeover_bot = dict(
-            self.start['bots'][0], health=800, max_health=1000,
+            bot_state_rows.bots(self.start)[0], health=800, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
             fire_seq=0, shell_index=0, reload_time=reload_duration,
             reload_duration=reload_duration, critical=burning,
@@ -12196,15 +12451,15 @@ class BotRuntimeTests(unittest.TestCase):
             self.start, bot_manifest=[takeover_bot]))
 
         for index in range(3):
-            outgoing = runtime.update(
-                .20, 100.2 + index * .20)[0]['bots'][0]
+            outgoing = bot_state_rows.bots(runtime.update(
+                .20, 100.2 + index * .20)[0])[0]
         self.assertEqual(750, outgoing['health'])
         self.assertEqual(5.0, outgoing['combat_fire_elapsed'])
         self.assertEqual(0.0, outgoing['combat_fire_timer'])
 
         for index in range(25):
-            outgoing = runtime.update(
-                .20, 100.8 + index * .20)[0]['bots'][0]
+            outgoing = bot_state_rows.bots(runtime.update(
+                .20, 100.8 + index * .20)[0])[0]
         self.assertEqual(500, outgoing['health'])
         self.assertFalse(outgoing['critical']['fire'])
         self.assertEqual(0.0, outgoing['combat_fire_elapsed'])
@@ -12224,7 +12479,7 @@ class BotRuntimeTests(unittest.TestCase):
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
             'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
         takeover_bot = dict(
-            self.start['bots'][0], health=900, max_health=1000,
+            bot_state_rows.bots(self.start)[0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
             fire_seq=0, shell_index=0, reload_time=reload_duration,
             reload_duration=reload_duration, critical=burning,
@@ -12235,7 +12490,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.battle_start(dict(
             self.start, bot_manifest=[takeover_bot]))
 
-        local = runtime.update(.20, 100.2)[0]['bots'][0]
+        local = bot_state_rows.bots(runtime.update(.20, 100.2)[0])[0]
         self.assertEqual(4, local['combat_seq'])
         self.assertEqual(2.2, local['combat_fire_elapsed'])
 
@@ -12255,7 +12510,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([], sync['pending'])
         self.assertEqual([], sync['unpublished_steps'])
 
-        outgoing = runtime.update(.20, 100.4)[0]['bots'][0]
+        outgoing = bot_state_rows.bots(runtime.update(.20, 100.4)[0])[0]
         self.assertEqual(800, outgoing['health'])
         self.assertEqual(3.2, outgoing['combat_fire_elapsed'])
         self.assertEqual(6, outgoing['combat_seq'])
@@ -12274,7 +12529,7 @@ class BotRuntimeTests(unittest.TestCase):
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
             'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
         takeover_bot = dict(
-            self.start['bots'][0], health=900, max_health=1000,
+            bot_state_rows.bots(self.start)[0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
             fire_seq=0, shell_index=0, reload_time=reload_duration,
             reload_duration=reload_duration, critical=burning,
@@ -12285,7 +12540,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.battle_start(dict(
             self.start, bot_manifest=[takeover_bot]))
 
-        local = runtime.update(.20, 100.2)[0]['bots'][0]
+        local = bot_state_rows.bots(runtime.update(.20, 100.2)[0])[0]
         self.assertEqual(4, local['combat_seq'])
         self.assertEqual(2.2, local['combat_fire_elapsed'])
 
@@ -12305,7 +12560,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([], sync['pending'])
         self.assertFalse(sync['authority_handoff_pending'])
 
-        outgoing = runtime.update(.20, 100.4)[0]['bots'][0]
+        outgoing = bot_state_rows.bots(runtime.update(.20, 100.4)[0])[0]
         self.assertEqual(800, outgoing['health'])
         self.assertEqual(3.2, outgoing['combat_fire_elapsed'])
         self.assertEqual(5, outgoing['combat_seq'])
@@ -12324,7 +12579,7 @@ class BotRuntimeTests(unittest.TestCase):
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
             'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
         takeover_bot = dict(
-            self.start['bots'][0], health=900, max_health=1000,
+            bot_state_rows.bots(self.start)[0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
             fire_seq=0, shell_index=0, reload_time=reload_duration,
             reload_duration=reload_duration, critical=burning,
@@ -12354,7 +12609,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([], sync['unpublished_steps'])
         self.assertFalse(sync['authority_handoff_pending'])
 
-        outgoing = runtime.update(.20, 100.4)[0]['bots'][0]
+        outgoing = bot_state_rows.bots(runtime.update(.20, 100.4)[0])[0]
         self.assertEqual((700, 3.2, 6), (
             outgoing['health'], outgoing['combat_fire_elapsed'],
             outgoing['combat_seq']))
@@ -12373,7 +12628,7 @@ class BotRuntimeTests(unittest.TestCase):
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
             'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
         takeover_bot = dict(
-            self.start['bots'][0], health=900, max_health=1000,
+            bot_state_rows.bots(self.start)[0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
             fire_seq=0, shell_index=0, reload_time=reload_duration,
             reload_duration=reload_duration, critical=burning,
@@ -12383,7 +12638,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.battle_start(dict(self.start, bot_authority_id=2))
         runtime.battle_start(dict(
             self.start, bot_manifest=[takeover_bot]))
-        local = runtime.update(.20, 100.2)[0]['bots'][0]
+        local = bot_state_rows.bots(runtime.update(.20, 100.2)[0])[0]
         self.assertEqual((4, 2.2), (
             local['combat_seq'], local['combat_fire_elapsed']))
 
@@ -12404,7 +12659,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([], sync['pending'])
         self.assertFalse(sync['authority_handoff_pending'])
 
-        outgoing = runtime.update(.20, 100.4)[0]['bots'][0]
+        outgoing = bot_state_rows.bots(runtime.update(.20, 100.4)[0])[0]
         self.assertEqual((750, 3.2, 5), (
             outgoing['health'], outgoing['combat_fire_elapsed'],
             outgoing['combat_seq']))
@@ -12422,7 +12677,7 @@ class BotRuntimeTests(unittest.TestCase):
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
             'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
         initial = dict(
-            self.start['bots'][0], health=900, max_health=1000,
+            bot_state_rows.bots(self.start)[0], health=900, max_health=1000,
             alive=True, critical=burning, combat_revision=4,
             combat_base_revision=1, combat_ack_seq=3,
             combat_fire_elapsed=2.0, combat_fire_timer=0.0)
@@ -12484,7 +12739,7 @@ class BotRuntimeTests(unittest.TestCase):
         before = dict(runtime.states[11])
 
         outgoing = runtime.update(.04, 1.0)
-        state = outgoing[0]['bots'][0]
+        state = bot_state_rows.bots(outgoing[0])[0]
 
         self.assertEqual(1, state['movement_dir'])
         self.assertEqual(0, state['rotation_dir'])
@@ -14025,7 +14280,7 @@ class BotRuntimeTests(unittest.TestCase):
             {'id': 2, 'team': 1, 'alive': True,
              'x': 5, 'y': 0, 'z': 5,
              'effective_params': _effective_params_snapshot()}])
-        self.assertFalse(final[0]['bots'][0]['alive'])
+        self.assertFalse(bot_state_rows.bots(final[0])[0]['alive'])
         self.assertEqual(0, self.runtime.states[11]['fire_seq'])
 
     def test_terminal_snapshot_freezes_all_bot_updates(self):
@@ -14706,7 +14961,7 @@ class BotRuntimeTests(unittest.TestCase):
         states = [message for message in publications
                   if message.get('type') == 'bot_state']
         self.assertEqual(1, len(states))
-        self.assertEqual([], states[0]['bots'])
+        self.assertEqual([], bot_state_rows.bots(states[0]))
 
     def test_runtime_caches_one_traffic_decision_with_the_planner_command(self):
         self.runtime.battle_start(self.start)
@@ -15254,7 +15509,7 @@ class BotRuntimeTests(unittest.TestCase):
         waiting = dict(self.start, bot_authority_id=2)
         self.assertEqual([], self.runtime.battle_start(waiting))
         snapshot_bot = dict(
-            self.start['bots'][0], health=900, max_health=1000,
+            bot_state_rows.bots(self.start)[0], health=900, max_health=1000,
             alive=True, x=1, y=0, z=2, yaw=0.5,
             fire_seq=7, shell_index=0, next_shell_index=0,
             ammo_remaining=[38], ammo_reload_pending=False,
@@ -15307,21 +15562,22 @@ class BotRuntimeTests(unittest.TestCase):
         publication = self.runtime.update(.20, 1.0)[0]
         expected_remaining = self.runtime._gun_states[11].reload_full - 0.20
         self.assertAlmostEqual(
-            expected_remaining, publication['bots'][0]['reload_time'])
+            expected_remaining,
+            bot_state_rows.decoded(publication, 0)['reload_time'], places=6)
 
         server, unused_manifest, unused_socket = \
             ServerBotStateRevisionTests._server()
         for name in ('shell_index', 'next_shell_index', 'ammo_remaining',
                      'ammo_reload_pending', 'clip', 'clip_size'):
-            server.bot_states[11][name] = publication['bots'][0][name]
+            server.bot_states[11][name] = bot_state_rows.bots(publication)[0][name]
         self.assertTrue(server.update_bot_states(
-            SIMULATION_WORKER_AUTHORITY_ID, {
+            SIMULATION_WORKER_AUTHORITY_ID, bot_state_rows.publication({
                 'round_id': server.round_id,
-                'bots': publication['bots'],
+                'bots': bot_state_rows.bots(publication),
                 'sample_time_us': publication['sample_time_us'],
                 'source_batch_horizon_us':
                     publication['source_batch_horizon_us'],
-            }), server.last_bot_state_reject)
+            })), server.last_bot_state_reject)
         start = server.current_battle_message()
         start['bot_authority_id'] = 1
         # The room preset travels with the round, so the successor installs
@@ -15393,7 +15649,7 @@ class BotRuntimeTests(unittest.TestCase):
             self.start, bot_authority_id=2)))
         reload_duration = self.runtime._gun_states[11].reload_full
         takeover = dict(
-            self.start['bots'][0], x=200.0, y=4.0, z=300.0,
+            bot_state_rows.bots(self.start)[0], x=200.0, y=4.0, z=300.0,
             yaw=1.0, aim_yaw=1.4, gun_pitch=-0.25,
             movement_dir=-1, rotation_dir=1, health=900,
             max_health=1000, alive=True,
@@ -15422,8 +15678,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIs(sync, self.runtime._combat_sync[11])
         self.assertTrue(sync['authority_handoff_pending'])
         self.assertEqual((200.0, 4.0, 300.0, 1.0), (
-            resumed[0]['bots'][0]['x'], resumed[0]['bots'][0]['y'],
-            resumed[0]['bots'][0]['z'], resumed[0]['bots'][0]['yaw']))
+            bot_state_rows.bots(resumed[0])[0]['x'], bot_state_rows.bots(resumed[0])[0]['y'],
+            bot_state_rows.bots(resumed[0])[0]['z'], bot_state_rows.bots(resumed[0])[0]['yaw']))
 
     def test_server_macro_order_drives_local_adapter_with_human_id_mapping(self):
         self.runtime.battle_start(self.start)
@@ -15484,9 +15740,9 @@ class BotRuntimeTests(unittest.TestCase):
                     ground_probe=lambda *unused: 0.0,
                     physics_ground_probe=lambda *unused: 0.0,
                     spawn_resolver=_spawn_resolver, baked_graph=_graph())
-                manifest = runtime.battle_start(dict(self.start, bots=[{
+                manifest = bot_state_rows.bots(runtime.battle_start(dict(self.start, bots=[{
                     'id': 11, 'team': 1, 'slot': 0, 'name': 'Recipient',
-                }]))[0]['bots']
+                }]))[0])
                 state = runtime.states[11]
                 state.update(
                     x=start[0], y=0.0, z=start[1], yaw=0.0, speed=0.0)
@@ -15545,9 +15801,9 @@ class BotRuntimeTests(unittest.TestCase):
             ground_probe=lambda *unused: 0.0,
             physics_ground_probe=lambda *unused: 0.0,
             spawn_resolver=_spawn_resolver, baked_graph=_graph())
-        manifest = runtime.battle_start(dict(self.start, bots=[{
+        manifest = bot_state_rows.bots(runtime.battle_start(dict(self.start, bots=[{
             'id': 11, 'team': 1, 'slot': 0, 'name': 'Recipient',
-        }]))[0]['bots']
+        }]))[0])
         state = runtime.states[11]
         state.update(
             x=3.0, y=0.0, z=2.0, yaw=0.0, speed=0.0,
@@ -16341,13 +16597,13 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertGreater(offset_goals, 0)
 
     def test_prohorovka_bot_hull_cannot_settle_past_the_stock_red_border(self):
-        # scripts/arena_defs/05_prohorovka.xml boundingBox. The shipped graph
-        # samples out to x=512 because the baker padded its grid around the
-        # authored east-lane waypoint at x=496, so the map-edge guard used to
-        # accept a Bot whose whole hull sat outside the red border.
+        # Reproduce the old overextended bake explicitly. Current shipped
+        # data honors the arena; runtime clipping must still fence a stale
+        # graph whose east edge was padded around an authored waypoint.
         arena = (-500.0, -500.0, 500.0, 500.0)
         graph = json.loads(
             (PORT_ROOT / 'navgraphs' / '05_prohorovka.json').read_text())
+        graph['bounds'][2] = 512.0
         state = {'id': 11, 'half_length': 3.5, 'half_width': 1.7}
         outside = (506.0, 0.0, -316.0)
         inside = (494.0, 0.0, -316.0)
@@ -16532,7 +16788,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(5.0, runtime.states[14]['_route_lane_offset'])
         self.assertEqual([14, 14], [value[0] for value in checked])
 
-    def test_malinovka_route_lanes_reject_shallow_and_fatal_hazards(self):
+    def test_malinovka_route_lanes_allow_navigable_water_and_reject_fatal_hazards(self):
         graph = json.loads(
             (PORT_ROOT / 'navgraphs' / '02_malinovka.json').read_text())
         runtime = self.module.BotRuntime(1)
@@ -16552,9 +16808,9 @@ class BotRuntimeTests(unittest.TestCase):
             -226.92893218813452, 0.0, 202.92893218813452)
         central_minus_five = (
             -230.46446609406726, 0.0, 206.46446609406726)
-        self.assertTrue(runtime.navigator.grid.point_has_baked_hazard(
+        self.assertFalse(runtime.navigator.grid.point_has_baked_hazard(
             central_minus_ten, self.module.BAKED_SHALLOW_WATER))
-        self.assertTrue(runtime.navigator.grid.point_has_baked_hazard(
+        self.assertFalse(runtime.navigator.grid.point_has_baked_hazard(
             central_minus_five, self.module.BAKED_SHALLOW_WATER))
         central = runtime._route_lane_target(
             24, (-270.0, 0.0, 174.0), (-234.0, 0.0, 210.0),
@@ -16562,8 +16818,8 @@ class BotRuntimeTests(unittest.TestCase):
                 'route_id': 'central_field', 'route_index': 3,
                 'route_anchor': (-270.0, 0.0, 174.0),
             }, 1.0)
-        self.assertEqual((-234.0, 0.0, 210.0), central)
-        self.assertEqual(0.0, state['_route_lane_offset'])
+        self.assertEqual(central_minus_ten[::2], central[::2])
+        self.assertEqual(-10.0, state['_route_lane_offset'])
 
         west_group = (2, 'west_lake_road')
         state.update(_route_lane_group=west_group,
@@ -17309,8 +17565,8 @@ class BotRuntimeTests(unittest.TestCase):
             {'id': 11, 'team': 1, 'slot': 0, 'name': 'Clear'},
             {'id': 12, 'team': 1, 'slot': 1, 'name': 'Blocked'},
         ]
-        manifest = runtime.battle_start(
-            dict(self.start, bots=roster))[0]['bots']
+        manifest = bot_state_rows.bots(runtime.battle_start(
+            dict(self.start, bots=roster))[0])
         runtime.states[11].update(x=0.0, y=0.0, z=0.0, yaw=0.0)
         runtime.states[12].update(x=10.0, y=0.0, z=0.0, yaw=0.0)
         enemy = {
@@ -17321,7 +17577,7 @@ class BotRuntimeTests(unittest.TestCase):
         enemy = _admit_player(enemy)
 
         outgoing = runtime.update(.04, 1.0, players=[enemy])
-        bot_states = next(message['bots'] for message in outgoing
+        bot_states = next(bot_state_rows.bots(message) for message in outgoing
                           if message['type'] == 'bot_state')
         observation = next(message for message in outgoing
                            if message['type'] == 'bot_observation')
@@ -17383,10 +17639,10 @@ class BotRuntimeTests(unittest.TestCase):
             'dominant_role': 'support', 'desired_range': 200.0,
             'fire_range': 500.0, 'roles': {'support': 1.0},
         }
-        manifest = runtime.battle_start(dict(self.start, bots=[{
+        manifest = bot_state_rows.bots(runtime.battle_start(dict(self.start, bots=[{
             'id': 11, 'team': 1, 'slot': 0, 'name': 'Limited TD',
             'profile': profile,
-        }]))[0]['bots']
+        }]))[0])
         state = runtime.states[11]
         state.update(x=0.0, y=0.0, z=0.0, yaw=0.0,
                      aim_yaw=0.0, speed=0.0)
@@ -17510,8 +17766,8 @@ class BotRuntimeTests(unittest.TestCase):
             {'id': 11, 'team': 1, 'slot': 0, 'name': 'Blocked-A'},
             {'id': 12, 'team': 1, 'slot': 1, 'name': 'Blocked-B'},
         ]
-        manifest = runtime.battle_start(
-            dict(self.start, bots=roster))[0]['bots']
+        manifest = bot_state_rows.bots(runtime.battle_start(
+            dict(self.start, bots=roster))[0])
         runtime.states[11].update(x=0.0, y=0.0, z=0.0)
         runtime.states[12].update(x=5.0, y=0.0, z=0.0)
         runtime.set_camera_position((1000.0, 0.0, 1000.0))
@@ -17523,7 +17779,7 @@ class BotRuntimeTests(unittest.TestCase):
         enemy = _admit_player(enemy)
 
         outgoing = runtime.update(.04, 1.0, players=[enemy])
-        bot_states = next(message['bots'] for message in outgoing
+        bot_states = next(bot_state_rows.bots(message) for message in outgoing
                           if message['type'] == 'bot_state')
         contact = next(message for message in outgoing
                        if message['type'] == 'bot_observation')['contacts'][0]
@@ -18387,8 +18643,8 @@ class BotRuntimeTests(unittest.TestCase):
              'name': 'Observer-%d' % index}
             for index in range(29)
         ]
-        manifest = runtime.battle_start(
-            dict(self.start, bots=roster))[0]['bots']
+        manifest = bot_state_rows.bots(runtime.battle_start(
+            dict(self.start, bots=roster))[0])
         identities = dict((state['id'], state) for state in manifest)
         planner = BotPlanner()
         observation_batches = 0
@@ -18407,7 +18663,7 @@ class BotRuntimeTests(unittest.TestCase):
             if not any(message['type'] == 'bot_observation'
                        for message in outgoing):
                 continue
-            wire_states = next(message['bots'] for message in outgoing
+            wire_states = next(bot_state_rows.bots(message) for message in outgoing
                                if message['type'] == 'bot_state')
             # The wire deliberately omits manifest-owned identity/profile
             # fields. Rebuild exactly what the server sanitizer gives its

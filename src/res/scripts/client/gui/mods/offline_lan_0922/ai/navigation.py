@@ -8,6 +8,9 @@ The implementation is engine-free; the caller supplies terrain and collision
 probes so it can be tested outside the legacy client.
 """
 
+from gui.mods.offline_lan_0922.worker_diagnostics import (
+    observed, count as combat_count)
+
 import heapq
 import math
 from collections import deque
@@ -18,8 +21,15 @@ from gui.mods.offline_lan_0922.ai.driver import (
 
 SQRT_TWO = math.sqrt(2.0)
 BAKED_FATAL_HAZARDS = 1 | 2
-# Shallow water remains passable when no dry route exists, but the baked graph
-# assigns it a large traction/risk cost so ordinary shortcuts stay on land.
+# A reviewed ford cell whose scoped depth limit admits it beyond the baked
+# graph's ordinary navigable water limit. It stays passable when no dry route
+# exists, but carries a large traction/risk cost and the controlled-ford
+# discipline below, because such a ford is a hand-authored single-file
+# corridor. Ordinary navigable water carries no hazard bit: the baker and
+# bot_runtime.BOT_WATER_AVOID_DEPTH share one line, and penalising every
+# puddle below it queued whole teams on the dry bank of a 20 cm ditch. A
+# graph baked before that alignment still flags its shallow apron, which
+# only makes these consumers more conservative.
 BAKED_SHALLOW_WATER = 4
 # Cache compact answers, not crossed-cell lists, in the 32-bit worker.
 MAX_BAKED_CORRIDOR_CACHE = 2048
@@ -37,6 +47,11 @@ BLOCKED_STEP_REPLAN_SECONDS = 1.0
 BLOCKED_STEP_REPLAN_VERDICTS = 4
 BLOCKED_STEP_EDGE_TTL = 12.0
 BLOCKED_STEP_EDGE_PENALTY = 240.0
+# A destroyed vehicle is permanent static geometry, so a search must prefer a
+# real detour over the lane it occupies. The penalty stays soft, in the same
+# class as the other edge penalties, so a single-lane choke keeps a connected
+# graph and ends in an honest hold instead of an unplannable map.
+STATIC_HULL_EDGE_PENALTY = 240.0
 # LocalDriver deliberately owns short-lived contact recovery, but displacement
 # alone cannot detect a tank that rocks or circles without advancing its route.
 # Track progress towards the navigator's stable local target and, after a long
@@ -70,6 +85,32 @@ def _distance_2d(first, second):
 	dx = float(first[0]) - float(second[0])
 	dz = float(first[2]) - float(second[2])
 	return math.sqrt(dx * dx + dz * dz)
+
+
+def _hull_covers_cell(centre_x, centre_z, half_extent,
+		hull_x, hull_z, sine, cosine, half_length, half_width):
+	"""Return whether a hull box overlaps one axis-aligned graph cell square.
+
+	Testing the cell square rather than its centre matters: a 3.4 metre wide
+	hull can sit entirely between the centres of a four-metre bake and cover
+	neither of them while still blocking both.
+	"""
+	dx = float(hull_x) - float(centre_x)
+	dz = float(hull_z) - float(centre_z)
+	# The two cell axes, then the two hull axes: forward is (sin, cos) and the
+	# side is (cos, -sin), matching this module's atan2(x, z) yaw convention.
+	if abs(dx) > (half_extent + abs(sine) * half_length +
+			abs(cosine) * half_width):
+		return False
+	if abs(dz) > (half_extent + abs(cosine) * half_length +
+			abs(sine) * half_width):
+		return False
+	cell_radius = half_extent * (abs(sine) + abs(cosine))
+	if abs(dx * sine + dz * cosine) > half_length + cell_radius:
+		return False
+	if abs(dx * cosine - dz * sine) > half_width + cell_radius:
+		return False
+	return True
 
 
 class TerrainGrid(object):
@@ -112,6 +153,9 @@ class TerrainGrid(object):
 		self._edge_cache = {}
 		self._segment_cache = {}
 		self._failed_edges = {}
+		self._static_hull_edges = {}
+		self._static_hull_key = None
+		self.static_hull_revision = 0
 
 	def _install_baked_graph(self, graph):
 		if (graph.get('format') != BAKED_FORMAT_NAME or
@@ -362,8 +406,7 @@ class TerrainGrid(object):
 				except Exception:
 					break
 
-	def _failed_edge_penalty(self, first_cell, second_cell, now):
-		key = tuple(sorted((first_cell, second_cell)))
+	def _failed_edge_timed_penalty(self, key, now):
 		value = self._failed_edges.get(key)
 		if value is None:
 			return 0.0
@@ -372,8 +415,65 @@ class TerrainGrid(object):
 			return 0.0
 		return value[1]
 
+	def _failed_edge_penalty(self, first_cell, second_cell, now):
+		key = tuple(sorted((first_cell, second_cell)))
+		# A published wreck never expires on a timer: it stays marked until the
+		# hull leaves the roster.
+		return max(self._static_hull_edges.get(key, 0.0),
+		           self._failed_edge_timed_penalty(key, now))
+
+	def set_static_hulls(self, hulls):
+		"""Publish the destroyed hulls that now occupy baked navigation cells.
+
+		A wreck is exact new static geometry, not traffic: it never moves
+		again, so no plan through it can succeed and no amount of waiting
+		clears it. Marking the graph edges it occupies routes later searches
+		around it, refuses the direct shortcut, and drops the cached paths that
+		used to run through it. Only the cells the hull box really overlaps are
+		marked, so a wide road keeps every column the wreck does not occupy.
+
+		Returns whether the published set changed.
+		"""
+		key = tuple(sorted(
+			(int(hull[0]), round(float(hull[1]), 2), round(float(hull[2]), 2),
+			 round(float(hull[3]), 3), round(float(hull[4]), 2),
+			 round(float(hull[5]), 2))
+			for hull in hulls or ()))
+		if key == self._static_hull_key:
+			return False
+		self._static_hull_key = key
+		self.static_hull_revision += 1
+		edges = {}
+		half_extent = self.cell_size * 0.5
+		for unused_id, x, z, yaw, half_length, half_width in key:
+			half_length = max(0.5, half_length)
+			half_width = max(0.3, half_width)
+			sine = math.sin(yaw)
+			cosine = math.cos(yaw)
+			radius = math.sqrt(half_length * half_length +
+			                   half_width * half_width)
+			first = self.cell_for((x - radius, 0.0, z - radius))
+			last = self.cell_for((x + radius, 0.0, z + radius))
+			for cell_z in range(first[1], last[1] + 1):
+				for cell_x in range(first[0], last[0] + 1):
+					centre = self.point_for((cell_x, cell_z), 0.0)
+					if not _hull_covers_cell(
+							centre[0], centre[2], half_extent,
+							x, z, sine, cosine, half_length, half_width):
+						continue
+					for step_z in (-1, 0, 1):
+						for step_x in (-1, 0, 1):
+							if step_x == 0 and step_z == 0:
+								continue
+							edges[tuple(sorted((
+								(cell_x, cell_z),
+								(cell_x + step_x, cell_z + step_z))))] = (
+									STATIC_HULL_EDGE_PENALTY)
+		self._static_hull_edges = edges
+		return True
+
 	def segment_penalty(self, start, end, now):
-		if not self._failed_edges:
+		if not self._failed_edges and not self._static_hull_edges:
 			return 0.0
 		penalty = 0.0
 		for key in self._edge_keys_for_segment(start, end):
@@ -506,8 +606,25 @@ class TerrainGrid(object):
 		if not self._failed_edges:
 			return False
 		for index in range(len(path) - 1):
-			if self.segment_penalty(path[index], path[index + 1], now) > 0.0:
-				return True
+			for key in self._edge_keys_for_segment(path[index], path[index + 1]):
+				if self._failed_edge_timed_penalty(key, now) > 0.0:
+					return True
+		return False
+
+	def path_crosses_static_hull(self, path):
+		"""Return whether a planned path runs through a published wreck.
+
+		This is separate from the timed failure above because a wreck does not
+		expire. A caller retires a path once, when the hull set that invalidates
+		it is newer than the plan; re-planning with the same wrecks in place is
+		the best answer available even where the route still has to pass one.
+		"""
+		if not self._static_hull_edges:
+			return False
+		for index in range(len(path) - 1):
+			for key in self._edge_keys_for_segment(path[index], path[index + 1]):
+				if key in self._static_hull_edges:
+					return True
 		return False
 
 	def path_has_edge_penalty(self, path, edge_penalties):
@@ -838,7 +955,8 @@ class TerrainGrid(object):
 			hard_edge_penalties=None):
 		return _TerrainSearch(self._plan_steps(
 			start, goal, avoid_points, max_expansions, now,
-			bool(prefer_clearance), edge_penalties, hard_edge_penalties))
+			bool(prefer_clearance), edge_penalties, hard_edge_penalties),
+			self.static_hull_revision)
 
 	def _plan_steps(self, start, goal, avoid_points, max_expansions, now,
 			prefer_clearance, edge_penalties, hard_edge_penalties):
@@ -877,6 +995,7 @@ class TerrainGrid(object):
 			if queued_cost != cost_so_far.get(current):
 				continue
 			expansions += 1
+			combat_count('nav_astar_expansions')
 			goal_distance = math.sqrt(
 				(current[0] - goal_cell[0]) ** 2 +
 				(current[1] - goal_cell[1]) ** 2)
@@ -930,7 +1049,8 @@ class TerrainGrid(object):
 				            self._penalty(
 				                next_cell, avoid_points, prefer_clearance) +
 				            (self._failed_edge_penalty(current, next_cell, now)
-				             if self._failed_edges else 0.0) +
+				             if (self._failed_edges or
+				                 self._static_hull_edges) else 0.0) +
 				            local_penalty)
 				if next_cell not in cost_so_far or new_cost < cost_so_far[next_cell]:
 					cost_so_far[next_cell] = new_cost
@@ -987,6 +1107,7 @@ class TerrainGrid(object):
 		yield self._smooth(
 			tuple(path), now, prefer_clearance, hard_edge_penalties)
 
+	@observed('nav.smooth')
 	def _smooth(self, path, now=0.0, prefer_clearance=False,
 			edge_penalties=None):
 		if len(path) < 3:
@@ -1017,8 +1138,9 @@ class TerrainGrid(object):
 class _TerrainSearch(object):
 	"""Small resumable A* task so collision probes are spread across frames."""
 
-	def __init__(self, generator):
+	def __init__(self, generator, hull_revision):
 		self.generator = generator
+		self.hull_revision = hull_revision
 		self.done = False
 		self.result = None
 		self.last_frame = None
@@ -1049,6 +1171,7 @@ class TerrainNavigator(object):
 		                        baked_graph=baked_graph)
 		self.paths = {}
 		self.path_times = {}
+		self.path_hull_revisions = {}
 		self.searches = {}
 		self.search_times = {}
 		self.bot_states = {}
@@ -1140,6 +1263,7 @@ class TerrainNavigator(object):
 				for state in self.bot_direct_progress.values()),
 		}
 
+	@observed('nav.fallback')
 	def _fallback_target(self, bot_id, current, goal, now, avoid_points, state,
 			allow_safe_local=True):
 		"""Keep moving without treating an unproved long segment as drivable.
@@ -1177,6 +1301,7 @@ class TerrainNavigator(object):
 		self._set_fallback_mode(bot_id, 'reactive')
 		return tuple(goal)
 
+	@observed('nav.pending')
 	def _pending_target(self, bot_id, current, goal, now, state,
 			avoid_points=None, allow_last_target=True,
 			immediate_safe_local=False):
@@ -1315,6 +1440,7 @@ class TerrainNavigator(object):
 		state['replans'] = int(state.get('replans', 0)) + 1
 		return tuple(escape)
 
+	@observed('nav.macro_replan')
 	def _start_macro_replan(self, bot_id, state, current, target, now):
 		"""Reroute one bot without changing shared terrain or hazard state."""
 		escape = self.grid.safe_local_target(
@@ -1538,6 +1664,7 @@ class TerrainNavigator(object):
 		for key, _timestamp in ordered[:len(ordered) - 80]:
 			self.paths.pop(key, None)
 			self.path_times.pop(key, None)
+			self.path_hull_revisions.pop(key, None)
 
 	def _finish_search(self, key, search, now):
 		path = search.result or ()
@@ -1545,9 +1672,14 @@ class TerrainNavigator(object):
 		self.search_times.pop(key, None)
 		self.paths[key] = path
 		self.path_times[key] = float(now)
+		# A resumable search may have traversed a cell before a wreck appeared.
+		# Stamp the revision it started with so that path still gets retired.
+		self.path_hull_revisions[key] = search.hull_revision
 		if path:
+			combat_count('nav_search_completed')
 			self.search_completed += 1
 		else:
+			combat_count('nav_search_failed')
 			self.search_failed += 1
 
 	def _cancel_bot_searches(self, bot_id, keep_key=None, kind=None):
@@ -1564,6 +1696,7 @@ class TerrainNavigator(object):
 				owned = False
 			if (owned and key != keep_key and
 					(kind is None or path_key[0] == kind)):
+				combat_count('nav_search_superseded')
 				self.searches.pop(key, None)
 				self.search_times.pop(key, None)
 
@@ -1608,6 +1741,7 @@ class TerrainNavigator(object):
 		self.search_frame_serial += 1
 		self._accrue_search_credit(elapsed)
 
+	@observed('nav.search_batch')
 	def _advance_searches(self, now):
 		"""Give every pending A* task a deterministic fair frame share.
 
@@ -1622,6 +1756,7 @@ class TerrainNavigator(object):
 		if not self.search_frame_open:
 			self._begin_automatic_frame(now)
 		if self.search_processed_frame == self.search_frame_serial:
+			combat_count('nav_batch_already_processed')
 			return
 		self.search_processed_frame = self.search_frame_serial
 		self.search_frame_time = float(now)
@@ -1638,6 +1773,7 @@ class TerrainNavigator(object):
 			max(0, int(self.search_credit)),
 			max(0, int(self.search_frame_budget)))
 		processed = 0
+		combat_count('nav_batch_pending_jobs', len(queue))
 		while budget > 0 and queue:
 			key = queue.pop(0)
 			search = self.searches.get(key)
@@ -1655,6 +1791,9 @@ class TerrainNavigator(object):
 		self.search_frame_budget = max(
 			0, int(self.search_frame_budget) - processed)
 		self.search_next_key = queue[0] if queue else None
+		combat_count('nav_search_steps', processed)
+		if queue and budget <= 0:
+			combat_count('nav_batch_budget_exhausted')
 		self._trim_cache(now)
 
 	def tick(self, now):
@@ -1670,6 +1809,7 @@ class TerrainNavigator(object):
 				self._active_macro_edge_penalties(bot_id, now)
 			self.grid.trim_caches()
 
+	@observed('nav.path')
 	def _path(self, path_key, start, goal, now, avoid_points):
 		key = self._cache_key(path_key, goal)
 		owner = self._path_owner(path_key)
@@ -1691,19 +1831,37 @@ class TerrainNavigator(object):
 				owner, now)
 			# A probe can fail while distant chunks are still streaming. Successful
 			# paths are permanent for the battle; failed ones get another chance.
-			if (path and not self.grid.path_has_penalty(path, now) and
+			#
+			# The one exception is a wreck published after this plan, which
+			# retires it exactly once. A path replanned with the same hulls
+			# already marked is the best answer the graph has, even where it
+			# still has to run past one, so it must not be discarded and
+			# researched again on every following tick.
+			retired_by_hull = bool(
+				self.path_hull_revisions.get(key) !=
+				self.grid.static_hull_revision and
+				self.grid.path_crosses_static_hull(path))
+			if (path and not retired_by_hull and
+					not self.grid.path_has_penalty(path, now) and
 					not self.grid.path_has_edge_penalty(
 						path, hard_edge_penalties)):
 				self.path_times[key] = float(now)
+				combat_count('nav_path_cached')
+				self.path_hull_revisions[key] = self.grid.static_hull_revision
 				return key, path
 			if path:
+				combat_count('nav_path_penalty_invalidated')
 				del self.paths[key]
 				self.path_times.pop(key, None)
+				self.path_hull_revisions.pop(key, None)
 			else:
 				if float(now) - self.path_times.get(key, 0.0) < 8.0:
+					combat_count('nav_failed_path_cooldown')
 					return key, path
+				combat_count('nav_failed_path_retry')
 				del self.paths[key]
 				self.path_times.pop(key, None)
+				self.path_hull_revisions.pop(key, None)
 				self.grid.clear_negative_cache()
 		search = self.searches.get(key)
 		if search is None:
@@ -1721,6 +1879,9 @@ class TerrainNavigator(object):
 				path = (tuple(start), tuple(goal))
 				self.paths[key] = path
 				self.path_times[key] = float(now)
+				combat_count('nav_path_direct')
+				self.path_hull_revisions[key] = (
+					self.grid.static_hull_revision)
 				return key, path
 			# Moving tanks do not belong in a cached static terrain path. Including all
 			# 28 peers made every expansion scan transient positions, permanently baked
@@ -1734,6 +1895,9 @@ class TerrainNavigator(object):
 				hard_edge_penalties=hard_edge_penalties)
 			self.searches[key] = search
 			self.search_times[key] = float(now)
+			combat_count('nav_search_created')
+		else:
+			combat_count('nav_search_retained')
 		self._advance_searches(now)
 		if key in self.paths:
 			return key, self.paths[key]
@@ -1791,6 +1955,7 @@ class TerrainNavigator(object):
 		return self.grid.segment_has_baked_hazard(
 			path[index - 1], target, BAKED_SHALLOW_WATER)
 
+	@observed('nav.lookahead')
 	def _lookahead_index(self, current, path, index, path_key, now,
 			lookahead_distance):
 		"""Select a proved corridor point far enough ahead for current speed."""
@@ -1823,6 +1988,7 @@ class TerrainNavigator(object):
 				break
 		return lookahead
 
+	@observed('nav.next_target')
 	def next_target(self, bot_id, current, goal, path_key, now,
 			anchor=None, avoid_points=None, lookahead_distance=None,
 			movement_intent=True):
@@ -1875,6 +2041,8 @@ class TerrainNavigator(object):
 		request_transition = bool(had_request and request_changed)
 		allow_pending_last_target = True
 		if request_changed:
+			combat_count('nav_request_changed' if had_request else
+			             'nav_request_first')
 			# A new route segment or combat target is not evidence that the previous
 			# request stalled. A locally safe old target may bridge an asynchronous
 			# search only when it still advances the new intent.

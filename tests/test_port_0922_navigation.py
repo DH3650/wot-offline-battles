@@ -351,8 +351,8 @@ class ArenaRectangleClipTests(unittest.TestCase):
     """A baked rectangle is a sampling artifact; the red border is not."""
 
     # scripts/arena_defs/05_prohorovka.xml boundingBox in the pinned #1513
-    # client. The shipped graph samples 12 m further east because the baker
-    # padded its grid around the authored east-lane waypoint at x=496.
+    # client. Older bakes padded the graph beyond this rectangle around an
+    # authored east-lane waypoint; current bakes already honor the border.
     PROKHOROVKA_ARENA = (-500.0, -500.0, 500.0, 500.0)
 
     _DIRECTIONS = [[-1, -1], [0, -1], [1, -1], [-1, 0],
@@ -406,7 +406,7 @@ class ArenaRectangleClipTests(unittest.TestCase):
         return json.loads(
             (PORT_ROOT / 'navgraphs' / '05_prohorovka.json').read_text())
 
-    def test_shipped_prohorovka_cells_reach_past_the_stock_red_border(self):
+    def test_shipped_prohorovka_cells_stay_inside_the_stock_red_border(self):
         graph = self._prohorovka()
         grid = TerrainNavigator(lambda *unused: None, baked_graph=graph).grid
         outside = [(column, row)
@@ -417,13 +417,18 @@ class ArenaRectangleClipTests(unittest.TestCase):
                        graph['origin'][0] + column * graph['cell_size'] >
                        self.PROKHOROVKA_ARENA[2])]
 
-        self.assertTrue(outside)
-        self.assertTrue(any(grid._baked_edge_height(
-            (column - 1, row), (column, row)) is not None
-            for column, row in outside))
+        self.assertFalse(outside)
+        self.assertEqual(list(self.PROKHOROVKA_ARENA), list(grid.bounds))
 
-    def test_clipped_prohorovka_stops_planning_past_the_red_border(self):
-        graph = self._prohorovka()
+    def test_clip_stops_planning_past_the_red_border(self):
+        # Reproduce an old overextended bake without requiring shipped data
+        # to retain that defect after a fresh bake.
+        graph = self._row_graph()
+        graph['format'] = 'offline-lan-0922-navgraph'
+        graph['version'] = 2
+        graph['origin'] = [490.0, 0.0]
+        graph['bounds'] = list(self.PROKHOROVKA_ARENA)
+        graph['bounds'][2] = 508.0
         cell_size = graph['cell_size']
         origin_x = graph['origin'][0]
         entries = [(row, column)
@@ -451,6 +456,151 @@ class ArenaRectangleClipTests(unittest.TestCase):
             self.assertLessEqual(
                 origin_x + (index % graph['width']) * cell_size,
                 self.PROKHOROVKA_ARENA[2])
+
+
+class StaticHullNavigationTests(unittest.TestCase):
+    """A destroyed hull is exact static geometry the graph has to carry."""
+
+    @staticmethod
+    def _flat_graph(cell_size=4.0, cells=21):
+        directions = ((-1, -1), (0, -1), (1, -1), (-1, 0),
+                      (1, 0), (-1, 1), (0, 1), (1, 1))
+        links = []
+        for z in range(cells):
+            for x in range(cells):
+                links.append(sum(
+                    1 << index for index, (dx, dz) in enumerate(directions)
+                    if 0 <= x + dx < cells and 0 <= z + dz < cells))
+        return {
+            'format': 'offline-lan-0922-navgraph', 'version': 2,
+            'game_version': '0.9.22.0.1-cn-1513', 'map': '01_karelia',
+            'cell_size': cell_size, 'origin': (0.0, 0.0),
+            'bounds': (-1.0, -1.0, cells * cell_size, cells * cell_size),
+            'width': cells, 'height': cells,
+            'heights_mm': [0] * (cells * cells),
+            'links': links, 'hazards': [0] * (cells * cells),
+            'spawn_anchors': ((0.0, 0.0), (0.0, 0.0)),
+            'objective_bases': ((0.0, 0.0), (0.0, 0.0)),
+            'spawn_formations': {'1': (), '2': ()},
+            'routes': {'1': (), '2': ()},
+            'bake': {'max_grade': 0.30},
+        }
+
+    def _grid(self, cell_size=4.0):
+        return TerrainNavigator(
+            lambda *unused: None,
+            baked_graph=self._flat_graph(cell_size)).grid
+
+    def test_a_hull_between_cell_centres_still_marks_both_cells(self):
+        grid = self._grid()
+        # A 3.4 metre wide hull straddling the x=18 boundary of a four-metre
+        # bake covers neither the x=16 nor the x=20 cell centre. Ranking the
+        # cell square instead of its centre keeps both columns blocking.
+        self.assertTrue(grid.set_static_hulls(
+            ((7, 18.0, 40.0, 0.0, 3.5, 1.7),)))
+        edges = grid._static_hull_edges
+
+        self.assertEqual((16.0, 0.0, 40.0), grid.point_for((4, 10), 0.0))
+        self.assertEqual((20.0, 0.0, 40.0), grid.point_for((5, 10), 0.0))
+        # Both columns the hull straddles are entered through a marked edge.
+        self.assertIn(((4, 10), (5, 10)), edges)
+        self.assertIn(((3, 10), (4, 10)), edges)
+        self.assertIn(((5, 10), (6, 10)), edges)
+        # Only edges that touch the hull are marked; the next lane is free.
+        self.assertNotIn(((2, 10), (3, 10)), edges)
+        self.assertNotIn(((6, 10), (7, 10)), edges)
+        self.assertGreater(
+            grid.segment_penalty((18.0, 0.0, 32.0), (18.0, 0.0, 48.0), 0.0),
+            0.0)
+        self.assertFalse(
+            grid.dry_segment_clear((18.0, 0.0, 32.0), (18.0, 0.0, 48.0), 0.0))
+        # A lane the wreck does not reach stays free for everyone else.
+        self.assertEqual(
+            0.0,
+            grid.segment_penalty((8.0, 0.0, 32.0), (8.0, 0.0, 48.0), 0.0))
+
+    def test_an_unchanged_hull_set_is_not_recomputed(self):
+        grid = self._grid()
+        hulls = ((7, 20.0, 40.0, 0.0, 3.5, 1.7),)
+
+        self.assertTrue(grid.set_static_hulls(hulls))
+        edges = grid._static_hull_edges
+        self.assertFalse(grid.set_static_hulls(hulls))
+        self.assertIs(edges, grid._static_hull_edges)
+        self.assertTrue(grid.set_static_hulls(()))
+        self.assertEqual({}, grid._static_hull_edges)
+
+    def test_a_published_hull_retires_the_cached_path_through_it(self):
+        grid = self._grid()
+        path = ((20.0, 0.0, 32.0), (20.0, 0.0, 40.0), (20.0, 0.0, 48.0))
+        clear = ((8.0, 0.0, 32.0), (8.0, 0.0, 48.0))
+
+        self.assertFalse(grid.path_crosses_static_hull(path))
+        grid.set_static_hulls(((7, 20.0, 40.0, 0.0, 3.5, 1.7),))
+        self.assertTrue(grid.path_crosses_static_hull(path))
+        self.assertFalse(grid.path_crosses_static_hull(clear))
+        # A wreck is not a timed failure, so it must not be reported as one:
+        # the caller retires a plan once per hull revision instead.
+        self.assertFalse(grid.path_has_penalty(path, 0.0))
+
+    def test_a_pending_search_does_not_claim_a_new_wreck_revision(self):
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=self._flat_graph())
+        start, goal = (20.0, 0.0, 20.0), (20.0, 0.0, 76.0)
+        path_key = ('route', 1, 'pending', 0)
+        key = navigator._cache_key(path_key, goal)
+        search = navigator.grid.begin_plan(start, goal)
+        navigator.searches[key] = search
+        navigator.search_times[key] = 0.0
+        search.step(8)
+        self.assertFalse(search.done)
+        navigator.grid.set_static_hulls(((7, 20.0, 40.0, 0.0, 3.5, 1.7),))
+        while not search.done:
+            search.step(1)
+        self.assertTrue(navigator.grid.path_crosses_static_hull(search.result))
+        navigator._finish_search(key, search, 0.1)
+        self.assertNotEqual(navigator.grid.static_hull_revision,
+                            navigator.path_hull_revisions[key])
+        navigator._path(path_key, start, goal, 0.2, None)
+        if key in navigator.paths:
+            self.assertFalse(navigator.grid.path_crosses_static_hull(
+                navigator.paths[key]))
+        else:
+            self.assertIn(key, navigator.searches)
+
+    def test_a_sealed_route_is_researched_once_not_every_tick(self):
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=self._flat_graph())
+        key = ('route', 1, 'direct', 0)
+        start = (20.0, 0.0, 20.0)
+        goal = (20.0, 0.0, 60.0)
+        navigator.next_target(1, start, goal, key, 0.0)
+        # Seal every lane so no replan can avoid the wrecks.
+        navigator.grid.set_static_hulls(tuple(
+            (index, 4.0 * index, 40.0, 0.0, 3.5, 2.1)
+            for index in range(21)))
+
+        searches = []
+        for tick in range(1, 61):
+            before = navigator.search_completed + navigator.search_failed
+            navigator.next_target(1, start, goal, key, tick * 0.1)
+            searches.append(
+                navigator.search_completed + navigator.search_failed - before)
+
+        self.assertLessEqual(sum(searches), 4)
+
+    def test_a_search_prefers_the_free_lane_beside_a_wreck(self):
+        grid = self._grid()
+        start = (20.0, 0.0, 20.0)
+        goal = (20.0, 0.0, 60.0)
+        grid.set_static_hulls(((7, 20.0, 40.0, 0.0, 3.5, 1.7),))
+
+        path = grid.plan(start, goal, prefer_clearance=False)
+
+        self.assertTrue(path)
+        self.assertFalse(grid.path_has_penalty(path, 0.0))
+        self.assertGreater(
+            max(abs(point[0] - 20.0) for point in path), 0.0)
 
 
 if __name__ == '__main__':

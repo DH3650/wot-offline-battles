@@ -23,7 +23,7 @@ from gui.mods.offline_lan_0922.artillery_controller import \
 from gui.mods.offline_lan_0922.authority_worker_probe import \
     AuthorityWorkerProbe, write_probe_record
 from gui.mods.offline_lan_0922.battle_feedback import (
-    SixthSenseController, VehicleStatePresenter)
+    SixthSenseController, VehicleStatePresenter, is_gold_shell)
 from gui.mods.offline_lan_0922.bot_runtime import (
     BOT_WATER_AVOID_DEPTH, BotRuntime, PROBE_KINDS,
     WORKER_CONTROL_SECONDS)
@@ -416,6 +416,7 @@ def _is_port_object(value):
     return isinstance(origin, str) and origin.startswith(_PORT_PACKAGE)
 
 
+_EMPTY_GROUND_FILTER = object()
 _FRAME_STAGE_NAMES = (
     'house', 'sync', 'critical', 'drown', 'prewarm', 'transition', 'local',
     'outline', 'bots_update', 'bot_present', 'bot_events', 'spot', 'lock',
@@ -1548,6 +1549,11 @@ class BattleRuntime(object):
 
     def __init__(self, runtime=None):
         self._runtime = runtime
+        # Keep stable callable objects alive for the native #1513 data-link
+        # setters.  Re-reading a bound method would create a temporary object.
+        self._local_vehicle_speed_link = self._read_local_vehicle_speed
+        self._local_vehicle_rotation_speed_link = \
+            self._read_local_vehicle_rotation_speed
         self._config = None
         self._worker_mode = False
         self._start_message = None
@@ -1640,6 +1646,7 @@ class BattleRuntime(object):
         self._bot_yaw_rates = {}
         self._track_report_time = None
         self._hit_impulse_reports = 0
+        self._feedback_shell_failures = set()
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_drive_turn = 0.0
@@ -1707,7 +1714,10 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._reset_local_camera_motion()
         self._local_engine_mode = None
+        self._local_engine_state = None
+        self._local_engine_audio_report = None
         self._spectated_engine_id = None
         self._local_grind = 0
         self._local_motion_soft_block = False
@@ -1835,6 +1845,7 @@ class BattleRuntime(object):
         self._projectile_visual_meta = {}
         self._projectile_visual_terminals = _RecentIdSet()
         self._projectile_terminal_data = {}
+        self._projectile_scene_stop_reasons = {}
         self._projectile_target_positions = {}
         self._projectile_position_history = []
         self._projectile_historic_pose_cache = None
@@ -1874,7 +1885,7 @@ class BattleRuntime(object):
         self._config = dict(config or {})
         self._worker_mode = bool(self._config.get('worker_mode', False))
         self._combat_diagnostics = (
-            WorkerCombatDiagnostics(_PROFILE_CLOCK)
+            WorkerCombatDiagnostics(_PROFILE_CLOCK, detail_stride=4)
             if self._worker_mode and PERFORMANCE_DIAGNOSTICS else None)
         if self._worker_mode:
             self._config['native_remote_vehicles'] = False
@@ -1954,6 +1965,7 @@ class BattleRuntime(object):
         self._bot_yaw_rates = {}
         self._track_report_time = None
         self._hit_impulse_reports = 0
+        self._feedback_shell_failures = set()
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_drive_turn = 0.0
@@ -2017,7 +2029,10 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._reset_local_camera_motion()
         self._local_engine_mode = None
+        self._local_engine_state = None
+        self._local_engine_audio_report = None
         self._spectated_engine_id = None
         self._local_grind = 0
         self._local_motion_soft_block = False
@@ -2128,6 +2143,7 @@ class BattleRuntime(object):
         self._projectile_visual_meta = {}
         self._projectile_visual_terminals = _RecentIdSet()
         self._projectile_terminal_data = {}
+        self._projectile_scene_stop_reasons = {}
         self._projectile_target_positions = {}
         self._projectile_position_history = []
         self._projectile_historic_pose_cache = None
@@ -4783,6 +4799,28 @@ class BattleRuntime(object):
         ground_filter = probe(x, z)
         return ground_filter if callable(ground_filter) else None
 
+    def _prepared_ground_filter(self, points):
+        """Build one broken-skin filter covering several ground columns.
+
+        A pass that samples many columns of one pose does not need a rebuilt
+        candidate set per column.  The prepared sweep filter covers the whole
+        envelope and still resolves each hit by its exact native identity
+        against the live accepted ledger, so it decides exactly what the
+        per-column filter decides for every column inside that envelope.
+        Returns ``None`` when this runtime cannot prepare one, which keeps the
+        per-column path in ``_suspension_ground_y``.
+        """
+        probe = getattr(
+            self._destructibles, 'prepare_horizontal_collision_filter', None)
+        if not callable(probe) or not points:
+            return None
+        xs = [float(point[0]) for point in points]
+        zs = [float(point[1]) for point in points]
+        prepared = probe(
+            self._vector((min(xs), 0.0, min(zs))),
+            self._vector((max(xs), 0.0, max(zs))))
+        return prepared if callable(prepared) else _EMPTY_GROUND_FILTER
+
     def _collide_down(self, start, end, ground_filter):
         """Vertical probe that skips the skin of an already broken item."""
         if ground_filter is None:
@@ -4839,7 +4877,8 @@ class BattleRuntime(object):
         return height
 
     def _suspension_ground_y(
-            self, x, z, minimum_y, maximum_y, flat_maximum_y=None):
+            self, x, z, minimum_y, maximum_y, flat_maximum_y=None,
+            prepared_filter=None):
         """Return ground inside one suspension contact's legal travel.
 
         Unlike the navigation column, this probe must never acquire a roof or
@@ -4851,7 +4890,10 @@ class BattleRuntime(object):
         maximum_y = float(maximum_y)
         if maximum_y < minimum_y:
             minimum_y, maximum_y = maximum_y, minimum_y
-        ground_filter = self._ground_filter(x, z)
+        ground_filter = (
+            self._ground_filter(x, z) if prepared_filter is None else
+            None if prepared_filter is _EMPTY_GROUND_FILTER else
+            prepared_filter)
         start_y = maximum_y
         for unused_layer in range(3):
             try:
@@ -6086,6 +6128,11 @@ class BattleRuntime(object):
             steady_rotation_matrix=self._local_steady_rotation(),
             stabilised_matrix=self._local_stabilised_pose())
         self._local_camera_velocity = zero_motion
+        self._reset_local_camera_motion()
+        # Seed the motion history with the spawn pose so the very first
+        # copied-physics frame already has one earlier sample to difference.
+        self._local_motion_history.append(
+            (0.0, tuple(float(value) for value in self._local_position)))
         self._local_physics = vehicle_physics.derive_params(
             entity.typeDescriptor,
             self._local_factors(entity.typeDescriptor))
@@ -6142,9 +6189,82 @@ class BattleRuntime(object):
         self._run_optional_feature(
             'local body swinging', self._bind_local_body_swinging,
             (entity, model))
+        self._run_optional_feature(
+            'local engine audio motion',
+            self._bind_local_engine_audio_motion, (entity,))
         self._runtime.compatibility.bind_vehicle_pose_sources(
             self._avatar, entity)
         self._local_model = model
+        return True
+
+    def _read_local_vehicle_speed(self):
+        return float(self._local_speed)
+
+    def _read_local_vehicle_rotation_speed(self):
+        return float(self._local_turn_speed)
+
+    def _report_local_engine_audio(self, available, error=None):
+        """Publish one line per distinct player engine-audio motion outcome."""
+        record = (bool(available), None if error is None else str(error))
+        if record == self._local_engine_audio_report:
+            return False
+        self._local_engine_audio_report = record
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] PRESENTATION '
+            'local_engine_audio_motion=%s%s\n' % (
+                record[0],
+                '' if record[1] is None else ' error=%r' % (record[1],)))
+        return True
+
+    def _bind_local_engine_audio_motion(self, entity):
+        """Feed the player's stock engine audition from the copied motion.
+
+        Exact #1513 ``model_assembler.assembleDetailedEngineState`` links
+        ``vehicleSpeedLink`` and ``rotationSpeedLink`` to the native vehicle
+        filter's ``averageSpeed`` and ``averageRotationSpeed`` for every
+        vehicle, the player's own included.  The native
+        ``DetailedEngineState`` refresh reads both every tick.  The speed
+        link feeds ``RTPC_ext_speed_abs``/``_rel``, ``RTPC_ext_move`` and
+        the engine load; the rotation link feeds
+        ``RTPC_ext_rot_speed_abs``/``_rel``, and also raises the engine load
+        once the vehicle is actually translating.  This port drives the
+        player from a copied pose overlay and never feeds that filter, so
+        all of those inputs stayed at zero for the whole battle: a
+        stationary A/D pivot, whose only non-zero motion is rotation,
+        reached the engine sound as a parked tank.  Forward and reverse
+        motion still made noise only because the published
+        ``ownVehicleAuxPhysicsData`` RPM covers them, and #1513's simulated
+        engine law is speed-only.
+
+        Bot vehicles already publish these two links from copied motion, so
+        the player's own vehicle was the last one left on the dead native
+        filter.  A plain Python callable is the exact boundary #1513 accepts
+        here; ``DataLinks.createFloatLink`` only supports native data-link
+        owners.  This is presentation only: it never feeds authoritative
+        motion, and the copied speed and yaw rate carry the signs and units
+        (m/s, rad/s) the native normalisation expects.
+        """
+        appearance = getattr(entity, 'appearance', None)
+        detailed = getattr(appearance, 'detailedEngineState', None)
+        if detailed is None:
+            self._local_engine_state = None
+            self._report_local_engine_audio(
+                False, 'stock DetailedEngineState is unavailable')
+            return False
+        if detailed is self._local_engine_state:
+            return True
+        try:
+            detailed.vehicleSpeedLink = self._local_vehicle_speed_link
+            detailed.rotationSpeedLink = \
+                self._local_vehicle_rotation_speed_link
+        except Exception as error:
+            # A half-applied pair still reads the copied speed, so keep no
+            # ownership claim and let the next frame retry the whole rebind.
+            self._local_engine_state = None
+            self._report_local_engine_audio(False, error)
+            raise
+        self._local_engine_state = detailed
+        self._report_local_engine_audio(True)
         return True
 
     def _report_local_body_swinging(self, available, error=None):
@@ -6438,23 +6558,107 @@ class BattleRuntime(object):
             self._local_swinging_probe = None
         return True
 
+    def _reset_local_camera_motion(self):
+        """Drop the pose history behind the copied camera-motion estimate."""
+        self._local_motion_history = []
+        self._local_motion_clock = 0.0
+        self._local_motion_window = None
+        return True
+
+    def _camera_motion_window(self):
+        """Return the exact #1513 pose-sample interval for camera motion."""
+        window = self._local_motion_window
+        if window is not None:
+            return window
+        value = getattr(
+            self._runtime.constants, 'SERVER_TICK_LENGTH', None)
+        try:
+            window = float(value)
+        except (TypeError, ValueError):
+            raise RuntimeError('#1513 server tick length is unavailable')
+        if not window > 0.0:
+            raise RuntimeError('#1513 server tick length is invalid')
+        self._local_motion_window = window
+        return window
+
+    def _local_motion_pose_at(self, moment):
+        """Read the recorded copied pose at one exact earlier moment."""
+        history = self._local_motion_history
+        if not history or moment < history[0][0]:
+            return None
+        index = len(history) - 1
+        while index > 0 and history[index][0] > moment:
+            index -= 1
+        if index + 1 >= len(history):
+            return history[index][1]
+        earlier_moment, earlier = history[index]
+        later_moment, later = history[index + 1]
+        span = later_moment - earlier_moment
+        if span <= 0.0:
+            return later
+        ratio = (moment - earlier_moment) / span
+        return tuple(
+            earlier[axis] + (later[axis] - earlier[axis]) * ratio
+            for axis in range(3))
+
+    def _local_camera_motion(self, position, dt, previous_velocity):
+        """Estimate the pose motion #1513's dynamic cameras consume.
+
+        Retail fills ``WGVehicleFilter.velocity`` and ``acceleration`` from
+        the native filter, which observes the vehicle pose on the exact
+        ``constants.SERVER_TICK_LENGTH`` grid.  ``AccelerationSmoother`` and
+        ``SniperCamera.__calcCurOscillatorAcceleration`` turn that value into
+        camera rotation, so at sniper zoom it is an aiming input.
+
+        Differentiating this port's copied pose twice per rendered frame
+        measures the ground-follow snap instead of vehicle motion, and scales
+        the result with the frame rate: the same 112 m Prokhorovka drive
+        peaks at 18.5 m/s^2 at 60 FPS and 10.3 m/s^2 at 30 FPS.
+        Read the recorded pose at that exact interval instead.  Publication
+        cadence is unchanged; every rendered frame still carries a value.
+        """
+        window = self._camera_motion_window()
+        history = self._local_motion_history
+        moment = self._local_motion_clock + dt
+        self._local_motion_clock = moment
+        history.append((moment, position))
+        # Two intervals answer both differences.  Keep the newest sample
+        # already older than that span so the oldest lookup stays bracketed.
+        limit = moment - 2.0 * window
+        drop = 0
+        while drop + 1 < len(history) and history[drop + 1][0] <= limit:
+            drop += 1
+        if drop:
+            del history[:drop]
+
+        recent = self._local_motion_pose_at(moment - window)
+        if recent is None:
+            # A spawn, respawn or teardown leaves less than one interval of
+            # history.  Publish the last known velocity rather than invent
+            # one, exactly as a zero-length frame does.
+            return previous_velocity, (0.0, 0.0, 0.0)
+        velocity = tuple(
+            (position[axis] - recent[axis]) / window for axis in range(3))
+        earlier = self._local_motion_pose_at(moment - 2.0 * window)
+        if earlier is None:
+            return velocity, (0.0, 0.0, 0.0)
+        previous = tuple(
+            (recent[axis] - earlier[axis]) / window for axis in range(3))
+        acceleration = tuple(
+            (velocity[axis] - previous[axis]) / window for axis in range(3))
+        return velocity, acceleration
+
     def _update_local_presentation(self, entity, dt=0.0):
         if self._local_matrix is None or self._local_model is None:
             raise RuntimeError('player presentation is not attached')
         previous_yaw = float(getattr(
             self._local_matrix, 'yaw', self._local_yaw))
-        previous_position = _xyz(self._local_matrix.translation)
         position = self._vector(self._local_position)
         dt = max(0.0, float(dt))
         previous_velocity = _xyz(self._local_camera_velocity)
         if dt > 0.0:
-            current_position = _xyz(position)
-            velocity_tuple = tuple(
-                (current_position[index] - previous_position[index]) / dt
-                for index in range(3))
-            acceleration_tuple = tuple(
-                (velocity_tuple[index] - previous_velocity[index]) / dt
-                for index in range(3))
+            velocity_tuple, acceleration_tuple = self._local_camera_motion(
+                _xyz(position), dt, previous_velocity)
         else:
             velocity_tuple = previous_velocity
             acceleration_tuple = (0.0, 0.0, 0.0)
@@ -6484,6 +6688,9 @@ class BattleRuntime(object):
         self._run_optional_feature(
             'local body swinging', self._bind_local_body_swinging,
             (entity, self._local_model))
+        self._run_optional_feature(
+            'local engine audio motion',
+            self._bind_local_engine_audio_motion, (entity,))
         self._sample_local_acceleration_swinging(entity, dt)
         self._run_optional_feature(
             'local track animation', self._update_local_tracks, (entity,))
@@ -6626,7 +6833,10 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._reset_local_camera_motion()
         self._local_engine_mode = None
+        self._local_engine_state = None
+        self._local_engine_audio_report = None
         return True
 
     def _on_client_ready(self):
@@ -7813,7 +8023,16 @@ class BattleRuntime(object):
                 self._bots.apply_snapshot(self._last_snapshot)
                 self._remember_ram_bot_snapshot(self._last_snapshot)
             if self._sync is not None:
-                self._sync.snapshot(message)
+                try:
+                    self._sync.snapshot(message)
+                except Exception as error:
+                    # The Bot state store has already consumed this frame.
+                    # Rolling the whole snapshot back here would leave the
+                    # authority poses permanently ahead of the replicas drawn
+                    # from them, which reads in game as frozen hulls that
+                    # shells pass through. Contain the presentation timeline
+                    # alone and keep the applied state.
+                    self._ignore_live_payload('snapshot_sync', error, message)
             return True
         except Exception as error:
             self._last_snapshot = previous_snapshot
@@ -9359,6 +9578,88 @@ class BattleRuntime(object):
             raise RuntimeError('combat attacker shell is unavailable')
         return shot, shell
 
+    def _feedback_shell_fields(self, event, attacker_record):
+        """Resolve the shell fields #1513 packs into a battle-event detail.
+
+        ``BATTLE_EVENT_TYPE.packDamage``/``packCrits`` carry a shell type index
+        and a gold flag beside the damage and attack reason.  The stock damage
+        log reads them back through ``_DamageExtra``/``_CritsExtra`` and draws
+        the shell abbreviation for received damage, received criticals and
+        blocked damage.  Only a shot has a shell: ``isShot`` is what selects
+        the log's shell column, so fire, ramming and world collision keep
+        ``NONE_SHELL_TYPE`` exactly as the retail cell does.
+        """
+        feedback_common = getattr(
+            self._runtime, 'battle_feedback_common', None)
+        none_shell = getattr(feedback_common, 'NONE_SHELL_TYPE', None)
+        if none_shell is None:
+            raise RuntimeError(
+                '#1513 shell-type feedback sentinel is unavailable')
+        none_shell = int(none_shell)
+        if (attacker_record is None or
+                self._combat_event_source(event) != 'shot' or
+                event.get('kind') not in (
+                    'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')):
+            return none_shell, False
+        indices = getattr(
+            self._runtime.constants, 'SHELL_TYPES_INDICES', None)
+        if not indices:
+            raise RuntimeError('#1513 shell type indices are unavailable')
+        try:
+            unused_shot, shell = self._event_shell(attacker_record, event)
+        except RuntimeError as error:
+            # ``_present_combat_hit`` owns the fatal shell-descriptor contract
+            # for a shot and runs first.  Losing the log's shell column must
+            # never also cost the canonical damage, ribbon and counter events.
+            self._report_feedback_shell_failure(str(error))
+            return none_shell, False
+        # #1513 ``Shell.kind`` is a property over ``Shell.type.name``; the
+        # copied law reads the same two shapes.
+        kind = _field(shell, 'kind', None)
+        if kind is None:
+            kind = _field(_field(shell, 'type', None), 'name', None)
+        if kind not in indices:
+            self._report_feedback_shell_failure(
+                'shell kind is not a #1513 shell type: %r' % (kind,))
+            return none_shell, False
+        return int(indices[kind]), self._shell_is_gold(shell)
+
+    def _report_feedback_shell_failure(self, reason):
+        """Write one bounded diagnostic per distinct unresolved shell."""
+        if reason in self._feedback_shell_failures:
+            return False
+        if len(self._feedback_shell_failures) >= 32:
+            return False
+        self._feedback_shell_failures.add(reason)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] FEEDBACK damage-log shell unresolved: %s\n'
+            % (reason,))
+        return True
+
+    def _shell_is_gold(self, shell):
+        """True when the raw item definitions price this shell in gold.
+
+        ``Shell.isGold`` stays at its ``False`` default on a client: only the
+        cell app's ``_readShell`` branch assigns it.  Resolving the flag from
+        ``shells.xml`` therefore reproduces the retail value instead of
+        reporting every premium round as standard.  A failed lookup keeps
+        ``False`` -- the same answer the exact client itself carries -- and is
+        contained to the gold background of one log row.
+        """
+        identity = _field(shell, 'id', None)
+        name = _field(shell, 'name', None)
+        if name is None or not isinstance(identity, (tuple, list)) or \
+                len(identity) < 1:
+            return False
+        names = getattr(getattr(self._runtime, 'nations', None), 'NAMES', None)
+        if not names:
+            return False
+        try:
+            nation = names[int(identity[0])]
+        except (IndexError, KeyError, TypeError, ValueError):
+            return False
+        return is_gold_shell(nation, name)
+
     @staticmethod
     def _critical_hit_mask(critical):
         """Pack #1513's device/destroyed/crew hit-direction bit fields."""
@@ -9474,17 +9775,20 @@ class BattleRuntime(object):
                 'vehicle hit impulse', error, disable=False)
             return None
 
-    def _present_hit_impulse(self, event, target_record, effects_descr):
+    def _present_hit_impulse(self, event, target_record, effects_descr,
+                             splash_direction=None):
         """Present retail's hull shot impulse on one vehicle this shot hit.
 
-        Retail reaches ``CompoundAppearance.receiveShotImpulse`` only inside
-        ``Vehicle.showDamageFromShot``'s decoded direct-hit branch, so an HE
-        near miss presents ``armorSplashHit`` with no hull reaction at all.
-        The impulse is the shot effect group's own ``targetImpulse``: retail
-        scales it by neither damage nor calibre.
+        Retail reaches ``CompoundAppearance.receiveShotImpulse`` from two
+        places.  ``Vehicle.showDamageFromShot`` passes the decoded direct-hit
+        axis and the shot effect group's own ``targetImpulse``, scaled by
+        neither damage nor calibre.  ``Vehicle.showDamageFromExplosion``
+        rocks the hull away from the blast centre at a quarter of the same
+        impulse, so an HE near miss is not motionless.
         """
         state = target_record.get('state') or {}
-        if event.get('splash', False) or event.get('dead', False):
+        splash = bool(event.get('splash', False))
+        if event.get('dead', False):
             return False
         if not bool(state.get('alive', True)) or int(
                 state.get('health', 1) or 0) <= 0:
@@ -9492,8 +9796,12 @@ class BattleRuntime(object):
         impulse = _number(_field(effects_descr, 'targetImpulse', 0.0))
         if impulse <= 0.0:
             return False
-        direction = self._decoded_hit_impulse_direction(
-            event, target_record)
+        if splash:
+            impulse = impulse / 4.0
+            direction = splash_direction
+        else:
+            direction = self._decoded_hit_impulse_direction(
+                event, target_record)
         if direction is None:
             return False
         if target_record.get('local'):
@@ -9538,6 +9846,107 @@ class BattleRuntime(object):
                 _number(getattr(direction, 'y', 0.0)),
                 _number(getattr(direction, 'z', 0.0)),
                 impulse, bool(presented)))
+        return True
+
+    def _impact_sound_identity(self, target_record, attacker_id, direction,
+                               damage_factor):
+        """Return the arguments a #1513 hit sound resolves its event from.
+
+        ``_SoundEffectDesc.create`` dereferences
+        ``BigWorld.entity(playerVehicleID).isAlive()`` as soon as either
+        identity is present, so only publish them while that stock lookup
+        resolves.  Without them the descriptor can only play its
+        two-other-tanks impact event.
+        """
+        player_id = int(getattr(self._avatar, 'playerVehicleID', 0) or 0)
+        lookup = getattr(self._runtime.bigworld, 'entity', None)
+        if player_id <= 0 or not callable(lookup) or lookup(player_id) is None:
+            return {}
+        try:
+            attacker_id = int(attacker_id or 0)
+        except (TypeError, ValueError, OverflowError):
+            attacker_id = 0
+        return {
+            'isPlayerVehicle': bool(target_record.get('local')),
+            'entity_id': int(target_record.get('engine_id') or 0),
+            'attackerID': attacker_id,
+            'damageFactor': damage_factor,
+            'hitdir': direction,
+        }
+
+    def _hit_damage_factor(self, event, target_record):
+        """Return retail's ``damageFactor``: hull damage as a health percent.
+
+        Exact #1513 hands this straight to ``SWITCH_ext_damage_size``:
+        ``_SoundEffectDesc.create`` compares it against 43.35 and 89.25, and
+        ``Vehicle.onStaticCollision`` scales its own 0..1 hull damage by 100
+        before passing it to the same descriptor, so the unit is a percentage
+        of the target's maximum health.
+        """
+        damage = max(0, int(event.get('damage', 0) or 0))
+        if damage <= 0:
+            return 0.0
+        state = target_record.get('state') or {}
+        maximum = _number(state.get('max_health'), 0.0)
+        if maximum <= 0.0:
+            target = self._server_entity(target_record.get('engine_id'))
+            maximum = _number(_field(
+                getattr(target, 'typeDescriptor', None), 'maxHealth', 0.0))
+        if maximum <= 0.0:
+            return 0.0
+        return max(0.0, min(100.0, 100.0 * damage / maximum))
+
+    def _present_splash_hit(self, target_record, effects_descr, effects_index,
+                            impact_position, direction, damage_factor):
+        """Present one HE near miss the way ``showSplashHitEffect`` does.
+
+        ``Vehicle.showDamageFromExplosion`` binds ``armorSplashHit`` to the
+        target's own hull node through ``ModelBoundEffects.addNewToNode`` and
+        passes the entity itself.  The only #1513 effect in that group is a
+        ``splashSound``, and ``_NodeSoundEffectDesc.create`` returns without
+        playing anything unless ``entity`` is a live, started vehicle, so the
+        static-scene owner used for direct hits presents nothing at all here.
+        """
+        try:
+            effects_list = effects_descr['armorSplashHit']
+        except (KeyError, TypeError):
+            return False
+        if not effects_list:
+            return False
+        try:
+            stages, effects, unused = effects_list
+        except (TypeError, ValueError):
+            return False
+        target = self._server_entity(target_record.get('engine_id'))
+        if (target is None or not getattr(target, 'isStarted', False) or
+                not self._record_alive(target_record, target)):
+            return False
+        if not self._optional_feature_enabled(
+                'projectile impact presentation'):
+            return False
+        hull_name = getattr(
+            getattr(self._runtime, 'tank_part_names', None), 'HULL', None)
+        if hull_name is None:
+            raise RuntimeError('#1513 HULL part name is unavailable')
+        try:
+            # The compound-only fallback builds its bound-effect owner
+            # lazily and raises while its compound is absent.
+            add_effect = getattr(
+                target.appearance.boundEffects, 'addNewToNode', None)
+            if not callable(add_effect):
+                return False
+            matrix = self._runtime.math.Matrix()
+            matrix.setTranslate((0.0, 0.0, 0.0))
+            self._report_effect(
+                'armour_splash', 'armorSplashHit', effects_index,
+                impact_position, direction)
+            add_effect(
+                hull_name, matrix, effects, stages, entity=target,
+                damageFactor=damage_factor)
+        except Exception as error:
+            self._warn_optional_failure(
+                'projectile impact presentation', error)
+            return False
         return True
 
     def _present_combat_hit(self, event, target_record, attacker_record,
@@ -9609,13 +10018,17 @@ class BattleRuntime(object):
         # failed terrain effect must not swallow the hull reaction.
         self._run_optional_feature(
             'vehicle hit impulse', self._present_hit_impulse,
-            (event, target_record, effects_descr))
+            (event, target_record, effects_descr, direction))
         # Retail presents an HE near-miss through
         # Vehicle.showDamageFromExplosion/armorSplashHit.  Direct hits keep
         # the three protocol outcomes: ricochet, resisted and pierced.
-        effect_group = ('armorSplashHit' if event.get('splash', False) else
-                        ('armorRicochet', 'armorResisted', 'armorHit')[
-                            shot_result])
+        damage_factor = self._hit_damage_factor(event, target_record)
+        if event.get('splash', False):
+            return self._present_splash_hit(
+                target_record, effects_descr, effects_index, impact_position,
+                direction, damage_factor)
+        effect_group = ('armorRicochet', 'armorResisted', 'armorHit')[
+            shot_result]
         stages, effects, unused = effects_descr[effect_group]
         hit_position = self._vector(impact_position)
         terrain_effects = getattr(self._avatar, 'terrainEffects', None)
@@ -9630,12 +10043,20 @@ class BattleRuntime(object):
             (_number(event.get('x')), _number(event.get('y')),
              _number(event.get('z'))), direction)
         try:
+            # #1513's armour-hit sound is a `_SoundEffectDesc` whose only
+            # events are the impact trio.  Without the shooter and target
+            # identities it always resolves to impactNPC_NPC, the mix meant
+            # for two other tanks, instead of impactPC_NPC for the player's
+            # own hit or impactNPC_PC for a hit on the player.  Retail's
+            # Vehicle.showDamageFromShot passes all four of these.
             add_effect(
                 hit_position, effects, stages, None, dir=direction,
                 start=hit_position - direction.scale(0.4),
                 end=hit_position + direction.scale(0.4),
                 showShockWave=bool(target_record.get('local')),
-                showFlashBang=bool(target_record.get('local')))
+                showFlashBang=bool(target_record.get('local')),
+                **self._impact_sound_identity(
+                    target_record, attacker_id, direction, damage_factor))
         except Exception as error:
             self._warn_optional_failure(
                 'projectile impact presentation', error)
@@ -9864,6 +10285,8 @@ class BattleRuntime(object):
         damage = max(0, int(event.get('damage', 0) or 0))
         if reason_id is None:
             reason_id = self._combat_attack_reason(event)
+        shell_type, shell_is_gold = self._feedback_shell_fields(
+            event, attacker_record)
         critical = event.get('critical')
         critical_count = len((critical or {}).get('events') or ())
         if attacker_record.get('local'):
@@ -9888,13 +10311,15 @@ class BattleRuntime(object):
                     'eventType': int(event_types.DAMAGE),
                     'targetID': target_id, 'count': 1,
                     'details': int(event_types.packDamage(
-                        damage, reason_id))})
+                        damage, reason_id, False, shell_type,
+                        shell_is_gold))})
             if critical_count > 0:
                 output.append({
                     'eventType': int(event_types.CRIT),
                     'targetID': target_id, 'count': 1,
                     'details': int(event_types.packCrits(
-                        critical_count, reason_id))})
+                        critical_count, reason_id, shell_type,
+                        shell_is_gold))})
             if bool(event.get('dead')):
                 output.append({
                     'eventType': int(event_types.KILL),
@@ -9977,19 +10402,22 @@ class BattleRuntime(object):
                     'eventType': int(event_types.TANKING),
                     'targetID': attacker_id, 'count': 1,
                     'details': int(event_types.packDamage(
-                        blocked_damage, reason_id))})
+                        blocked_damage, reason_id, False, shell_type,
+                        shell_is_gold))})
             if damage > 0:
                 output.append({
                     'eventType': int(event_types.RECEIVED_DAMAGE),
                     'targetID': attacker_id, 'count': 1,
                     'details': int(event_types.packDamage(
-                        damage, reason_id))})
+                        damage, reason_id, False, shell_type,
+                        shell_is_gold))})
             if critical_count > 0:
                 output.append({
                     'eventType': int(event_types.RECEIVED_CRIT),
                     'targetID': attacker_id, 'count': 1,
                     'details': int(event_types.packCrits(
-                        critical_count, reason_id))})
+                        critical_count, reason_id, shell_type,
+                        shell_is_gold))})
         if output:
             callback = getattr(self._avatar, 'onBattleEvents', None)
             if not callable(callback):
@@ -10618,14 +11046,39 @@ class BattleRuntime(object):
         callback = getattr(self._avatar, 'onRoundFinished', None)
         if not callable(callback):
             raise RuntimeError('Avatar.onRoundFinished is unavailable')
+        winner = max(0, min(int(result.get('winner', 0)), 2))
         base_team = max(0, min(int(result.get('base_team', 0)), 2))
         if base_team in (1, 2):
             captured = getattr(self._avatar.arena, 'onTeamBaseCaptured', None)
             if callable(captured):
                 captured(base_team, 0)
-        callback(max(0, min(int(result.get('winner', 0)), 2)), reason)
+        # Retail ends the round by moving the arena to AFTERBATTLE, and every
+        # stock end-of-battle consumer reads that transition rather than
+        # ``Avatar.onRoundFinished``.  ``ArenaPeriodController`` stores the
+        # winner as ``BattleContext.lastArenaWinStatus``, which survives into
+        # the lobby and selects the battle-results music; the same publication
+        # latches ``MusicController.__lastBattleResultEventName`` from the
+        # arena's ``wwmusicSetup`` and stops the combat ambient.  Publish the
+        # period first so both owners hold the outcome before the notification
+        # runs.  The LAN round has no separate afterbattle server window, so
+        # the period carries no countdown, exactly as retail behaves once its
+        # own afterbattle window has elapsed.  A failure here is end-of-battle
+        # presentation only; it must never swallow the terminal notification
+        # or the result bookkeeping that follows it.
+        self._run_optional_feature(
+            'afterbattle arena period', self._publish_afterbattle_period,
+            (winner, reason))
+        callback(winner, reason)
         self._round_finished_notified = True
         self._report_memory('round_end')
+        return True
+
+    def _publish_afterbattle_period(self, winner, reason):
+        """Move the stock arena to AFTERBATTLE with the round's outcome."""
+        if self._binding is None:
+            raise RuntimeError('#1513 arena-period binding is unavailable')
+        self._binding.arena_period(
+            'afterbattle', winner_team=int(winner), finish_reason=int(reason))
         return True
 
     def _apply_rules(self, rules):
@@ -11002,6 +11455,7 @@ class BattleRuntime(object):
         self._projectile_epoch = epoch
         self._projectile_meta = {}
         self._projectile_terminal_data = {}
+        self._projectile_scene_stop_reasons = {}
         # An epoch change elects a new simulator inside the same battle. Keep
         # observational target history across that handoff: restored shells
         # resume from their last checked cursor, which can predate election.
@@ -11949,11 +12403,18 @@ class BattleRuntime(object):
         self._report_effect(
             'wreck_hit', 'armorHit', effects_index, impact, direction)
         try:
+            # Same #1513 impact trio as a hit on a live vehicle: without the
+            # shooter and target identities the group can only play its
+            # other-tanks mix.
             add_effect(
                 hit_position, effects, stages, None, dir=direction,
                 start=hit_position - direction.scale(0.4),
                 end=hit_position + direction.scale(0.4),
-                showShockWave=False, showFlashBang=False)
+                showShockWave=False, showFlashBang=False,
+                **self._impact_sound_identity(
+                    target_record,
+                    self._projectile_attacker_engine_id(meta), direction,
+                    0.0))
         except Exception as error:
             self._warn_optional_failure(
                 'projectile impact presentation', error)
@@ -13302,14 +13763,17 @@ class BattleRuntime(object):
         if world_blocks:
             fraction = max(
                 0.0, min(1.0, world_distance / chord_length))
+            impact = lerp3(start, end, fraction)
             self._projectile_terminal_data[projectile_id] = {
-                'impact': lerp3(start, end, fraction),
+                'impact': impact,
                 'target_key': None,
                 'collisions': None,
                 'query': None,
                 'piercing_loss': meta['piercing_loss'],
                 'penetration_factor': meta.get('penetration_factor'),
+                'stop_reason': scene.get('stop_reason'),
             }
+            self._report_shot_scene_stop(scene.get('stop_reason'), impact)
             return {'reason': 'impact', 'fraction': fraction}
         if nearest_key is not None:
             self._projectile_terminal_data[projectile_id] = {
@@ -13325,6 +13789,30 @@ class BattleRuntime(object):
             }
             return {'reason': 'impact', 'fraction': nearest_fraction}
         return None
+
+    def _report_shot_scene_stop(self, reason, impact):
+        """Name the scenery contract that ended a shot, once per round.
+
+        A player only reports that "an object ate the shell".  The branch that
+        stopped it is the whole diagnosis: a legal ``above_threshold_hp`` or
+        ``shell_family`` refusal, a penetration budget spent on destructibles,
+        or an identity failure such as ``catalog_miss``.  One line per distinct
+        reason keeps a full battle log readable.
+        """
+        if reason is None or not bool(
+                (self._config or {}).get('debug_logging', False)):
+            return False
+        reasons = self._projectile_scene_stop_reasons
+        seen = reasons.get(reason, 0)
+        reasons[reason] = seen + 1
+        if seen:
+            return False
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] SHOT scenery stop reason=%s at '
+            '(%.1f %.1f %.1f)\n' % (
+                reason, float(impact[0]), float(impact[1]),
+                float(impact[2])))
+        return True
 
     def _projectile_shot(self, meta):
         frozen = meta.get('source_shot')
@@ -13419,6 +13907,17 @@ class BattleRuntime(object):
             return None
         meta['source_descriptor'] = descriptor
         return descriptor
+
+    def _projectile_attacker_engine_id(self, meta):
+        """Return the engine id #1513 hit sounds compare against the player."""
+        record = self._records.get(
+            '%s:%s' % (meta.get('shooter_kind'), meta.get('shooter_id')))
+        if record is None:
+            return 0
+        try:
+            return int(record.get('engine_id') or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
     def _projectile_source_entity(self, meta):
         key = '%s:%s' % (meta.get('shooter_kind'), meta.get('shooter_id'))
@@ -17203,6 +17702,7 @@ class BattleRuntime(object):
                             descriptor, dt, now, commit_enabled=True,
                             motion_yaw=None):
         """Resolve Bot contact: static world first, then exact catalog."""
+        diagnostic = getattr(self, '_combat_diagnostics', None)
         pos = self._vector(position)
         bot_state = getattr(self._bots, 'states', {}).get(int(bot_id), {})
         airborne = bool(bot_state.get('airborne', False))
@@ -17233,7 +17733,17 @@ class BattleRuntime(object):
                 not self._destructibles._catalog_hull_contact(
                     pos, yaw, speed, descriptor, dt,
                     **destructible_motion)):
+            if diagnostic is not None:
+                diagnostic.count('motion_world_reused')
             return 'clear'
+        if diagnostic is not None:
+            diagnostic.count('motion_world_fallback')
+            if airborne:
+                diagnostic.count('motion_world_airborne')
+            elif movement_dir * float(speed) <= 0.0:
+                diagnostic.count('motion_world_coast_or_reverse')
+            elif rotation_dir != 0 or abs(turn_speed) > 0.01:
+                diagnostic.count('motion_world_turning')
         allow_crush_drive = (
             not airborne and
             movement_dir * float(speed) > 0.0)
@@ -18568,6 +19078,7 @@ class BattleRuntime(object):
         probe_height = float(probe_height)
         points = vehicle_physics.suspension_world_points(
             params, position, yaw)
+        prepared_filter = self._prepared_ground_filter(points)
         memory = self._local_spring_ground_memory
         if not isinstance(memory, list) or len(memory) != len(points):
             memory = [None] * len(points)
@@ -18590,7 +19101,8 @@ class BattleRuntime(object):
                 vehicle_physics.CONTACT_PENETRATION)
             value = self._suspension_ground_y(
                 x, z, minimum_y, maximum_y,
-                flat_maximum_y=spring_maximum_y)
+                flat_maximum_y=spring_maximum_y,
+                prepared_filter=prepared_filter)
             value, memory[index] = vehicle_physics.retained_ground_contact(
                 point, value, memory[index],
                 params['contact_memory_distance'], support_gradient)
@@ -18610,6 +19122,7 @@ class BattleRuntime(object):
         probe_height = float(probe_height)
         points = vehicle_physics.suspension_pseudo_world_points(
             params, position, yaw)
+        prepared_filter = self._prepared_ground_filter(points)
         memory = self._local_pseudo_ground_memory
         if not isinstance(memory, list) or len(memory) != len(points):
             memory = [None] * len(points)
@@ -18634,7 +19147,8 @@ class BattleRuntime(object):
                 if contact.get('kind') == 'track' else None)
             value = self._suspension_ground_y(
                 x, z, minimum_y, maximum_y,
-                flat_maximum_y=flat_maximum_y)
+                flat_maximum_y=flat_maximum_y,
+                prepared_filter=prepared_filter)
             value, memory[index] = vehicle_physics.retained_ground_contact(
                 point, value, memory[index],
                 params['contact_memory_distance'], support_gradient)
@@ -18670,6 +19184,10 @@ class BattleRuntime(object):
             previous_plane, motion_pose[0], motion_pose[2])
         end_ground = vehicle_physics.suspension_plane_height(
             current_plane, position[0], position[2])
+        prepared_filter = self._prepared_ground_filter(tuple(
+            (float(motion_pose[0]) + dx * fraction,
+             float(motion_pose[2]) + dz * fraction)
+            for fraction in fractions))
         for fraction in fractions:
             x = float(motion_pose[0]) + dx * fraction
             z = float(motion_pose[2]) + dz * fraction
@@ -18677,7 +19195,8 @@ class BattleRuntime(object):
             ground = self._suspension_ground_y(
                 x, z, expected - GROUND_PLANE_EPSILON,
                 expected + GROUND_PLANE_EPSILON,
-                flat_maximum_y=expected + GROUND_PLANE_EPSILON)
+                flat_maximum_y=expected + GROUND_PLANE_EPSILON,
+                prepared_filter=prepared_filter)
             if (ground is None or
                     abs(float(ground) - expected) > GROUND_PLANE_EPSILON):
                 return False
@@ -20559,9 +21078,9 @@ class BattleRuntime(object):
                     'edge_sample_time_us')
                 state_kwargs['edge_revision'] = message.get(
                     'edge_revision')
-                return projected_sender(message.get('bots'), **state_kwargs)
+                return projected_sender(message.get('rows'), **state_kwargs)
             return self.client.send_bot_state(
-                message.get('bots'), **state_kwargs)
+                message.get('rows'), **state_kwargs)
         if kind == 'bot_observation':
             return self.client.send_bot_observation(
                 message.get('contacts'), message.get('affordances'))
@@ -23212,6 +23731,7 @@ class BattleRuntime(object):
                 'piercing_loss': initial_piercing_loss,
                 'stopped_by_destructible': False,
                 'penetration_factor': penetration_factor,
+                'stop_reason': None,
             }
         travelled = 0.0
         piercing_loss = initial_piercing_loss
@@ -23256,6 +23776,7 @@ class BattleRuntime(object):
                     'piercing_loss': piercing_loss,
                     'stopped_by_destructible': True,
                     'penetration_factor': penetration_factor,
+                    'stop_reason': 'penetration_exhausted',
                 }
             stop_distance = result.get('stop_distance')
             if stop_distance is not None:
@@ -23266,6 +23787,7 @@ class BattleRuntime(object):
                     'stopped_by_destructible': bool(
                         result.get('stopped_by_destructible')),
                     'penetration_factor': penetration_factor,
+                    'stop_reason': result.get('stop_reason'),
                 }
             advance = result.get('continue_from')
             if advance is None:
@@ -23278,6 +23800,7 @@ class BattleRuntime(object):
                     'piercing_loss': piercing_loss,
                     'stopped_by_destructible': False,
                     'penetration_factor': penetration_factor,
+                    'stop_reason': result.get('stop_reason'),
                 }
             advance = _number(advance)
             if advance <= 0.0:
@@ -23288,7 +23811,8 @@ class BattleRuntime(object):
                 return {'world_distance': 999999.0,
                         'piercing_loss': piercing_loss,
                         'stopped_by_destructible': False,
-                        'penetration_factor': penetration_factor}
+                        'penetration_factor': penetration_factor,
+                        'stop_reason': None}
         raise RuntimeError('#1513 destructible shot traversal exceeded 64 hits')
 
     @staticmethod
@@ -23624,6 +24148,7 @@ class BattleRuntime(object):
         self._projectile_visual_meta = {}
         self._projectile_visual_terminals = _RecentIdSet()
         self._projectile_terminal_data = {}
+        self._projectile_scene_stop_reasons = {}
         self._projectile_target_positions = {}
         self._projectile_position_history = []
         self._projectile_historic_pose_cache = None
@@ -23794,6 +24319,7 @@ class BattleRuntime(object):
         self._bot_yaw_rates = {}
         self._track_report_time = None
         self._hit_impulse_reports = 0
+        self._feedback_shell_failures = set()
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_drive_turn = 0.0
@@ -23831,7 +24357,10 @@ class BattleRuntime(object):
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
         self._local_camera_velocity = None
+        self._reset_local_camera_motion()
         self._local_engine_mode = None
+        self._local_engine_state = None
+        self._local_engine_audio_report = None
         self._spectated_engine_id = None
         self._local_grind = 0
         self._local_vertical_speed = 0.0

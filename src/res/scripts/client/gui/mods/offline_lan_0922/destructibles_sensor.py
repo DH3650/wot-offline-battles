@@ -5,6 +5,10 @@ The three sensor bodies below are dedented copies from ``offline_battle.py``.
 Only their former closure dependencies are supplied at module scope.
 """
 
+from gui.mods.offline_lan_0922.worker_diagnostics import (
+    observed, observed_call, observed_ray,
+    current as current_combat, count as combat_count)
+
 _event_sink = None
 
 _DESTRUCTIBLE_BIN_METRES = 8.0
@@ -573,6 +577,7 @@ def _item_name_cache_victim_1513(cache):
 		key=lambda value: (int(value[1].get('last_access', 0)), value[0]))[0]
 
 
+@observed('destructible.name_alignment')
 def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 		native_count, names):
 	"""Incrementally rebuild one chunk's exact per-item native filenames.
@@ -710,7 +715,9 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 			_release_item_name_query_focus_1513(space_id, chunk_id)
 			return entry['result']
 		try:
-			native_type = query(space_id, chunk_id, item_index, -1)
+			native_type = observed_call(
+				'native.destructible.category', query,
+				space_id, chunk_id, item_index, -1)
 		except Exception as error:
 			# The native name loop resolves through the same provider and omits
 			# this item.  Preserve that alignment fact, but quarantine the live
@@ -747,6 +754,7 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	return entry['result']
 
 
+@observed('destructible.chunk_names')
 def _chunk_native_name_list_1513(bigworld, space_id, chunk_id, native_count):
 	"""Read and validate one chunk's possibly compacted native name list.
 
@@ -766,11 +774,14 @@ def _chunk_native_name_list_1513(bigworld, space_id, chunk_id, native_count):
 	entry = cache.get(key)
 	if entry is not None:
 		if entry['native_count'] == int(native_count):
+			combat_count('destructible_name_list_cached')
 			_touch_item_name_cache_entry_1513(entry)
 			return entry['names'], 'ready'
 		cache.pop(key, None)
 	try:
-		names = bigworld.wg_getChunkDestrFilenames(space_id, chunk_id)
+		names = observed_call(
+			'native.destructible.filenames',
+			bigworld.wg_getChunkDestrFilenames, space_id, chunk_id)
 	except Exception as error:
 		_isolate_destructible_1513(
 			'filename_query', chunk_id, detail=error)
@@ -1417,6 +1428,7 @@ def _spatial_revision_1513():
 
 
 def _receipt_stat_1513(name, amount=1):
+	combat_count('destructible_receipt_' + name, amount)
 	stats = globals().setdefault('g_offh_destr_receipt_stats', {})
 	stats[name] = int(stats.get(name, 0)) + int(amount)
 
@@ -1585,6 +1597,7 @@ def _receipt_cache_delete_1513(name, key):
 	return True
 
 
+@observed('destructible.empty_contact_check')
 def _empty_contact_receipt_valid_1513(key):
 	name = 'g_offh_destr_empty_contact_receipts'
 	state = globals().get(name)
@@ -1630,6 +1643,7 @@ def _proximity_receipt_key_1513(spaceID, current_chunk, pos, vehicle_box):
 		_bin_rectangle_signature_1513(_box_xz_bounds(vehicle_box)))
 
 
+@observed('destructible.empty_proximity_check')
 def _empty_proximity_receipt_valid_1513(
 		key, manager, chunk_registry):
 	"""Reuse only a complete, unchanged streamed empty-cell receipt."""
@@ -1674,6 +1688,7 @@ def _nearby_destructibles(registry, pos, vehicle_box=None):
 				if item[0] in seen:
 					continue
 				seen.add(item[0])
+				combat_count('destructible_nearby_items')
 				yield item
 
 def _symmetric_quantize(value, scale):
@@ -2030,7 +2045,9 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 			chunk_id, item_index):
 		return None
 	try:
-		chunk_matrix = BigWorld.wg_getChunkMatrix(spaceID, chunk_id)
+		chunk_matrix = observed_call(
+			'native.destructible.chunk_matrix', BigWorld.wg_getChunkMatrix,
+			spaceID, chunk_id)
 		chunk_translation = getattr(chunk_matrix, 'translation', None)
 	except Exception as error:
 		_isolate_destructible_1513(
@@ -2039,7 +2056,8 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 	if chunk_translation is None:
 		return None
 	try:
-		matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+		matrix = Math.Matrix(observed_call(
+			'native.destructible.item_matrix', BigWorld.wg_getDestructibleMatrix,
 			spaceID, chunk_id, item_index))
 	except Exception as error:
 		_isolate_destructible_1513(
@@ -2164,6 +2182,7 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 	return instance
 
 
+@observed('destructible.shot_catalog')
 def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
 	"""Resolve the nearest live-validated catalog OBB along a shell ray."""
 	segment = end - start
@@ -2176,17 +2195,26 @@ def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
 	if not instances and not baked_instances:
 		return None
 	authority = _get_destr_authority()
-	identities = set(instances)
+	identities = set()
+	contact_bins = globals().get('g_offh_destr_contact_bins', {})
+	baked_bins = catalog.get('baked_shot_bins', {})
 	effective_end = end
 	if (maximum_distance is not None and
 			float(maximum_distance) < segment_length):
+		# The exact interval test below admits the native endpoint with this
+		# tolerance; its broad phase must include the same interval at bin edges.
 		effective_end = start + segment.scale(
-			max(0.0, float(maximum_distance)) / segment_length)
+			min(segment_length, max(0.0, float(maximum_distance) + 1.0e-6)) /
+			segment_length)
 	bounds = (min(start.x, effective_end.x), max(start.x, effective_end.x),
 		min(start.z, effective_end.z), max(start.z, effective_end.z))
 	for bin_key in _baked_bin_keys_for_bounds_1513(*bounds):
-		identities.update(
-			catalog.get('baked_shot_bins', {}).get(bin_key, ()))
+		# Registration and falling-transform updates already maintain this
+		# exact live footprint index. Seeding from every registered instance
+		# makes each projectile chord re-test props across the explored map.
+		identities.update(contact_bins.get(bin_key, ()))
+		identities.update(baked_bins.get(bin_key, ()))
+	combat_count('destructible_shot_candidates', len(identities))
 	hits = {}
 	for identity in sorted(identities):
 		if _destructible_isolated_1513(identity[0], identity[1]):
@@ -2264,6 +2292,7 @@ def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
 
 
 @_batched_spatial_mutations_1513
+@observed('destructible.stream_motion')
 def _stream_baked_motion_instances_1513(spaceID, vehicle_box):
 	"""Live-validate catalog wires covering one exact vehicle sweep."""
 	catalog = _destructible_catalog or {}
@@ -2276,7 +2305,9 @@ def _stream_baked_motion_instances_1513(spaceID, vehicle_box):
 			catalog.get('baked_shot_bins', {}).get(bin_key, ()))
 	instances = globals().get('g_offh_destr_instances', {})
 	for identity in sorted(identities):
+		combat_count('destructible_stream_candidates')
 		if identity not in instances:
+			combat_count('destructible_stream_missing')
 			_stream_baked_shot_instance_1513(spaceID, identity)
 
 
@@ -2543,6 +2574,7 @@ def _point_near_tree_sweep_1513(x, z, sweep_box,
 		contact_radius * contact_radius + 1.0e-8)
 
 
+@observed('destructible.tree_candidates')
 def _tree_candidates_for_sweeps_1513(
 		chunk_id, registry, sweep_boxes, tree_type,
 		contact_radius=_SOLID_CONTACT_RADIUS_1513):
@@ -2615,6 +2647,7 @@ def _vehicle_contact_box(pos, yaw, bbox, epsilon=0.075, travel=0.0,
 	return center, half_axes
 
 
+@observed('destructible.intersections')
 def _catalog_intersections(world_boxes, vehicle_box):
 	result = []
 	for world_box in world_boxes:
@@ -2781,7 +2814,11 @@ def clear_local_prediction(token):
 	return changed
 
 
+@observed('destructible.contact_candidates')
 def _catalog_contact_candidates(vehicle_box):
+	diagnostic = current_combat()
+	if diagnostic is not None:
+		diagnostic.geometry('destructible_contact_box', vehicle_box)
 	instances = globals().get('g_offh_destr_instances', {})
 	contact_bins = globals().get('g_offh_destr_contact_bins', {})
 	bounds = _box_xz_bounds(vehicle_box)
@@ -2796,10 +2833,12 @@ def _catalog_contact_candidates(vehicle_box):
 		if members:
 			had_members = True
 		for chunk_id, item_index in sorted(members):
+			combat_count('destructible_contact_bin_items')
 			identity = (int(chunk_id), int(item_index))
 			if _destructible_isolated_1513(*identity):
 				continue
 			if identity in seen:
+				combat_count('destructible_contact_duplicate_bin_item')
 				continue
 			seen.add(identity)
 			instance = instances.get(identity)
@@ -2819,6 +2858,7 @@ def _catalog_contact_candidates(vehicle_box):
 			'g_offh_destr_empty_contact_receipts', receipt_key,
 			{'cell_signature': _spatial_cell_signature_1513((receipt_key,))},
 			_EMPTY_CONTACT_RECEIPT_LIMIT)
+	combat_count('destructible_contact_candidates', len(candidates))
 	return candidates
 
 
@@ -2998,7 +3038,8 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 			if not recast_budget or int(recast_budget[0]) <= 0:
 				return 'pending_hard' if pending_contact else 'deferred'
 			recast_budget[0] = int(recast_budget[0]) - 1
-		current_hit = BigWorld.wg_collideSegment(
+		current_hit = observed_ray(
+			'native.destructible.ray', BigWorld.wg_collideSegment,
 			spaceID, next_start, segment_end, 128)
 		if current_hit is None:
 			return 'kinetic' if kinetic_contact else True
@@ -3202,6 +3243,7 @@ def _catalog_pending_at_hull(pos, yaw, vel, td, now, dt=0.04,
 	return False
 
 
+@observed('destructible.hull_guard')
 def _catalog_hull_contact(pos, yaw, vel, td, dt=0.04,
 		motion_yaw=None):
 	"""Cheap contact-bin guard for the copied player/Bot pose integrators."""
@@ -3235,6 +3277,7 @@ def _catalog_motion_result(status, token=None, accepted_now=False,
 	return legacy_status if return_status else legacy_status != 'clear'
 
 
+@observed('destructible.motion')
 def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		return_status=False, dt=0.04, kinetic_speed=None,
 		return_detail=False, kinetic_commit=False, commit_enabled=True,
@@ -3638,6 +3681,7 @@ def _falling_native_state_1513(spaceID, chunkID, itemIndex, math_module):
 
 
 @_batched_spatial_mutations_1513
+@observed('destructible.falling_refresh')
 def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 	"""Follow each destroyed falling atom's live native transform exactly."""
 	instances = globals().get('g_offh_destr_instances', {})
@@ -3703,7 +3747,8 @@ def _refresh_destroyed_falling_instances_1513(spaceID, authority, now):
 			active[identity]['last_refresh'] = float(now)
 			continue
 		try:
-			matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+			matrix = Math.Matrix(observed_call(
+				'native.destructible.item_matrix', BigWorld.wg_getDestructibleMatrix,
 				spaceID, chunk_id, item_index))
 		except Exception as error:
 			_isolate_destructible_1513(
@@ -4286,6 +4331,7 @@ def prewarm_tree_registry(spaceID, pos, yaw, td=None, now=None,
 	}
 
 
+@observed('destructible.tree_motion')
 def _tree_motion_resolution_1513(
 		spaceID, start_pos, start_yaw, end_pos, end_yaw, speed, td, now,
 		dt, requested_chunks=None):
@@ -4478,9 +4524,11 @@ def _trusted_tree_event_position_1513(
 	try:
 		import BigWorld
 		import Math
-		chunk_matrix = Math.Matrix(BigWorld.wg_getChunkMatrix(
+		chunk_matrix = Math.Matrix(observed_call(
+			'native.destructible.chunk_matrix', BigWorld.wg_getChunkMatrix,
 			spaceID, identity[0]))
-		item_matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+		item_matrix = Math.Matrix(observed_call(
+			'native.destructible.item_matrix', BigWorld.wg_getDestructibleMatrix,
 			spaceID, identity[0], identity[1]))
 		chunk_translation = chunk_matrix.translation
 		item_translation = item_matrix.translation
@@ -4736,6 +4784,7 @@ def commit_tree_contacts(
 
 
 @_batched_spatial_mutations_1513
+@observed('destructible.body_scan')
 def _fell_trees_near(
 		spaceID, pos, yaw, vel, td=None, registration_only=False,
 		priority_chunks=None):
@@ -4748,6 +4797,10 @@ def _fell_trees_near(
 	import AreaDestructibles
 	import BigWorld
 	import Math
+	# An event whose LAN admission was refused stays frozen and pending. Drain
+	# that backlog before proving more native destruction, so a publication the
+	# transport could not take is retried instead of lost.
+	_retry_catalog_publications_1513()
 	try:
 		mgr = getattr(AreaDestructibles, 'g_destructiblesManager', None)
 		if not mgr:
@@ -4863,6 +4916,7 @@ def _fell_trees_near(
 				-_prewarm_priority.get(cid, (0.0, 0.0))[0],
 				-_prewarm_priority.get(cid, (0.0, 0.0))[1], cid))
 		for cid in _cid_order:
+			combat_count('destructible_body_chunks')
 			if _destructible_isolated_1513(cid):
 				continue
 			registry = _st['chunks'].get(cid)
@@ -4873,6 +4927,7 @@ def _fell_trees_near(
 				_drop_streamed_chunk_registry_1513(_st, cid)
 				registry = None
 			if registry is None:
+				combat_count('destructible_body_unregistered_chunk')
 				if _native_count is None:
 					if _destructible_isolated_1513(cid):
 						continue
@@ -4917,7 +4972,8 @@ def _fell_trees_near(
 				}
 				_retry_registry = False
 				try:
-					_cm_t = BigWorld.wg_getChunkMatrix(
+					_cm_t = observed_call(
+						'native.destructible.chunk_matrix', BigWorld.wg_getChunkMatrix,
 						spaceID, cid).translation
 				except Exception as error:
 					_isolate_destructible_1513(
@@ -4940,7 +4996,8 @@ def _fell_trees_near(
 							(_baked_slot is not None and
 								_baked_slot.get('kind') == 'falling'))
 						try:
-							_m = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+							_m = Math.Matrix(observed_call(
+								'native.destructible.item_matrix', BigWorld.wg_getDestructibleMatrix,
 								spaceID, cid, _ti))
 						except Exception as error:
 							_isolate_destructible_1513(
@@ -5324,11 +5381,12 @@ def _fell_trees_near(
 					if (_ttyp == AreaDestructibles.DESTR_TYPE_TREE and
 							_key in _st['publish_pending']):
 						_object_pos = Math.Vector3(_tx, _ty, _tz)
-						if not _publish_tree_once_1513(
-								_st, spaceID, (cid, _ti, None), _object_pos,
-								yaw if vel >= 0 else yaw + math.pi, vel):
-							raise RuntimeError(
-								'tree proximity event was not admitted')
+						# Still refused: the frozen payload stays pending for
+						# the next scan. Transport backpressure is local to
+						# this one event and must not end the battle.
+						_publish_tree_once_1513(
+							_st, spaceID, (cid, _ti, None), _object_pos,
+							yaw if vel >= 0 else yaw + math.pi, vel)
 					continue
 				fall_yaw = yaw if vel >= 0 else (yaw + math.pi)
 				_auth = _get_destr_authority()
@@ -5362,14 +5420,16 @@ def _fell_trees_near(
 						'native proximity destroy was not accepted: '
 						'chunk=%s item=%s' % (cid, _ti))
 				_st['felled'].add(_key)
+				# The native item is already destroyed here, so its canonical
+				# event must still reach the server. A refused publication is
+				# kept frozen and retried on a later scan; raising would end
+				# the round over one unsent destructible.
 				if _ttyp == AreaDestructibles.DESTR_TYPE_TREE:
-					if not _publish_tree_once_1513(
-							_st, spaceID, (cid, _ti, None), _object_pos,
-							fall_yaw, vel):
-						raise RuntimeError(
-							'tree proximity event was not admitted')
+					_publish_tree_once_1513(
+						_st, spaceID, (cid, _ti, None), _object_pos,
+						fall_yaw, vel)
 				else:
-					_publish_destroyed(
+					_publish_catalog_once_1513(
 						('fragile'
 						 if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE
 						 else 'module' if _ttyp == structure_type
@@ -5726,7 +5786,8 @@ def _try_destroy_solid_hit(spaceID, segment_start, hit_pt, surf_normal,
 			_probes += ((hit_pt + _incoming.scale(3.0),
 				hit_pt - _incoming.scale(2.0)),)
 		for _seg_a, _seg_b in _probes:
-			_mi = BigWorld.wg_getMatInfoNearPoint(
+			_mi = observed_call(
+				'native.destructible.material', BigWorld.wg_getMatInfoNearPoint,
 				spaceID, _seg_a, _seg_b, hit_pt, lambda *a: False)
 			_decoded = _decode_mat_info_1513(_mi)
 			if not _solid_destructible_candidate_1513(
@@ -5826,9 +5887,24 @@ def _scaled_shot_through_health_1513(desc, mat_kind, item_scale):
 		return None
 
 
+def _shot_through_refusal_1513(shot, health):
+	"""Name why an item this shell destroyed still ended its flight.
+
+	The pinned #1513 ``destructibles.xml`` caps shooting through at
+	``maxHpForShootingThrough`` = 19, and stock ``Shell.isAmmoPercingType``
+	restricts the family to AP, APHE and APCR.  Both refusals are legal retail
+	behaviour, so a report needs to tell them apart from a failed lookup.
+	"""
+	if _shot_kind_1513(shot) not in _SHOT_AP_KINDS_1513:
+		return 'shell_family'
+	if health is None:
+		return 'health_unavailable'
+	return 'above_threshold_hp'
+
+
 def _typed_shot_result_1513(world_distance, stop_distance=None,
 		piercing_loss=0.0, continue_from=None, loss_distance=None,
-		stopped_by_destructible=False):
+		stopped_by_destructible=False, stop_reason=None):
 	return {
 		'world_distance': float(world_distance),
 		'stop_distance': (None if stop_distance is None
@@ -5839,6 +5915,9 @@ def _typed_shot_result_1513(world_distance, stop_distance=None,
 		'loss_distance': (None if loss_distance is None
 			else float(loss_distance)),
 		'stopped_by_destructible': bool(stopped_by_destructible),
+		# Names the exact branch that ended the ray.  A Windows report can then
+		# say which contract stopped a shell instead of only that one did.
+		'stop_reason': (None if stop_reason is None else str(stop_reason)),
 	}
 
 
@@ -5873,17 +5952,160 @@ def _validated_tree_shot_identity_1513(spaceID, decoded):
 	return int(chunk_id), int(item_index)
 
 
-def _transparent_tree_shot_filter_1513(ignored_trees):
-	"""Keep every native surface except an exact validated SpeedTree."""
+def _transparent_shot_surface_filter_1513(ignored_surfaces):
+	"""Keep every native surface except an exact proved-broken destructible.
+
+	``ignored_surfaces`` holds ``(chunkID, itemIndex, matKind)`` keys.  A ``None``
+	material covers the whole item, which is how SpeedTrees, fragiles and falling
+	atoms are addressed.  A structure names its exact broken module so its intact
+	sibling modules and any backing wall still stop the shell.
+	"""
 	def keep_surface(*hit):
 		# #1513 passes (matKind, collFlags, itemIndex, chunkID).  Malformed or
-		# ordinary surfaces stay authoritative; only exact tree wires are skipped.
+		# ordinary surfaces stay authoritative; only proved-broken destructible
+		# skins are skipped.
 		try:
 			identity = int(hit[3]), int(hit[2])
 		except (IndexError, TypeError, ValueError, OverflowError):
 			return True
-		return identity not in ignored_trees
+		if identity + (None,) in ignored_surfaces:
+			return False
+		try:
+			material = hit[0]
+		except IndexError:
+			return True
+		try:
+			return identity + (material,) not in ignored_surfaces
+		except TypeError:
+			return True
 	return keep_surface
+
+
+def _already_broken_shot_surface_1513(decoded):
+	"""Return the exact broken identity this native shell surface belongs to.
+
+	#1513 ``Vehicle._isDestructibleMayBeBroken`` treats an item as broken as soon
+	as the chunk controller reports it, whatever the delayed hide callback still
+	draws, and a falling atom keeps its native skin in the world for the whole
+	round.  The movement path already hides those skins through
+	``ground_collision_filter``/``horizontal_collision_filter``; the shell ray
+	must use the same law or a felled pole eats every later shell.  Only a
+	destructible material range plus an accepted authority key may skip a
+	surface, so an ordinary wall is never hidden by a coincidental index.
+	"""
+	if decoded is None:
+		return None
+	unused_hit, unused_normal, chunk_id, item_index, mat_kind, unused_name = \
+		decoded
+	try:
+		if (mat_kind < _DESTRUCTIBLE_MAT_KIND_MIN_1513 or
+				mat_kind > _DESTRUCTIBLE_MAT_KIND_MAX_1513):
+			return None
+		identity = int(chunk_id), int(item_index)
+	except (TypeError, ValueError, OverflowError):
+		return None
+	if _destructible_isolated_1513(identity[0], identity[1]):
+		return None
+	return _broken_shot_surface_key_1513(
+		identity[0], identity[1], mat_kind)
+
+
+def _broken_shot_surface_key_1513(chunk_id, item_index, mat_kind):
+	"""Return the accepted key that removes one broken surface from the ray.
+
+	A tree, fragile or falling atom is accepted whole and is addressed with a
+	``None`` material.  A structure is accepted per module, so only the exact
+	broken module may be hidden while its siblings keep stopping the shell.
+	"""
+	authority = _get_destr_authority()
+	identity = int(chunk_id), int(item_index)
+	if authority.is_destroyed(identity[0], identity[1], None):
+		return identity + (None,)
+	if (mat_kind is not None and
+			authority.is_destroyed(identity[0], identity[1], mat_kind)):
+		return identity + (mat_kind,)
+	return None
+
+
+def _native_item_scale_1513(measured, spaceID, chunk_id, item_index):
+	"""Read one native destructible item scale without quarantining the slot.
+
+	``wg_getDestructibleMatrix`` shares the exact native item index space with
+	``wg_getChunkDestrFilenames`` and ``wg_getDestructibleEffectCategory``, so a
+	SpeedTree slot already proved resolved and named by the tree identity gate
+	resolves here too.  Trees own no catalog OBB, so this is the only scale
+	source for them.  A failed query is an anomaly for the caller to classify,
+	not evidence that the slot is unsafe.
+	"""
+	import BigWorld
+	import Math
+	try:
+		matrix = Math.Matrix(measured(
+			'native.destructible.item_matrix',
+			BigWorld.wg_getDestructibleMatrix,
+			spaceID, int(chunk_id), int(item_index)))
+		return _matrix_item_scale_1513(matrix, Math)
+	except Exception:
+		return None
+
+
+def _tree_shoot_through_1513(measured, spaceID, decoded, shot):
+	"""Return ``(allowed, health)`` for one standing SpeedTree on a shell ray.
+
+	#1513 keeps trees under the same numeric destructible contract as every
+	other type.  ``destructibles.xml`` publishes one ``maxHpForShootingThrough``
+	and one ``projectilePiercingPowerReduction`` table for all of them, and
+	stock ``Vehicle._isDestructibleMayBeBroken`` runs a tree through the same
+	``scaledDestructibleHealth(itemScale, refHealth)`` branch it uses for
+	fragiles and falling atoms, including ``kineticDamageCorrection``, which
+	``DestructiblesCache.__readTree`` does supply.  The shell family is checked
+	first so HE and HEAT never pay for a native matrix query.
+	"""
+	if _shot_kind_1513(shot) not in _SHOT_AP_KINDS_1513:
+		return False, None
+	import AreaDestructibles
+	desc = _runtime_material_descriptor_1513(
+		AreaDestructibles, decoded[5], decoded[2], decoded[3])
+	health = _scaled_shot_through_health_1513(
+		desc, decoded[4],
+		_native_item_scale_1513(
+			measured, spaceID, decoded[2], decoded[3]))
+	return (health is not None and
+		health <= _SHOT_THROUGH_MAX_HP_1513), health
+
+
+def _shot_broken_surface_advance_1513(measured, bigworld, spaceID,
+		start_pos, end_pos, identity, obstacle_distance, ignored_surfaces,
+		surface_filter):
+	"""Return a proved resume distance past one exact just-broken skin.
+
+	The item this shell destroyed no longer belongs to the collision scene, but
+	its registered OBB exit was not available, so a fixed jump could skip real
+	geometry.  Hiding this exact identity and re-casting proves that nothing
+	else stands between the contact and the next unfiltered surface, which is
+	where the caller resumes.
+	"""
+	if identity is None:
+		# The destroy order was accepted but left no readable key.  Keep the
+		# historical conservative advance rather than hiding an unknown surface.
+		return float(obstacle_distance) + 0.6
+	ignored_surfaces.add(identity)
+	next_hit = measured('native.projectile.world',
+		bigworld.wg_collideSegment,
+		spaceID, start_pos, end_pos, 128, surface_filter)
+	floor = float(obstacle_distance) + _SHOT_RAY_EPSILON
+	maximum = ((next_hit[0] - start_pos).length if next_hit is not None
+		else (end_pos - start_pos).length)
+	# Dynamic-only props do not necessarily participate in mask 128.  The
+	# filtered native ray proves only the static interval; cap it at the next
+	# live catalog contact as well, including unresolved/ambiguous entries.
+	catalog_hit = _catalog_shot_intersection(
+		spaceID, start_pos, end_pos, maximum)
+	if catalog_hit is not None:
+		maximum = min(maximum, float(catalog_hit['distance']))
+	if next_hit is None and catalog_hit is None:
+		return max(floor, maximum)
+	return max(floor, maximum - _SHOT_RAY_EPSILON)
 
 
 def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
@@ -5899,9 +6121,9 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 			return function(*args)
 		return diagnostic.call(stage, function, *args)
 
-	ignored_trees = set()
-	tree_filter = _transparent_tree_shot_filter_1513(ignored_trees)
-	tree_hits = 0
+	ignored_surfaces = set()
+	surface_filter = _transparent_shot_surface_filter_1513(ignored_surfaces)
+	skipped_hits = 0
 	world_dist = 99999.0
 	world_collision = measured('native.projectile.world',
 		bigworld.wg_collideSegment,
@@ -5925,6 +6147,15 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 				spaceID, start_pos, end_pos, world_dist)
 			if catalog_hit is not None:
 				break
+		tree_shoot_through = None
+		if (tree_identity is not None and shot is not None and
+				not _get_destr_authority().is_destroyed(
+					tree_identity[0], tree_identity[1], decoded[4])):
+			# Freeze this standing tree's own scaled health before the
+			# native fall can move its item matrix.  The legacy float
+			# contract has no shell to test and keeps tree transparency.
+			tree_shoot_through = _tree_shoot_through_1513(
+				measured, spaceID, decoded, shot)
 		destruction_accepted = _try_destroy_destructible(
 			spaceID, mat_info, shot_yaw, 12.0, True)
 		if destruction_accepted:
@@ -5932,20 +6163,56 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 				_diagnostic_contact_1513(
 					'shot_material_accept', decoded[2], decoded[3],
 					fields=(('mat', decoded[4]),))
+		broken_surface = None
 		if tree_identity is not None and (
 				destruction_accepted or _get_destr_authority().is_destroyed(
 					tree_identity[0], tree_identity[1], decoded[4])):
-			if tree_identity in ignored_trees:
+			tree_key = (tree_identity[0], tree_identity[1], None)
+			if not (destruction_accepted and
+					tree_shoot_through is not None):
+				# A tree the round already felled is not collision at all.
+				broken_surface = tree_key
+			elif not tree_shoot_through[0]:
+				# Above the threshold, or HE/HEAT: felled, but the shell
+				# ends here exactly like any other destructible.
+				return _typed_shot_result_1513(
+					world_dist, stop_distance=world_dist,
+					stopped_by_destructible=True,
+					stop_reason=_shot_through_refusal_1513(
+						shot, tree_shoot_through[1]))
+			else:
+				# Trees own no catalog OBB, so the proved next surface is
+				# the only exit evidence available for one.
+				return _typed_shot_result_1513(
+					99999.0,
+					piercing_loss=_SHOT_THROUGH_MIN_REDUCTION_1513,
+					continue_from=_shot_broken_surface_advance_1513(
+						measured, bigworld, spaceID, start_pos, end_pos,
+						tree_key, world_dist, ignored_surfaces,
+						surface_filter),
+					loss_distance=world_dist)
+		elif not destruction_accepted:
+			# A fragile, module or falling atom that this round already broke
+			# keeps its native skin while the hide callback runs, and a felled
+			# column keeps it for the whole round.  Retail removes it from
+			# collision at once, so it must not stop a later shell either.
+			broken_surface = _already_broken_shot_surface_1513(decoded)
+			if broken_surface is not None:
+				_diagnostic_contact_1513(
+					'shot_broken_skin_skip', broken_surface[0],
+					broken_surface[1], fields=(('mat', broken_surface[2]),))
+		if broken_surface is not None:
+			if broken_surface in ignored_surfaces:
 				raise RuntimeError(
-					'#1513 transparent tree shot filter did not advance')
-			ignored_trees.add(tree_identity)
-			tree_hits += 1
-			if tree_hits > 64:
+					'#1513 transparent shot surface filter did not advance')
+			ignored_surfaces.add(broken_surface)
+			skipped_hits += 1
+			if skipped_hits > 64:
 				raise RuntimeError(
-					'#1513 transparent tree shot traversal exceeded 64 hits')
+					'#1513 transparent shot traversal exceeded 64 hits')
 			world_collision = measured('native.projectile.world',
 				bigworld.wg_collideSegment,
-				spaceID, start_pos, end_pos, 128, tree_filter)
+				spaceID, start_pos, end_pos, 128, surface_filter)
 			continue
 		if destruction_accepted:
 			if shot is not None:
@@ -5964,10 +6231,17 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 						start_pos, end_pos, decoded[0])
 					if registered_exit is None:
 						if _destructible_catalog is not None:
-							return _typed_shot_result_1513(
-								world_dist, stop_distance=world_dist,
-								stopped_by_destructible=True)
-						continue_from = world_dist + 0.6
+							# The item is gone; only its exact exit is unknown.
+							# Prove the next surface instead of ending an
+							# admitted shot on debris.
+							continue_from = _shot_broken_surface_advance_1513(
+								measured, bigworld, spaceID, start_pos,
+								end_pos,
+								_broken_shot_surface_key_1513(
+									decoded[2], decoded[3], decoded[4]),
+								world_dist, ignored_surfaces, surface_filter)
+						else:
+							continue_from = world_dist + 0.6
 					else:
 						continue_from = (registered_exit +
 							_SHOT_RAY_EPSILON)
@@ -5976,7 +6250,8 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 						continue_from=continue_from, loss_distance=world_dist)
 				return _typed_shot_result_1513(
 					world_dist, stop_distance=world_dist,
-					stopped_by_destructible=True)
+					stopped_by_destructible=True,
+					stop_reason=_shot_through_refusal_1513(shot, health))
 			# Destructible broken by the shell: re-cast past the debris.
 			second = measured('native.projectile.world',
 				bigworld.wg_collideSegment,
@@ -6033,6 +6308,8 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 				'shot_catalog_miss', point=world_collision[0])
 		return (_typed_shot_result_1513(
 			world_dist, stop_distance=(world_dist
+				if world_collision is not None else None),
+			stop_reason=('catalog_miss'
 				if world_collision is not None else None))
 			if shot is not None else world_dist)
 	if catalog_hit['ambiguous']:
@@ -6042,7 +6319,8 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 		ambiguous_distance = float(catalog_hit['distance'])
 		return (_typed_shot_result_1513(
 			ambiguous_distance, stop_distance=ambiguous_distance,
-			stopped_by_destructible=True)
+			stopped_by_destructible=True,
+			stop_reason='catalog_ambiguous')
 			if shot is not None else ambiguous_distance)
 
 	candidate = catalog_hit['candidate']
@@ -6060,6 +6338,8 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 			fields=(('kind', kind), ('mat', mat_kind)))
 		return (_typed_shot_result_1513(
 			world_dist, stop_distance=(world_dist
+				if world_collision is not None else None),
+			stop_reason=('native_reject'
 				if world_collision is not None else None))
 			if shot is not None else world_dist)
 	_diagnostic_contact_1513(
@@ -6073,15 +6353,27 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 			desc, mat_kind, candidate[5])
 		can_continue = (_shot_kind_1513(shot) in _SHOT_AP_KINDS_1513 and
 			health is not None and health <= _SHOT_THROUGH_MAX_HP_1513)
-		if can_continue and catalog_hit.get('exit_proved', True):
+		if can_continue:
+			if catalog_hit.get('exit_proved', True):
+				continue_from = (catalog_hit['exit_distance'] +
+					_SHOT_RAY_EPSILON)
+			else:
+				# Same law as the native material path: an item this shell
+				# just removed may not end the shot merely because its OBB
+				# exit was unavailable.
+				continue_from = _shot_broken_surface_advance_1513(
+					measured, bigworld, spaceID, start_pos, end_pos,
+					_broken_shot_surface_key_1513(
+						chunk_id, item_index, mat_kind),
+					catalog_hit['distance'], ignored_surfaces, surface_filter)
 			return _typed_shot_result_1513(
 				99999.0, piercing_loss=_SHOT_THROUGH_MIN_REDUCTION_1513,
-				continue_from=(catalog_hit['exit_distance'] +
-					_SHOT_RAY_EPSILON),
+				continue_from=continue_from,
 				loss_distance=catalog_hit['distance'])
 		return _typed_shot_result_1513(
 			catalog_hit['distance'], stop_distance=catalog_hit['distance'],
-			stopped_by_destructible=True)
+			stopped_by_destructible=True,
+			stop_reason=_shot_through_refusal_1513(shot, health))
 	# Re-cast beyond the proved OBB just like the legacy material path.  This
 	# lets a shell continue after a dynamic-only prop while a surviving static
 	# backing remains authoritative for structures during native replacement.

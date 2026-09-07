@@ -12,6 +12,8 @@ import sys
 import tempfile
 import types
 import unittest
+
+import bot_state_rows
 from unittest import mock
 import weakref
 import xml.etree.ElementTree as ET
@@ -345,7 +347,7 @@ class PortSourceTests(unittest.TestCase):
         build_script = (PORT_ROOT / 'build_for_client.sh').read_text(
             encoding='utf-8')
 
-        self.assertEqual('0.6.11', packager.MOD_VERSION)
+        self.assertEqual('0.6.12', packager.MOD_VERSION)
         self.assertEqual(packager.MOD_VERSION, package.PORT_VERSION)
         self.assertEqual(packager.MOD_VERSION, meta_version)
         self.assertIn(
@@ -470,7 +472,7 @@ class PortSourceTests(unittest.TestCase):
                 config_path.parent / packager.BUILD_IDENTITY_FILENAME
             ).read_text(encoding='utf-8'))
             self.assertEqual(1, identity['schema'])
-            self.assertEqual('0.6.11', identity['semanticVersion'])
+            self.assertEqual('0.6.12', identity['semanticVersion'])
             self.assertRegex(
                 identity['buildIdentity'],
                 r'^local-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$')
@@ -678,6 +680,34 @@ class PortConfigTests(unittest.TestCase):
             os.path.join(appdata, 'Wargaming.net', 'WorldOfTanks',
                          'offline_lan_0922'), path)
         self.assertNotIn(os.path.join('mods', 'configs'), path)
+
+    def test_a_machine_owned_state_file_can_skip_the_readable_form(self):
+        """The embedded 2.7 runtime loses its C JSON encoder to either flag.
+
+        ``json.dumps`` in CPython 2.7 uses ``c_make_encoder`` only when
+        ``indent`` is None and ``sort_keys`` is false.  A large cache the port
+        writes on a gameplay barrier must not pay the pure-Python encoder, so
+        ``write_json`` offers a compact form while the small files a player
+        or a support request reads stay indented and sorted.
+        """
+        config_module = _load_port_source('config')
+        value = {'b': 2, 'a': [1, {'d': 4, 'c': 3}]}
+        with tempfile.TemporaryDirectory() as directory:
+            readable = str(Path(directory) / 'readable.json')
+            compact = str(Path(directory) / 'compact.json')
+
+            config_module.write_json(readable, value)
+            config_module.write_json(compact, value, compact=True)
+
+            readable_text = Path(readable).read_text(encoding='utf-8')
+            compact_text = Path(compact).read_text(encoding='utf-8')
+            self.assertIn('\n  ', readable_text)
+            self.assertEqual(1, compact_text.count('\n'))
+            self.assertNotIn(', ', compact_text)
+            self.assertNotIn(': ', compact_text)
+            self.assertLess(len(compact_text), len(readable_text))
+            self.assertEqual(value, json.loads(compact_text))
+            self.assertEqual(value, json.loads(readable_text))
 
     def test_waiting_room_choices_round_trip_in_player_owned_state(self):
         config_module = _load_port_source('config')
@@ -5632,13 +5662,10 @@ class LANClientTests(unittest.TestCase):
         bots = [{'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
                  'yaw': 0.0, 'health': 1000, 'alive': True,
                  'fire_seq': 0}]
-        original = module.project_bot_state
-        module.project_bot_state = mock.Mock(
-            side_effect=AssertionError('second projection'))
-        try:
-            self.assertFalse(client.send_projected_bot_state(bots))
-        finally:
-            module.project_bot_state = original
+        # A visible client is never Bot authority, so the sender must refuse
+        # before it touches the rows at all.
+        rows = bot_state_rows.rows(bots)
+        self.assertFalse(client.send_projected_bot_state(rows))
 
         client._send.assert_not_called()
 
@@ -6187,9 +6214,15 @@ class LANClientTests(unittest.TestCase):
         self.assertEqual('invalid snapshot message', client.last_error)
 
     def test_snapshot_bot_pose_timing_is_atomic_and_monotonic(self):
+        # Atomic: the pair is present or absent together, and once a round
+        # publishes it, it may not disappear. Monotonic: neither frontier may
+        # rewind. How the producer paired its revision with its sample clock
+        # is its own bookkeeping and no longer costs the replica a frame.
         _, client, _, _ = self._client()
         client.running = True
         client.round_id = 3
+        # A live round contains a rejected live payload instead of ending.
+        client.phase = 'battle'
         client._handle_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 3, 'server_tick': 4,
@@ -6199,6 +6232,7 @@ class LANClientTests(unittest.TestCase):
             'players': [], 'bots': []})
         self.assertTrue(client.running)
 
+        # An unchanged revision whose sample clock moved is applied.
         client._handle_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 3, 'server_tick': 5,
@@ -6206,57 +6240,51 @@ class LANClientTests(unittest.TestCase):
             'motion_time_us': 150000, 'bot_state_time_us': 100000,
             'bot_authority_id': -1, 'bot_manifest': [],
             'players': [], 'bots': []})
-        self.assertFalse(client.running)
-        self.assertEqual('invalid snapshot message', client.last_error)
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(5, client.last_snapshot['server_tick'])
 
-        _, client, _, _ = self._client()
-        client.running = True
-        client.round_id = 3
+        # An advanced revision that repeats its sample time is applied too.
         client._handle_message({
             'type': 'snapshot', 'protocol': 5,
-            'round_id': 3, 'server_tick': 4,
-            'bot_state_revision': 5,
-            'motion_time_us': 120000, 'bot_state_time_us': 90000,
+            'round_id': 3, 'server_tick': 6,
+            'bot_state_revision': 6,
+            'motion_time_us': 160000, 'bot_state_time_us': 100000,
             'bot_authority_id': -1, 'bot_manifest': [],
             'players': [], 'bots': []})
+        self.assertTrue(client.running)
+        self.assertEqual(6, client.last_snapshot['server_tick'])
+
+        # A rewound sample clock is not newer than the frame already drawn.
         client._handle_message({
             'type': 'snapshot', 'protocol': 5,
-            'round_id': 3, 'server_tick': 5,
-            'bot_state_revision': 6,
+            'round_id': 3, 'server_tick': 7,
+            'bot_state_revision': 7,
+            'motion_time_us': 170000, 'bot_state_time_us': 90000,
             'bot_authority_id': -1, 'bot_manifest': [],
             'players': [], 'bots': []})
-        self.assertFalse(client.running)
-        self.assertEqual('invalid snapshot message', client.last_error)
+        self.assertTrue(client.running)
+        self.assertEqual(6, client.last_snapshot['server_tick'])
 
-        _, client, _, _ = self._client()
-        client.running = True
-        client.round_id = 3
+        # Timing may not disappear once the round has published it.
         client._handle_message({
             'type': 'snapshot', 'protocol': 5,
-            'round_id': 3, 'server_tick': 4,
-            'bot_state_revision': 5,
-            'motion_time_us': 120000, 'bot_state_time_us': 90000,
+            'round_id': 3, 'server_tick': 8,
+            'bot_state_revision': 8,
+            'bot_authority_id': -1, 'bot_manifest': [],
             'players': [], 'bots': []})
-        client._handle_message({
-            'type': 'snapshot', 'protocol': 5,
-            'round_id': 3, 'server_tick': 5,
-            'bot_state_revision': 6,
-            'motion_time_us': 150000, 'bot_state_time_us': 90000,
-            'players': [], 'bots': []})
-        self.assertFalse(client.running)
-        self.assertEqual('invalid snapshot message', client.last_error)
+        self.assertTrue(client.running)
+        self.assertEqual(6, client.last_snapshot['server_tick'])
 
-        _, client, _, _ = self._client()
-        client.running = True
-        client.round_id = 3
+        # Half a pair is never a valid header.
         client._handle_message({
             'type': 'snapshot', 'protocol': 5,
-            'round_id': 3, 'server_tick': 4,
-            'bot_state_revision': 5,
-            'motion_time_us': 120000,
+            'round_id': 3, 'server_tick': 9,
+            'bot_state_revision': 8, 'motion_time_us': 180000,
+            'bot_authority_id': -1, 'bot_manifest': [],
             'players': [], 'bots': []})
-        self.assertFalse(client.running)
-        self.assertEqual('invalid snapshot message', client.last_error)
+        self.assertTrue(client.running)
+        self.assertEqual(6, client.last_snapshot['server_tick'])
 
     def test_state_message_without_protocol_fails_closed(self):
         _, client, _, _ = self._client()

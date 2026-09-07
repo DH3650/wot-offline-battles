@@ -357,6 +357,24 @@ nearest vehicle cap the search, while ambiguity fails closed. Traversal resumes
 from the exact registered OBB exit plus a small epsilon, not a fixed jump that
 could skip a thick structure or its backing geometry.
 
+An item the round has already broken is not part of the collision scene. #1513
+`Vehicle._isDestructibleMayBeBroken` reports an item as broken as soon as its
+chunk controller does, whatever the delayed hide callback still draws, and a
+falling atom keeps its native skin in the world for the whole round. Vehicle
+movement and the HE blast rays already hide those skins through the exact
+`(chunk, item, material)` native keep-callback. The solid-shell ray now uses
+the same law: a proved-broken surface is filtered out and the ray is re-cast,
+so a felled pole or a broken wall panel no longer stops later shells while
+intact sibling modules and backing walls stay authoritative. A shell that has
+just destroyed an admitted item and cannot resolve that item's registered OBB
+exit resumes before the nearest remaining native or catalog surface rather
+than ending on debris. The filtered re-cast is also capped by the live catalog
+intersection, because a clear mask-128 ray does not exclude a dynamic-only
+prop. Every scenery stop now carries a `stop_reason`, so a
+Windows report can distinguish the legal `above_threshold_hp` and
+`shell_family` refusals from an identity failure such as `catalog_miss`,
+`catalog_ambiguous` or `native_reject`.
+
 The exact #1513 `destructibles.xml` supplies both numeric shooting-through
 contracts: `maxHpForShootingThrough` is `19`, and every listed material has
 `projectilePiercingPowerReduction` factor/minimum values `(0, 25)`. Version
@@ -370,7 +388,41 @@ needed. A sampled remainder below 1 mm makes
 the shell disappear at that
 obstacle. An above-threshold item may be destroyed but stops traversal. Under
 the pre-1.13 HE mechanics used by #1513, HE and HEAT stop at the first
-destructible, and HE explodes at that point.
+destructible, and HE explodes at that point. Stock
+`vehicle_items.Shell.isAmmoPercingType` names exactly the same
+ARMOR_PIERCING/ARMOR_PIERCING_HE/ARMOR_PIERCING_CR family, so the split is the
+client's own set rather than a guess.
+
+`DESTR_TYPE_TREE` now follows the same numeric law. `destructibles.xml`
+publishes one `maxHpForShootingThrough` and one
+`projectilePiercingPowerReduction` table for every destructible type, and stock
+`Vehicle._isDestructibleMayBeBroken` runs a tree through the same
+non-structure branch it uses for fragiles and falling atoms, including
+`kineticDamageCorrection` -- which `DestructiblesCache.__readTree` does supply
+-- and the same `scaledDestructibleHealth(itemScale, refHealth)`. So a tree's
+reference health is scaled exactly like any other item's. The pinned tree table
+ranges from `3` for bushes and shrubs to `70` for large firs, and 303 of its
+498 entries exceed the cap, so most large trees now fell and then stop an AP
+shell while a small tree costs the flat 25 mm.
+
+Trees own no catalog OBB, so neither their item scale nor their exit distance
+can come from the baked catalog. Both come from the native item:
+`wg_getDestructibleMatrix` shares one native index space with
+`wg_getChunkDestrFilenames` and `wg_getDestructibleEffectCategory`, so a slot
+already proved resolved and named by the tree identity gate resolves there
+too, and `_matrix_item_scale_1513` reads the stock scale convention from it.
+The scale is frozen while the tree still stands, before the native fall can
+move its matrix, and the shell family is tested first so HE and HEAT never pay
+for the query. A tree the round has already felled keeps the broken-skin rule:
+it is not collision, costs no penetration and is never felled twice.
+
+Two boundaries remain unproved on this path. A native matrix query that fails
+for a resolved, named tree leaves no scale, which stops the shell and records
+`health_unavailable` rather than guessing a scale. And soft vegetation below
+health `10` -- 177 of the 498 entries, all bushes, shrubs and ferns -- is still
+excluded by the existing vegetation gate, so it is never felled and never
+tested against the cap; whether such an item can produce a mask-128 shell
+contact at all has not been observed on the exact client.
 
 The threshold and material reduction are exact pinned-resource evidence.
 Official same-family mechanics descriptions support the shell-family split,
@@ -600,6 +652,50 @@ log-line limit. Neighbours at a reporting or round boundary may
 be incomplete. `PERF combat_summary` reports each closed capture's stage
 totals, frame/time span, queue maxima, and counters. Detailed clocks are
 inactive between captures; the small frame ring remains available.
+
+The deeper Bot probes sample one callback per group of four control callbacks,
+rotating the selected slot across groups and including every Bot and catch-up
+slice in that callback. Selection follows actual Bot control work, so
+render-frame cadence cannot alias away all samples; rotation also spreads
+samples across slower decision phases. Existing
+coarse stages and lane-ledger accounting remain active throughout each capture.
+`detail_sampled` labels individual frames; a capture's `detail.frames`,
+`detail.stages` and `detail.counts` describe only that matched sample. Use these
+matched totals for the detailed cost breakdown; do not compare a sampled child
+total directly to an all-frame parent total or treat sampled counts as a census.
+The sampling reduces average observer cost; it cannot remove observer overhead
+from an individual sampled frame. An unsampled slow frame retains coarse timing.
+
+The new scopes separate Bot state/critical/parameter preparation, pose copying,
+longitudinal and traverse integration, publication, route selection, shared A*
+work, local driving, world-collision preparation, ground profiles, and
+destructible registration/candidate scans. `native.motion.ray/ground` and
+`native.destructible.*` time existing native calls with their original arguments
+and exception behavior. Reason counters distinguish expired or geometrically
+invalid motion receipts, superseded/failed/retained path requests, A* expansions,
+streaming misses, and empty-cell reuse. Same-geometry counters identify repeated
+ray or hull-box inputs within a Bot slice; they do not prove that intervening
+world mutations made reuse safe.
+
+`slices` records elapsed authority time, control refresh and publication intent
+at slice entry; a later contact barrier can still require an extra publication.
+The bounded `actors` rows identify Bot IDs and slices, with at most six reported
+per frame and 64 Bots in a capture summary. A frame tracks at most 128 Bot/slice
+pairs and 2048 geometry keys; overflow counters expose dropped diagnostic detail.
+`bot.actor` self time is residual work inside that Bot's block. Shared navigator
+batch time is attributed to its initiating caller, not exclusively to that
+Bot's own search. Pure-helper observation is bound only during synchronous owned
+calls on the current thread and restored on return, exception or reentry; it
+installs no native hooks and retains no entities or native vectors.
+
+`tools/benchmark_bot_workload.py --scenario combat` runs the real copied Bot,
+world-collision, ground and destructible-scan Python paths with deterministic
+native test seams, a finite hard wall, and nearby opposing teams. It includes
+spotting, lanes and acknowledged fire admission; projectile terminal processing
+has separate human/Bot pipeline parity tests. `--diagnostics` enables the shipped
+one-in-four detail sample; `--diagnostic-stride 1` measures full-detail overhead.
+Identical snapshot output includes every native collision call's geometry. This
+synthetic workload is not a captured-battle replay or a Windows performance test.
 
 The supplemental-lane shadow ledger retains at most 1024 identities and
 records actual enqueue-to-completion wait separately from phase-deadline
@@ -951,6 +1047,21 @@ OfflineMapCreator.destroy()
   -> wait for Lobby + HangarSpace + vehicle model
   -> if local player is room host, open the next TrainingSettingsWindow
 ```
+
+## Battle-result presentation
+
+The exact #1513 `gui/battle_results/context.pyc` constructor takes
+`(arenaUniqueID, showImmediately, showIfPosted, resetCache)`.
+`BattleResultsService.requestResults` opens the window before yielding the
+result fetch, so retrying a failed fetch must not repeat `showImmediately`.
+The LAN session grants that flag once, for a receipt belonging to its live
+round and transport, after the waiting barrier naturally returns it to the
+garage. Login recovery, early departure, reconnect and an explicit Battle
+click cannot inherit that permission. Durable receipt facts such as
+`premature_leave` never grant popup permission by themselves. Recovery still
+caches the result and publishes its clickable notification without reapplying
+the settlement. Pure-data lifecycle tests cover this request contract;
+Windows acceptance remains necessary for the actual window transition.
 
 ## Post-battle achievements
 
