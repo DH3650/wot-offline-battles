@@ -1289,9 +1289,15 @@ def set_catalog(catalog):
 			raise ValueError('ambiguous catalog has no locators')
 		if (kind == 'structure' or len(boxes) == 1) and locators:
 			raise ValueError('destructible catalog has unexpected locators')
+		retained_boxes = raw.get('retained_collision_boxes', ())
+		if (not isinstance(retained_boxes, (list, tuple)) or
+				any(type(index) not in _INTEGER_TYPES or
+					index < 0 or index >= len(boxes) for index in retained_boxes)):
+			raise ValueError('destructible retained collision boxes are invalid')
 		prepared[normalized] = {
 			'filename': filename, 'kind': kind, 'boxes': tuple(boxes),
 			'locators': locators,
+			'retained_collision_boxes': frozenset(retained_boxes),
 		}
 	try:
 		catalog_version = int(catalog.get('version', 1))
@@ -2299,7 +2305,7 @@ def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
 	}
 
 
-def _confirmed_unresolved_obstacle_1513(spaceID, identity):
+def _confirmed_unresolved_obstacle_1513(spaceID, identity, vehicle_box=None):
 	"""Return exact baked OBBs for a streamed but unidentified model.
 
 	Registration proves *identity*: which descriptor the item uses, whether it
@@ -2319,6 +2325,15 @@ def _confirmed_unresolved_obstacle_1513(spaceID, identity):
 	baked = catalog.get('baked_instances', {}).get(identity)
 	if baked is None or baked['kind'] == 'falling' or not baked['boxes']:
 		return ()
+	def report_skip(reason):
+		key = (baked['descriptor_filename'], reason.split('_')[0])
+		logged = globals().get('g_offh_destr_unresolved_logs', ())
+		if key in logged or len(logged) >= _ISOLATION_LOG_TYPE_LIMIT:
+			return
+		if vehicle_box is not None and any(
+				_catalog_intersections(baked['boxes'], vehicle_box)):
+			_log_unresolved_obstacle_1513(
+				chunk_id, item_index, baked, reason=reason)
 	cache = globals().setdefault('g_offh_destr_unresolved_obstacles', {})
 	import AreaDestructibles
 	import BigWorld
@@ -2329,14 +2344,18 @@ def _confirmed_unresolved_obstacle_1513(spaceID, identity):
 	except Exception:
 		return ()
 	if mgr is None or manager_space != spaceID:
+		report_skip('manager_space')
 		return ()
 	native_count = _native_chunk_destructible_count_1513(mgr, chunk_id)
 	if native_count is None or item_index >= native_count:
 		# The chunk is no longer streamed, so neither is its geometry.
 		cache.pop(identity, None)
+		report_skip('native_count_%r' % native_count)
 		return ()
 	entry = cache.get(identity)
 	if entry is not None and entry[0] == native_count:
+		if not entry[1]:
+			report_skip('cached_placement_unproved')
 		return entry[1]
 	try:
 		chunk_matrix = observed_call(
@@ -2344,6 +2363,7 @@ def _confirmed_unresolved_obstacle_1513(spaceID, identity):
 			spaceID, chunk_id)
 		chunk_translation = getattr(chunk_matrix, 'translation', None)
 		if chunk_translation is None:
+			report_skip('chunk_translation_missing')
 			return ()
 		matrix = Math.Matrix(observed_call(
 			'native.destructible.item_matrix',
@@ -2352,29 +2372,36 @@ def _confirmed_unresolved_obstacle_1513(spaceID, identity):
 			matrix, chunk_translation, Math)
 	except Exception:
 		# A placement query that cannot answer is not evidence of a wall.
+		report_skip('native_placement_query_failed')
 		return ()
 	boxes = baked['boxes'] if signature == baked['signature'] else ()
 	cache[identity] = (native_count, boxes)
 	if boxes:
 		_log_unresolved_obstacle_1513(chunk_id, item_index, baked)
+	else:
+		report_skip('matrix_mismatch_live_%r_baked_%r' % (
+			signature, baked['signature']))
 	return boxes
 
 
-def _log_unresolved_obstacle_1513(chunk_id, item_index, baked):
+def _log_unresolved_obstacle_1513(chunk_id, item_index, baked, reason=None):
 	"""Name the first unidentified blocking model of each map resource."""
 	logged = globals().setdefault('g_offh_destr_unresolved_logs', set())
-	key = baked['descriptor_filename']
+	filename = baked['descriptor_filename']
+	key = filename if reason is None else (filename, reason.split('_')[0])
 	if key in logged or len(logged) >= _ISOLATION_LOG_TYPE_LIMIT:
 		return
 	logged.add(key)
 	try:
 		import sys
 		sys.stdout.write(
-			'[Offline LAN 0.9.22] DESTR blocking unidentified model '
+			'[Offline LAN 0.9.22] DESTR %s unidentified model '
 			'chunk=%s item=%s kind=%s name=%s map=%s '
-			'repeats=suppressed_for_battle\n' % (
-				chunk_id, item_index, baked['kind'], key,
-				(_destructible_catalog or {}).get('map') or 'unknown'))
+			'repeats=suppressed_for_battle detail=%s\n' % (
+				'blocking' if reason is None else 'unproved',
+				chunk_id, item_index, baked['kind'], filename,
+				(_destructible_catalog or {}).get('map') or 'unknown',
+				reason or 'live_placement_confirmed'))
 	except Exception:
 		# Runtime handling is authoritative; the log stream is observational.
 		pass
@@ -2413,7 +2440,8 @@ def _stream_baked_motion_instances_1513(spaceID, vehicle_box):
 			if cache is not None:
 				cache.pop(identity, None)
 			continue
-		boxes = _confirmed_unresolved_obstacle_1513(spaceID, identity)
+		boxes = _confirmed_unresolved_obstacle_1513(
+			spaceID, identity, vehicle_box=vehicle_box)
 		if boxes:
 			combat_count('destructible_stream_unidentified')
 			unresolved.append((identity, boxes))
@@ -3056,6 +3084,20 @@ def _catalog_candidate_on_ray_1513(
 	return None
 
 
+def _catalog_retains_collision_1513(candidate):
+	"""Whether this exact module has a solid compiled destroyed replacement."""
+	record = (_destructible_catalog or {}).get('resources', {}).get(
+		_normalized_filename(candidate[3]))
+	if not record or not record.get('retained_collision_boxes'):
+		return False
+	if record['kind'] == 'structure':
+		return any(record['boxes'][index][6] == candidate[2]
+			for index in record['retained_collision_boxes'])
+	instance = globals().get('g_offh_destr_instances', {}).get(candidate[:2], {})
+	index = instance.get('box_index', 0 if len(record['boxes']) == 1 else None)
+	return index in record['retained_collision_boxes']
+
+
 def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 		collision, vel, td, recast_budget=None,
 		require_pending_first=False, allow_kinetic_first=False,
@@ -3099,6 +3141,10 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 			prefer_destroyed=(require_pending_first and candidate_index == 0))
 		if candidate is None:
 			return 'pending_hard' if pending_contact else False
+		# Damage can replace a railway vehicle with a still-solid wreck.  Its
+		# native hit must never be skipped through the old whole-item OBB.
+		if _catalog_retains_collision_1513(candidate):
+			return 'pending_hard' if pending_contact else False
 		# #1513 ``Vehicle._isDestructibleMayBeBroken`` returns True as soon as the
 		# chunk controller reports the item broken, whatever the vehicle speed and
 		# whatever the hide callback still draws.  A broken skin therefore never
@@ -3139,9 +3185,18 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 			current_start, segment_end, hit_point)
 		if exit_distance is None:
 			return 'pending_hard' if pending_contact else False
+		# The interval is clipped to this segment.  Decide whether any ray
+		# remains before adding the epsilon to a native float32 position:
+		# rounding can overshoot the endpoint by more than epsilon and turn
+		# a length-based check into a backwards recast through the same skin.
+		if float(exit_distance) >= (segment_end - current_start).length:
+			return 'kinetic' if kinetic_contact else True
 		next_start = current_start + direction.scale(
 			float(exit_distance) + _SHOT_RAY_EPSILON)
-		if (segment_end - next_start).length <= _SHOT_RAY_EPSILON:
+		if _vector_dot(
+				(segment_end.x - next_start.x, segment_end.y - next_start.y,
+				 segment_end.z - next_start.z),
+				(direction.x, direction.y, direction.z)) <= _SHOT_RAY_EPSILON:
 			return 'kinetic' if kinetic_contact else True
 		if recast_budget is not None:
 			if not recast_budget or int(recast_budget[0]) <= 0:
@@ -3204,6 +3259,11 @@ def _broken_collision_filter(members, accepted_trees=()):
 			identity = (int(hit[3]), int(hit[2]))
 		except (IndexError, TypeError, ValueError, OverflowError):
 			return True
+		if (isinstance(hit[0], _INTEGER_TYPES) and
+				87 <= hit[0] <= 100):
+			# #1513's destroyed-model materials are new geometry, not the
+			# delayed original skin covered by an item-wide destruction key.
+			return True
 		if identity not in accepted_trees and (
 				identity + (hit[0],)) not in broken and (
 				identity + (None,)) not in broken:
@@ -3247,15 +3307,30 @@ def _live_broken_collision_filter_1513(members, accepted_trees=()):
 	member_ids = frozenset((int(chunk_id), int(item_index))
 		for chunk_id, item_index in members)
 
+	def keep_native_surface(hit, identity):
+		if _DIAGNOSTICS_ENABLED:
+			now = _diagnostic_time_1513()
+			pending = tuple(sorted(key for key, deadline in
+				globals().get('g_offh_destr_pending', {}).items()
+				if key[:2] in member_ids and now < deadline))
+			if pending:
+				_diagnostic_contact_1513(
+					'native_motion_keep', identity[0], identity[1],
+					fields=(('hit', tuple(hit)), ('pending', pending[:8])), now=now)
+		return True
+
 	def reject_broken_skin(*hit):
 		try:
 			identity = (int(hit[3]), int(hit[2]))
 		except (IndexError, TypeError, ValueError, OverflowError):
 			return True
+		if (isinstance(hit[0], _INTEGER_TYPES) and
+				87 <= hit[0] <= 100):
+			return keep_native_surface(hit, identity)
 		if identity in accepted_trees:
 			accepted = True
 		elif identity not in member_ids or not callable(destroyed_keys):
-			return True
+			return keep_native_surface(hit, identity)
 		else:
 			mat_kind = hit[0]
 			predicted = globals().get('g_offh_destr_speculative', set())
@@ -3265,7 +3340,7 @@ def _live_broken_collision_filter_1513(members, accepted_trees=()):
 			if (not accepted and
 					identity + (mat_kind,) not in predicted and
 					identity + (None,) not in predicted):
-				return True
+				return keep_native_surface(hit, identity)
 		globals()['g_offh_destr_ground_skips'] = globals().get(
 			'g_offh_destr_ground_skips', 0) + 1
 		return False
@@ -3345,9 +3420,11 @@ def _catalog_pending_at_hull(pos, yaw, vel, td, now, dt=0.04,
 		pos, yaw, vel, bbox, _motion_travel_reach(vel, dt),
 		motion_yaw=motion_yaw)
 	pending = globals().get('g_offh_destr_pending', {})
+	ready = getattr(_get_destr_authority(), 'contact_collision_ready', None)
 	for candidate in _catalog_contact_candidates(vehicle_box):
 		deadline = pending.get((candidate[0], candidate[1], candidate[2]))
-		if deadline is not None and float(now) < float(deadline):
+		if (deadline is not None and float(now) < float(deadline) and
+				not (callable(ready) and ready(*candidate[:3]))):
 			return True
 	return False
 
@@ -3419,27 +3496,19 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		raise ValueError(
 			'catalog motion proposals require detail and kinetic classification')
 	_diagnostic_flush_1513(now)
-	publish_failures, publish_kinds = _retry_catalog_publications_1513()
-	if publish_failures:
-		# Backpressure is an operation-local pending result.  Do not admit more
-		# irreversible native mutations until the already committed event is
-		# observable, and retain its exact identity for the worker retry.
-		return _catalog_motion_result(
-			'pending', publish_failures, return_status=return_status,
-			return_detail=return_detail, kinds=publish_kinds,
-			requires_commit=False if proposal_only else None)
+	# Native acceptance already decided collision. Keep transport retries in
+	# their frozen ledger; a delayed event must not hold this or another hull.
+	_retry_catalog_publications_1513(spaceID)
 	if _destructible_catalog is None:
 		return _catalog_motion_result(
-			'pending' if publish_failures else 'clear', publish_failures,
+			'clear',
 			return_status=return_status, return_detail=return_detail,
-			kinds=publish_kinds,
 			requires_commit=False if proposal_only else None)
 	bbox = _vehicle_hull_bbox(td)
 	if bbox is None:
 		return _catalog_motion_result(
-			'pending' if publish_failures else 'clear', publish_failures,
+			'clear',
 			return_status=return_status, return_detail=return_detail,
-			kinds=publish_kinds,
 			requires_commit=False if proposal_only else None)
 	import Math
 	auth = _get_destr_authority()
@@ -3459,9 +3528,8 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		unresolved, vehicle_box, auth)
 	if not candidates and not unidentified:
 		return _catalog_motion_result(
-			'pending' if publish_failures else 'clear', publish_failures,
+			'clear',
 			return_status=return_status, return_detail=return_detail,
-			kinds=publish_kinds,
 			requires_commit=False if proposal_only else None)
 
 	grouped = {}
@@ -3476,9 +3544,8 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 	crushed = False
 	kinetic = False
 	approach = False
-	publication_pending = bool(publish_failures)
-	exact_token = set(publish_failures)
-	contact_kinds = set(publish_kinds)
+	exact_token = set()
+	contact_kinds = set()
 	if unidentified:
 		contact_kinds.add('unidentified')
 	commit_candidates = []
@@ -3509,6 +3576,13 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 					note_destroyed(
 						'module' if mat_kind is not None else 'fragile',
 						chunk_id, item_index, mat_kind, now)
+				if (_catalog_retains_collision_1513(candidate) and
+						float(now) < globals().get('g_offh_destr_pending', {}).get(key, 0.0) and
+						not (callable(getattr(auth, 'contact_collision_ready', None)) and
+							auth.contact_collision_ready(*key))):
+					# Keep outside the old body until the native replacement is
+					# installed. After that, its actual BSP owns motion/support.
+					blocked = True
 				crushed = True
 				if contact_candidate:
 					exact_token.add(key)
@@ -3524,6 +3598,10 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 			chunk_id, item_index, mat_kind, unused_filename, kind = (
 				candidate[:5])
 			key = (chunk_id, item_index, mat_kind)
+			if _catalog_retains_collision_1513(candidate):
+				# A legal cosmetic break does not admit translation through the
+				# replacement body during the native hiding callback window.
+				blocked = True
 			mat_info = _synthetic_mat_info(candidate, Math)
 			physical_crushable = _stock_crushable_1513(
 				mat_info, vel, td, candidate[5])
@@ -3608,10 +3686,9 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		exact_token.add((chunk_id, item_index, mat_kind))
 		note_destroyed(
 			event_kind, chunk_id, item_index, mat_kind, now)
-		if not _publish_catalog_once_1513(
+		_publish_catalog_once_1513(
 				event_kind, chunk_id, item_index, point, yaw, vel,
-				mat_kind if event_kind == 'module' else None):
-			publication_pending = True
+				mat_kind if event_kind == 'module' else None)
 		accepted_now = True
 		used_kinetic_speed = used_kinetic_speed or used_cap
 		_diagnostic_contact_1513(
@@ -3620,8 +3697,7 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 				('speed', '%.3f' % float(gate_speed))), now=now)
 		crushed = True
 
-	status = ('pending' if publication_pending else
-		'hard' if blocked else
+	status = ('hard' if blocked else
 		'kinetic' if kinetic else
 		'crushed' if crushed else
 		'approach' if approach else 'clear')
@@ -4116,8 +4192,13 @@ def _publish_catalog_once_1513(
 	return True
 
 
-def _retry_catalog_publications_1513():
-	"""Retry native-committed catalog events before geometry can move away."""
+def _retry_catalog_publications_1513(spaceID):
+	"""Retry native-committed events independently of their current geometry."""
+	owner = globals().get('g_offh_destr_runtime_space')
+	if owner is not None and int(owner) != int(spaceID):
+		# Motion may run before the new space's scanner clears old state, or a
+		# stale caller may arrive after teardown. Neither may replay this ledger.
+		return set(), set()
 	pending = globals().get('g_offh_destr_catalog_publish_pending', {})
 	failed = set()
 	kinds = set()
@@ -4341,11 +4422,18 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 			_event_kind, chunkID, itemIndex,
 			matKind if _event_kind == 'module' else None,
 			_now)
-	_publish_destroyed(
-		_event_kind,
-		chunkID, itemIndex, hitPt, yaw, vel,
-		matKind if typ == AreaDestructibles.DESTR_TYPE_STRUCTURE else None,
-		isShotDamage)
+	_event_mat = matKind if typ == AreaDestructibles.DESTR_TYPE_STRUCTURE else None
+	if isShotDamage:
+		# Shot receipts belong to the current projectile transaction. They must
+		# never be retried later as independent physical-contact LAN events.
+		_publish_destroyed(
+			_event_kind, chunkID, itemIndex, hitPt, yaw, vel, _event_mat, True)
+	else:
+		# Native destruction cannot be rolled back if transport rejects this
+		# report. Freeze it for the existing per-space retry owner before
+		# returning the accepted physical result.
+		_publish_catalog_once_1513(
+			_event_kind, chunkID, itemIndex, hitPt, yaw, vel, _event_mat)
 	return True
 
 
@@ -4936,10 +5024,6 @@ def _fell_trees_near(
 	import AreaDestructibles
 	import BigWorld
 	import Math
-	# An event whose LAN admission was refused stays frozen and pending. Drain
-	# that backlog before proving more native destruction, so a publication the
-	# transport could not take is retried instead of lost.
-	_retry_catalog_publications_1513()
 	try:
 		mgr = getattr(AreaDestructibles, 'g_destructiblesManager', None)
 		if not mgr:
@@ -4956,6 +5040,9 @@ def _fell_trees_near(
 			# empty/deferred transaction shell while clearing every prior battle.
 			_clear_runtime_registry(preserve_spatial_batch=True)
 			globals()['g_offh_destr_runtime_space'] = int(spaceID)
+		# Retire prior-space events before retrying this battle's frozen
+		# publications. Native item IDs can name different objects in a new map.
+		_retry_catalog_publications_1513(spaceID)
 		_st = globals().setdefault('g_offh_tree_state', {'chunks': {}, 'felled': set(), 'spaceID': None})
 		if _st.get('spaceID') != spaceID:
 			# New battle/space: chunk IDs collide between maps and the
@@ -6107,6 +6194,9 @@ def _transparent_shot_surface_filter_1513(ignored_surfaces):
 			identity = int(hit[3]), int(hit[2])
 		except (IndexError, TypeError, ValueError, OverflowError):
 			return True
+		if (isinstance(hit[0], _INTEGER_TYPES) and
+				87 <= hit[0] <= 100):
+			return True
 		if identity + (None,) in ignored_surfaces:
 			return False
 		try:
@@ -6156,6 +6246,8 @@ def _broken_shot_surface_key_1513(chunk_id, item_index, mat_kind):
 	``None`` material.  A structure is accepted per module, so only the exact
 	broken module may be hidden while its siblings keep stopping the shell.
 	"""
+	if mat_kind is not None and 87 <= mat_kind <= 100:
+		return None
 	authority = _get_destr_authority()
 	identity = int(chunk_id), int(item_index)
 	if authority.is_destroyed(identity[0], identity[1], None):

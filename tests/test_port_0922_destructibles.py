@@ -1721,6 +1721,85 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             destructibles_sensor._publish_destroyed(
                 'fragile', 12, 3, (1, 2, 4))
 
+    def test_contact_finishes_native_hide_after_effect_without_replaying_it(self):
+        import functools
+        for kind in ('fragile', 'module'):
+            for shot in (False, True):
+                with self.subTest(kind=kind, shot=shot):
+                    manager = _Manager()
+                    area = _authority_environment(manager)
+                    manager.space_id = 1
+                    area.DESTRUCTIBLE_MATKIND = types.SimpleNamespace(NORMAL_MIN=73)
+                    callbacks = {}
+                    events = []
+                    manager._DestructiblesManager__destroyCallbacks = callbacks
+
+                    def finish(*args, **kwargs):
+                        events.append(('collision', args, kwargs))
+
+                    name = ('_DestructiblesManager__setFragileDestroyed'
+                            if kind == 'fragile' else
+                            '_DestructiblesManager__setModuleDestroyed')
+                    setattr(manager, name, finish)
+
+                    def order(*args):
+                        manager.orders.append(args)
+                        events.append(('effect',))
+                        native_args = ((1, 22, 37, True, shot, False, None)
+                                       if kind == 'fragile' else
+                                       (1, 22, 37, 1, True, shot, False))
+                        callbacks[functools.partial(finish, *native_args)] = 71
+
+                    manager.orderDestructibleDestroy = order
+                    cancel = mock.Mock()
+                    destructibles_authority.BigWorld.cancelCallback = cancel
+                    with mock.patch.dict(sys.modules, {'AreaDestructibles': area}):
+                        if kind == 'fragile':
+                            call = lambda: destructibles_authority.destroy_fragile(
+                                1, 22, 37, (0.0, 0.0, 0.0), shot)
+                            mat_kind = None
+                        else:
+                            call = lambda: destructibles_authority.destroy_module(
+                                1, 22, 37, 74, (0.0, 0.0, 0.0), shot)
+                            mat_kind = 74
+                        self.assertTrue(call())
+                        self.assertFalse(call())
+                    self.assertEqual(not shot,
+                        destructibles_authority.contact_collision_ready(22, 37, mat_kind))
+                    self.assertEqual(('effect',), events[0])
+                    if shot:
+                        self.assertEqual(1, len(events))
+                        self.assertEqual(1, len(callbacks))
+                        cancel.assert_not_called()
+                    else:
+                        self.assertEqual(2, len(events))
+                        self.assertEqual('collision', events[1][0])
+                        self.assertEqual({'delCallback': False}, events[1][2])
+                        self.assertEqual({}, callbacks)
+                        cancel.assert_called_once_with(71)
+
+    def test_contact_hide_completion_preserves_a_failed_or_foreign_callback(self):
+        import functools
+        manager = _Manager()
+        area = _authority_environment(manager)
+        manager.space_id = 1
+        method = mock.Mock(side_effect=RuntimeError('native collision not ready'))
+        manager._DestructiblesManager__setFragileDestroyed = method
+        current = functools.partial(method, 1, 22, 37, True, False, False, None)
+        foreign = functools.partial(method, 2, 22, 37, True, False, False, None)
+        callbacks = {current: 71, foreign: 72}
+        manager._DestructiblesManager__destroyCallbacks = callbacks
+        cancel = mock.Mock()
+        destructibles_authority.BigWorld.cancelCallback = cancel
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': area}):
+            self.assertFalse(destructibles_authority._finish_contact_collision(
+                1, 22, 37, None, 'fragile'))
+            self.assertFalse(destructibles_authority._finish_contact_collision(
+                2, 22, 37, None, 'fragile'))
+        self.assertEqual({current: 71, foreign: 72}, callbacks)
+        method.assert_called_once()
+        cancel.assert_not_called()
+
     def test_fragile_preserves_shot_encoding_without_unmatched_native_sync(self):
         manager = _Manager()
         area = _authority_environment(manager)
@@ -2163,6 +2242,130 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual((1, 22, 37), calls[0][:3])
         self.assertIs(hit_point, calls[0][3])
         self.assertTrue(calls[0][4])
+
+    def test_material_contact_retries_frozen_event_after_native_acceptance(self):
+        for kind, method_name, event_kind, mat_kind in (
+                (1, 'destroy_tree', 'tree', None),
+                (2, 'destroy_column', 'column', None),
+                (3, 'destroy_fragile', 'fragile', None),
+                (4, 'destroy_module', 'module', 75)):
+            with self.subTest(kind=kind):
+                destructibles_sensor._clear_runtime_registry()
+                area = types.ModuleType('AreaDestructibles')
+                area.g_destructiblesManager = types.SimpleNamespace(
+                    isChunkLoaded=lambda unused: False)
+                area.DESTR_TYPE_TREE = 1
+                area.DESTR_TYPE_FALLING_ATOM = 2
+                area.DESTR_TYPE_FRAGILE = 3
+                area.DESTR_TYPE_STRUCTURE = 4
+                area.g_cache = types.SimpleNamespace(
+                    getDescByFilename=lambda unused: {
+                        'type': kind, 'health': 10,
+                        'modules': {75: {'health': 1}}})
+                destroyed = set()
+                native = mock.Mock(side_effect=lambda *unused:
+                                   destroyed.add((22, 37)) or True)
+                authority = types.SimpleNamespace(
+                    is_destroyed=lambda chunk, item, mat=None:
+                    (chunk, item) in destroyed)
+                setattr(authority, method_name, native)
+                sink = mock.Mock(side_effect=(
+                    False, RuntimeError('transport unavailable'), True))
+                destructibles_sensor.set_event_sink(sink)
+                hit = _mat_info_1513(
+                    True, _Vector(10, 2, 20), _Vector(0, 1, 0),
+                    75, 'fence', 22, 37)
+                with mock.patch.dict(sys.modules, {'AreaDestructibles': area}), \
+                        mock.patch.object(destructibles_sensor,
+                                          '_get_destr_authority',
+                                          return_value=authority), \
+                        mock.patch.object(destructibles_sensor,
+                                          'validate_tree_identity_1513',
+                                          return_value=True):
+                    self.assertTrue(destructibles_sensor._try_destroy_destructible(
+                        1, hit, 0.25, 6.0, False))
+                    self.assertFalse(destructibles_sensor._try_destroy_destructible(
+                        1, hit, 0.75, 8.0, True))
+                    destructibles_sensor._retry_catalog_publications_1513(1)
+                    self.assertIn((22, 37, mat_kind),
+                        destructibles_sensor.g_offh_destr_catalog_publish_pending)
+                    destructibles_sensor._retry_catalog_publications_1513(1)
+                native.assert_called_once()
+                self.assertEqual(3, sink.call_count)
+                events = [call.args[0] for call in sink.call_args_list]
+                self.assertTrue(all(event == events[0] for event in events))
+                self.assertEqual({
+                    'destructible_kind': event_kind, 'chunk_id': 22,
+                    'item_index': 37, 'x': 10.0, 'y': 2.0, 'z': 20.0,
+                    'fall_yaw': 0.25, 'speed': 6.0, 'is_shot': False,
+                    **({'mat_kind': mat_kind} if mat_kind is not None else {}),
+                }, events[0])
+                self.assertEqual({},
+                    destructibles_sensor.g_offh_destr_catalog_publish_pending)
+
+    def test_failed_destruction_publication_does_not_block_unrelated_hull(self):
+        (bigworld, math_module, area, cache, authority,
+         descriptor) = self._direction_catalog_fixture()
+        sink = mock.Mock(return_value=False)
+        destructibles_sensor.set_event_sink(sink)
+        self.assertFalse(destructibles_sensor._publish_catalog_once_1513(
+            'fragile', 22, 37, _Vector(), 0.25, 6.0))
+        with mock.patch.dict(sys.modules, {
+                'BigWorld': bigworld, 'Math': math_module,
+                'AreaDestructibles': area, 'DestructiblesCache': cache,
+                }), mock.patch.object(destructibles_sensor,
+                    '_get_destr_authority', return_value=authority):
+            result = destructibles_sensor._catalog_motion_proposal(
+                1, _Vector(100, 0, 100), 0.0, 20.0, descriptor, 10.0,
+                dt=0.04, kinetic_speed=20.0)
+        self.assertEqual('clear', result['status'])
+        self.assertIsNone(result['token'])
+        self.assertFalse(result['requires_commit'])
+        self.assertIn((22, 37, None),
+            destructibles_sensor.g_offh_destr_catalog_publish_pending)
+        self.assertEqual(2, sink.call_count)
+        authority.destroy_fragile.assert_not_called()
+
+    def test_new_space_discards_pending_publication_before_scanner_retry(self):
+        area, bigworld, math_module, descriptor = self._scanner_tree_fixture()
+        destructibles_sensor.g_offh_destr_runtime_space = 2
+        sink = mock.Mock(return_value=False)
+        destructibles_sensor.set_event_sink(sink)
+        self.assertFalse(destructibles_sensor._publish_catalog_once_1513(
+            'fragile', 12, 3, _Vector(10, 2, 20), 0.25, 6.0))
+        sink.reset_mock()
+        sink.return_value = True
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}):
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 6.0, descriptor)
+        sink.assert_not_called()
+        self.assertEqual(1, destructibles_sensor.g_offh_destr_runtime_space)
+        self.assertFalse(getattr(destructibles_sensor,
+                                'g_offh_destr_catalog_publish_pending', {}))
+
+    def test_foreign_space_motion_does_not_replay_contact_backlog(self):
+        (bigworld, math_module, area, cache, authority,
+         descriptor) = self._direction_catalog_fixture()
+        destructibles_sensor.g_offh_destr_runtime_space = 2
+        sink = mock.Mock(return_value=False)
+        destructibles_sensor.set_event_sink(sink)
+        self.assertFalse(destructibles_sensor._publish_catalog_once_1513(
+            'fragile', 12, 3, _Vector(), 0.25, 6.0))
+        sink.reset_mock()
+        sink.return_value = True
+        with mock.patch.dict(sys.modules, {
+                'BigWorld': bigworld, 'Math': math_module,
+                'AreaDestructibles': area, 'DestructiblesCache': cache,
+                }), mock.patch.object(destructibles_sensor,
+                    '_get_destr_authority', return_value=authority):
+            destructibles_sensor._catalog_motion_proposal(
+                1, _Vector(100, 0, 100), 0.0, 20.0, descriptor, 10.0,
+                dt=0.04, kinetic_speed=20.0)
+        sink.assert_not_called()
+        self.assertIn((12, 3, None),
+            destructibles_sensor.g_offh_destr_catalog_publish_pending)
 
     def test_named_material_without_descriptor_isolates_exact_wire(self):
         filename = 'content/test/missing-destructible.model'
@@ -4122,6 +4325,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             {(22, 1, None)})
         self.assertFalse(item_wide(73, 0, 1, 22))
         self.assertFalse(item_wide(74, 0, 1, 22))
+        self.assertTrue(item_wide(87, 0, 1, 22))
+        self.assertTrue(item_wide(100, 0, 1, 22))
         self.assertTrue(item_wide(73, 0, 2, 22))
         module_only = \
             destructibles_sensor._transparent_shot_surface_filter_1513(
@@ -7187,6 +7392,70 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             bins_before, destructibles_sensor.g_offh_destr_contact_bins)
 
+    def test_solid_destroyed_replacement_blocks_contact_and_obb_skip(self):
+        (bigworld, math_module, area, cache, authority,
+         descriptor) = self._direction_catalog_fixture()
+        filename = next(iter(destructibles_sensor._destructible_catalog['resources']))
+        record = destructibles_sensor._destructible_catalog['resources'][filename]
+        record['retained_collision_boxes'] = frozenset((0,))
+        hit = (_Vector(0.0, 0.7, 3.5), _Vector(0.0, 0.0, -1.0))
+        with mock.patch.dict(sys.modules, {
+                'BigWorld': bigworld, 'Math': math_module,
+                'AreaDestructibles': area, 'DestructiblesCache': cache}), \
+                mock.patch.object(destructibles_sensor, '_get_destr_authority',
+                                  return_value=authority):
+            proposal = destructibles_sensor._catalog_motion_proposal(
+                1, _Vector(), 0.0, 20.0, descriptor, 10.0,
+                dt=0.04, kinetic_speed=20.0)
+            self.assertEqual('hard', proposal['status'])
+            self.assertTrue(proposal['requires_commit'])
+            self.assertFalse(destructibles_sensor._catalog_soft_static_path(
+                1, _Vector(), _Vector(0.0, 0.7, 10.0), hit, 20.0, descriptor))
+            authority.is_destroyed.return_value = True
+            during_hide = destructibles_sensor._catalog_motion_proposal(
+                1, _Vector(), 0.0, 20.0, descriptor, 10.0,
+                dt=0.04, kinetic_speed=20.0)
+            self.assertEqual('hard', during_hide['status'])
+            # After the swap the native replacement BSP, not the original
+            # whole-item box, decides whether its wreckage blocks this ray.
+            after_hide = destructibles_sensor._catalog_motion_proposal(
+                1, _Vector(), 0.0, 20.0, descriptor, 10.3,
+                dt=0.04, kinetic_speed=20.0)
+            self.assertEqual('crushed', after_hide['status'])
+            self.assertFalse(destructibles_sensor._catalog_soft_static_path(
+                1, _Vector(), _Vector(0.0, 0.7, 10.0), hit, 20.0, descriptor,
+                require_pending_first=True))
+            self.assertIsNone(destructibles_sensor._broken_shot_surface_key_1513(
+                22, 37, 87))
+        bigworld.wg_collideSegment.assert_not_called()
+
+    def test_broken_skin_covering_ray_endpoint_never_recasts_backwards(self):
+        import struct
+
+        class NativeVector(_Vector):
+            def __add__(self, other):
+                return NativeVector(*(struct.unpack('f', struct.pack('f', value))[0]
+                    for value in (self.x + other.x, self.y + other.y,
+                                  self.z + other.z)))
+
+        (bigworld, math_module, area, cache, authority,
+         descriptor) = self._direction_catalog_fixture(destroyed=True)
+        start = NativeVector(0.0, 0.7, 3.0)
+        end = NativeVector(0.0, 0.7, 4.0)
+        hit = (_Vector(0.0, 0.7, 3.5), _Vector(0.0, 0.0, -1.0))
+        # A reversed ray begins inside the native skin and hits it again.
+        bigworld.wg_collideSegment.return_value = hit
+        with mock.patch.dict(sys.modules, {
+                'BigWorld': bigworld, 'Math': math_module,
+                'AreaDestructibles': area, 'DestructiblesCache': cache}), \
+                mock.patch.object(destructibles_sensor, '_get_destr_authority',
+                                  return_value=authority):
+            result = destructibles_sensor._catalog_soft_static_path(
+                1, start, end, hit, 0.0, descriptor,
+                require_pending_first=True)
+        self.assertIs(True, result)
+        bigworld.wg_collideSegment.assert_not_called()
+
     def test_pending_shared_fence_face_recasts_into_active_neighbour(self):
         (bigworld, math_module, area, cache, authority,
          descriptor) = self._direction_catalog_fixture()
@@ -7465,11 +7734,14 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                         1, _Vector(), 0.2, 20.0, descriptor, 10.0,
                         dt=0.04, kinetic_speed=20.0)
 
-                self.assertEqual('pending', committed['status'])
+                self.assertEqual('crushed', committed['status'])
                 self.assertEqual((key,), committed['token'])
                 self.assertTrue(committed['accepted_now'])
-                self.assertEqual('pending', retry['status'])
-                self.assertEqual((key,), retry['token'])
+                self.assertEqual(
+                    'clear' if kind == 'falling' else 'crushed',
+                    retry['status'])
+                self.assertEqual(
+                    None if kind == 'falling' else (key,), retry['token'])
                 self.assertFalse(retry['requires_commit'])
                 self.assertEqual(
                     'clear' if kind == 'falling' else 'crushed',
@@ -7899,6 +8171,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             self.assertTrue(collision_filter(75, 0, 37, 22))
             destroyed.add((37, None))
             self.assertFalse(collision_filter(75, 0, 37, 22))
+            self.assertTrue(collision_filter(87, 0, 37, 22))
             self.assertTrue(collision_filter(75, 0, 38, 22))
 
     def test_stationary_multi_module_structure_crushes_each_module(self):
@@ -8313,7 +8586,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             for line in writes))
 
     def test_pending_name_alignment_blocks_before_the_crush_law_owns_it(self):
-        """The wagon is solid while pending and crushable once identified."""
+        """A damaged wagon still blocks movement through its replacement body."""
         environment = self._prohorovka_wagon_environment(
             descriptor_available=True)
         authority = types.SimpleNamespace(
@@ -8326,12 +8599,12 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             environment['clock'][0] = 10.0 + tick
             details.append(self._wagon_sweep(
                 environment, authority, commit_enabled=True))
-            if details[-1]['status'] == 'crushed':
+            if details[-1]['accepted_now']:
                 break
 
         self.assertEqual('hard', details[0]['status'])
         self.assertIn('unidentified', details[0]['kinds'])
-        self.assertEqual('crushed', details[-1]['status'])
+        self.assertEqual('hard', details[-1]['status'])
         self.assertNotIn('unidentified', details[-1]['kinds'])
         self.assertEqual(((32637, 56, None),), details[-1]['token'])
         authority.destroy_fragile.assert_called_once()
@@ -8555,7 +8828,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         # then does the exact retail crush law get to decide.
         self.assertEqual('hard', pending_detail['status'])
         self.assertIn('unidentified', pending_detail['kinds'])
-        self.assertEqual('crushed', detail['status'])
+        # Its compiled destroyed module retains collision, so cosmetic
+        # destruction alone cannot admit translation through this contact.
+        self.assertEqual('hard', detail['status'])
         self.assertTrue(detail['requires_commit'])
         self.assertEqual(((32636, 25, 74),), detail['token'])
         self.assertEqual(

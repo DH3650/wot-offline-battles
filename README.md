@@ -46,12 +46,89 @@ The 0.9.22 client gets a working offline garage:
   kit and a large repair kit.
 - You can change modules, optional devices, consumables, shells, camouflage
   and crew skills. Every item costs nothing.
-- The garage is written to `mods/configs/offline_lan_0922/garage_state.json`
-  after each change, so it survives a restart.
+- The garage is written to the selected save after each change, so it survives
+  a restart.
 - The battle runs the vehicle the garage fitted. Crew skills, optional devices
   and consumables move the same values the garage parameters panel shows: view
   range, concealment, reload, aim time, dispersion, traverse, engine power,
   terrain resistance and repair speed.
+
+## Saves
+
+The launcher's Saves tab keeps any number of independent saves. Each one owns
+its own garage, crew, account settings and battle results under
+`%APPDATA%/Wargaming.net/WorldOfTanks/offline_lan_0922/saves/<save>/`, and the
+selected save is written into the client configuration when the game starts.
+State written by a build without saves moves into the default save on the next
+start.
+
+A new save is created as one of two accounts, and the choice is permanent. A
+fully unlocked save is the historical garage: every vehicle, module and
+consumable is already owned. A new account starts the way a real World of Tanks
+account does, with the tier 1 starter tanks, 100000 credits, 30 garage slots
+and nothing else researched; credits and experience are earned in battle, and
+vehicles, modules, ammunition and consumables are researched and bought in the
+garage at this client's own prices. Gold is spent but not earned, so premium
+vehicles and gold ammunition are paid for out of the gold the launcher grants.
+
+Taking a complex optional device off a vehicle follows the client's own rule:
+its descriptor says whether the device survives being removed, and one that
+does not is destroyed unless the player pays the game's own removal price --
+10 gold in a career, nothing in a fully unlocked save.
+
+Ammunition and consumables are stock now, not scenery. A battle spends the
+rounds it fired and one of each consumable it used, the server reports both,
+and reloading buys whatever the depot is short of at this client's prices. An
+account that cannot pay for a full load does not get one.
+
+A battle leaves the vehicle as damaged as it ended: the client's own
+inventory carries the outstanding repair cost beside the remaining health, so
+the garage shows the tank destroyed or damaged and the maintenance panel
+offers the repair. The bill comes out of the client's own repair formula --
+one health point costs what that vehicle charges per point -- and it has to be
+paid before the tank can fight again. A save keeps the damage across a
+restart, because a restart is not a free repair.
+
+Crew members are recruited from the same three schools the game offers, at
+50%, 75% or 100% of their role: free, 20000 credits and 200 gold in a career,
+and free in a fully unlocked save. A recruit goes to the barracks or straight
+into a seat.
+
+The barracks holds the crew members no vehicle is carrying. Selling a vehicle
+can send its crew there instead of dismissing them, a seat can be unloaded and
+filled again, and a crew member can move straight from one tank to another;
+whoever leaves a seat needs a free berth, which is the same check the game's
+own dialogs make before they offer the choice. A vehicle remembers the crew that
+left it, so the game's own "return crew" button puts them back where they
+were -- until the game is restarted, because the inventory ids a return works
+by are rebuilt from the save rather than stored in it. A crew member can only
+take a seat in the vehicle they were trained for, and retraining -- at the same three
+schools, one crew member or a whole crew at a time -- is how they change
+vehicle. The client works out the role level they keep, so the loss is the
+game's own.
+
+The launcher's Account tab shows the selected save's credits, gold and free
+experience and lets a player set them. Gold is the one currency an offline
+account can never earn -- there is no store to buy it from and no battle that
+pays it -- so this is where a save gets it. A save has no balances until the
+game has started it once, and the game must be closed while they are changed,
+because the client owns the same file.
+
+The Shop tab sells every vehicle this client prices in gold: 196 of them, and
+145 are reward or event tanks the game's own shop never sold and that no tech
+tree leads to. A purchase takes the gold out of the selected save and leaves
+the vehicle waiting; the next time the game starts that save, the client builds
+it into the garage, stock and with a crew, exactly as a shop purchase arrives.
+A vehicle this client cannot build stays waiting and says why in the client
+log, so a purchase is never silently lost.
+
+Only the client can name a saved vehicle, so a save written before this
+version says nothing about what it owns. The shop refuses to sell to such a
+save until the game has started it once; otherwise it would charge gold for a
+vehicle the save already has.
+
+Vehicle data profiles are deliberately not part of a save: they change
+the client catalogue for a whole room, so they belong to the installation.
 
 The launcher's Tools tab can also edit vehicle data directly. A vehicle data
 profile is a named set of Packed XML field changes (health, damage,
@@ -125,8 +202,30 @@ whose profile changed after it started must be restarted first.
   commemorative medals from the client's own achievement thresholds, and both
   the vehicle and the account dossier keep counting them. Medals the client
   itself retired, cancelled before release, or that need data this
-  reconstruction does not own, including Mark of Mastery, are listed with
-  their reason in `battle_achievements.py` rather than guessed.
+  reconstruction does not own are listed with their reason in
+  `battle_achievements.py` rather than guessed.
+- Battle payments follow the published structure: Credits are a base amount
+  per vehicle tier that alone carries the 1.85 victory multiplier, a
+  tier-independent amount per point of damage, double for detecting artillery,
+  and one capture payment split between the vehicles that completed it; XP
+  adds 50 percent on a win and returns five percent as Free XP. Damage XP
+  uses an offline tier curve derived from the captured tables, and kill XP
+  uses victim durability. These are balance approximations, not recovered
+  retail formulas: percentile ratios do not identify XP coefficients, and
+  durability does not uniquely determine tier.
+- A premium vehicle's own XP bonus and crew-training rate come from the
+  client's own `premiumVehicleXPFactor` and `crewXpFactor`. The XP bonus is
+  banked and shown in the results breakdown, but it never enters the number
+  the mastery badge ranks, which stays the bare battle XP.
+- Mastery badges and Marks of Excellence use the real bar. Wargaming computes
+  both from the live player population, so `tools/bake_mastery_thresholds_0922.py`
+  captures the published retail tables into `mastery_catalog.py`: base XP for
+  each mastery class, and average combined damage by percentile for the gun
+  marks. A battle's own base XP decides the class the results screen shows,
+  and the vehicle's own average combined damage decides its marks. That
+  average is retail's: an exponential moving average over 100 battles that
+  starts from zero on a fresh vehicle, so marks take most of a hundred good
+  battles rather than one.
 
 This is a reconstruction from the frozen clients and same-era mechanics, not
 Wargaming's retail server. LAN play assumes trusted clients. Native rendering,

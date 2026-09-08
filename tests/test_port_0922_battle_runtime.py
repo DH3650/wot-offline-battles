@@ -557,6 +557,19 @@ class _Descriptor(object):
                 self.turret.hitTester, self.gun.hitTester)
 
 
+def _wide_track_descriptor():
+    """Return the exact #1513 Ch24_Type64 bounds used by world-collision tests."""
+    descriptor = _Descriptor()
+    descriptor.chassis.hitTester = _HitTester1513(
+        _Vector(-1.565461, 0.002, -2.648121),
+        _Vector(1.565461, 1.175350, 2.648682))
+    descriptor.hull.hitTester = _HitTester1513(
+        _Vector(-1.15, -0.540596, -2.79015),
+        _Vector(1.15, 0.729932, 2.70431))
+    descriptor.chassis.hullPosition = _Vector(0.0, 0.999047, 0.0)
+    return descriptor
+
+
 def _suspension_descriptor():
     """Return one fixture with every client-owned trial suspension field."""
     descriptor = _Descriptor()
@@ -7760,6 +7773,19 @@ class BattleRuntimeContractTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {
                 'CurrentVehicle': current_vehicle}):
             self.assertEqual({}, battle._local_ammo_layout())
+
+    def test_mounted_zero_id_manual_extinguisher_is_preserved(self):
+        runtime = _runtime()
+        descriptor = types.SimpleNamespace(
+            id=(15, 0), compactDescr=251, name='handExtinguishers',
+            cooldownSeconds=90.0, reuseCount=1)
+        runtime.vehicles.g_cache.equipments = lambda: {0: descriptor}
+        battle = BattleRuntime(runtime)
+        battle._local_mounted_equipments = lambda: [251]
+        states = battle._default_equipments()
+        self.assertEqual(1, len(states))
+        self.assertEqual(0, states[0].contract['id'])
+        self.assertEqual(251, states[0].contract['compactDescr'])
 
     def test_mounted_rations_are_published_without_an_activation_action(self):
         runtime = _runtime()
@@ -19793,7 +19819,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 RuntimeError, 'native suspension ground hit is malformed'):
             battle._suspension_ground_y(0.0, 0.0, -0.5, 0.8)
 
-    def _legacy_support_battle(self, columns, floor):
+    def _legacy_support_battle(self, columns, floor, descriptor=None):
         """Return a legacy-vertical player over one sampled ground field."""
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -19801,7 +19827,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._local_fall_armed = True
         battle._local_suspension_disabled = True
         entity = _Vehicle(
-            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+            10, descriptor or _Descriptor(), _Vector(), (0, 0, 0),
+            {'health': 500})
         calls = []
 
         def collide(space_id, start, end, flags, *rest):
@@ -19826,15 +19853,30 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(battle._local_airborne)
         self.assertEqual(0.0, battle._local_vertical_speed)
 
-    def test_player_bridges_a_slot_running_along_its_hull(self):
+    def test_player_bridges_a_slot_running_along_its_chassis(self):
         battle, entity, unused_calls = self._legacy_support_battle(
-            {(1.7, 0.0): 9.95, (-1.7, 0.0): 10.0}, 7.0)
+            {(1.5, 0.0): 9.95, (-1.5, 0.0): 10.0}, 7.0)
 
         position = battle._update_vertical_motion(
             entity, (0.0, 10.0, 0.0), 0.0, 0.1)
 
         self.assertAlmostEqual(10.0, position[1], places=6)
         self.assertFalse(battle._local_airborne)
+
+    def test_player_support_uses_wide_chassis_not_narrower_hull(self):
+        """A Type 64-style track footprint still bridges its narrow hull slot."""
+        descriptor = _wide_track_descriptor()
+        battle, entity, calls = self._legacy_support_battle(
+            {(1.6, 0.0): 10.0, (-1.6, 0.0): 10.0}, 7.0,
+            descriptor)
+
+        position = battle._update_vertical_motion(
+            entity, (0.0, 10.0, 0.0), 0.0, 0.1)
+
+        self.assertAlmostEqual(10.0, position[1], places=6)
+        self.assertFalse(battle._local_airborne)
+        self.assertIn((1.6, 0.0), calls)
+        self.assertIn((-1.6, 0.0), calls)
 
     def test_player_still_falls_where_only_one_chassis_end_is_supported(self):
         battle, entity, unused_calls = self._legacy_support_battle(
