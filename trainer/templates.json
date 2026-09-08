@@ -1,0 +1,214 @@
+{
+  "_comment": [
+    "乘员技能模板: 键 = 角色组合 (主角色在前, 兼职角色按字母序), 用 + 连接。",
+    "trained = 7 个生效技能 (全部 100%); training = 第 8 个在练技能 (0%)。",
+    "该角色组合总共只有 7 个可学技能时 (纯装填手), training 为 null。",
+    "可用 TUI 编辑: python -m trainer.tui → 编辑技能模板。"
+  ],
+  "templates": {
+    "commander": {
+      "trained": [
+        "commander_eagleEye",
+        "commander_expert",
+        "commander_sixthSense",
+        "commander_tutor",
+        "brotherhood",
+        "camouflage",
+        "repair"
+      ],
+      "training": "fireFighting"
+    },
+    "commander+gunner": {
+      "trained": [
+        "commander_sixthSense",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "gunner_smoothTurret",
+        "gunner_sniper",
+        "commander_eagleEye"
+      ],
+      "training": "gunner_gunsmith"
+    },
+    "commander+gunner+loader": {
+      "trained": [
+        "commander_sixthSense",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "gunner_smoothTurret",
+        "commander_eagleEye",
+        "loader_pedant"
+      ],
+      "training": "gunner_sniper"
+    },
+    "commander+gunner+loader+radioman": {
+      "trained": [
+        "commander_sixthSense",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "commander_eagleEye",
+        "gunner_smoothTurret",
+        "radioman_finder"
+      ],
+      "training": "loader_pedant"
+    },
+    "commander+gunner+radioman": {
+      "trained": [
+        "commander_sixthSense",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "commander_eagleEye",
+        "gunner_smoothTurret",
+        "radioman_finder"
+      ],
+      "training": "gunner_sniper"
+    },
+    "commander+loader": {
+      "trained": [
+        "commander_sixthSense",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "commander_eagleEye",
+        "commander_tutor",
+        "loader_pedant"
+      ],
+      "training": "loader_desperado"
+    },
+    "commander+loader+radioman": {
+      "trained": [
+        "commander_sixthSense",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "commander_eagleEye",
+        "radioman_finder",
+        "loader_pedant"
+      ],
+      "training": "radioman_inventor"
+    },
+    "commander+radioman": {
+      "trained": [
+        "commander_sixthSense",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "commander_eagleEye",
+        "radioman_finder",
+        "radioman_inventor"
+      ],
+      "training": "radioman_retransmitter"
+    },
+    "driver": {
+      "trained": [
+        "driver_badRoadsKing",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "driver_smoothDriving",
+        "driver_virtuoso",
+        "driver_rammingMaster"
+      ],
+      "training": "driver_tidyPerson"
+    },
+    "driver+gunner": {
+      "trained": [
+        "driver_badRoadsKing",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "driver_smoothDriving",
+        "gunner_smoothTurret",
+        "driver_virtuoso"
+      ],
+      "training": "gunner_sniper"
+    },
+    "driver+loader": {
+      "trained": [
+        "driver_badRoadsKing",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "driver_smoothDriving",
+        "driver_virtuoso",
+        "loader_pedant"
+      ],
+      "training": "loader_desperado"
+    },
+    "gunner": {
+      "trained": [
+        "gunner_smoothTurret",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "gunner_sniper",
+        "gunner_gunsmith",
+        "gunner_rancorous"
+      ],
+      "training": "fireFighting"
+    },
+    "gunner+loader": {
+      "trained": [
+        "gunner_smoothTurret",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "gunner_sniper",
+        "loader_pedant",
+        "gunner_gunsmith"
+      ],
+      "training": "loader_desperado"
+    },
+    "loader": {
+      "trained": [
+        "loader_pedant",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "loader_desperado",
+        "loader_intuition",
+        "fireFighting"
+      ],
+      "training": null
+    },
+    "loader+radioman": {
+      "trained": [
+        "loader_pedant",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "radioman_finder",
+        "loader_desperado",
+        "loader_intuition"
+      ],
+      "training": "radioman_inventor"
+    },
+    "radioman": {
+      "trained": [
+        "radioman_finder",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "radioman_inventor",
+        "radioman_retransmitter",
+        "radioman_lastEffort"
+      ],
+      "training": "fireFighting"
+    },
+    "radioman+loader": {
+      "trained": [
+        "radioman_finder",
+        "brotherhood",
+        "repair",
+        "camouflage",
+        "radioman_inventor",
+        "loader_pedant",
+        "radioman_retransmitter"
+      ],
+      "training": "loader_desperado"
+    }
+  }
+}
