@@ -60,6 +60,7 @@ SERVER_TEAM_SIZE_ENV_0922 = "WOT_0922_TEAM_SIZE"
 SERVER_TEAM1_SIZE_ENV_0922 = "WOT_0922_TEAM1_SIZE"
 SERVER_TEAM2_SIZE_ENV_0922 = "WOT_0922_TEAM2_SIZE"
 SERVER_BOT_LINEUP_ENV_0922 = "WOT_0922_BOT_LINEUP"
+SERVER_BOT_EXCLUDED_VEHICLES_ENV_0922 = "WOT_0922_BOT_EXCLUDED_VEHICLES"
 SERVER_LOOPBACK_ONLY_ENV_0922 = "WOT_0922_LOOPBACK_ONLY"
 SERVER_VEHICLE_OVERLAY_ROOT_ENV_0922 = "WOT_0922_VEHICLE_OVERLAY_ROOT"
 VEHICLE_OVERLAY_CAPABILITY = "vehicle_overlay_v1"
@@ -82,11 +83,19 @@ BUILD_IDENTITY_RELATIVE_PATH_0922 = (
 BUILD_SEMANTIC_VERSION_ENV = "WOT_OFFLINE_SEMANTIC_VERSION"
 BUILD_IDENTITY_ENV = "WOT_OFFLINE_BUILD_IDENTITY"
 PLAYER_ENGINE_CONFIG_0922 = "engine_config.offline-player.xml"
+WORKER_ENGINE_CONFIG_0922 = "engine_config.offline-worker.xml"
 PLAYER_ARGUMENT_0922 = "--player"
 WORKER_ONLY_ARGUMENT_0922 = "--worker-only"
 PAIRED_PLAYER_ARGUMENT_0922 = "--paired-player"
 STOP_STARTER_ARGUMENT_0922 = "--stop-starter"
-WORKER_READY_TIMEOUT_SECONDS_0922 = 60.0
+# The starter waits up to 60 seconds for readiness, then can spend another
+# 10 seconds attaching ProcDump. Keep the launcher's 90-second budget so the
+# starter can record its own failure before launcher cancellation.
+WORKER_STARTER_READY_TIMEOUT_SECONDS_0922 = 60.0
+WORKER_READY_TIMEOUT_MARGIN_SECONDS_0922 = 30.0
+WORKER_READY_TIMEOUT_SECONDS_0922 = (
+    WORKER_STARTER_READY_TIMEOUT_SECONDS_0922 +
+    WORKER_READY_TIMEOUT_MARGIN_SECONDS_0922)
 WORKER_FAILURE_DRAIN_SECONDS_0922 = 0.5
 STARTER_CONTROL_TIMEOUT_SECONDS_0922 = 5.0
 STARTER_SHUTDOWN_TIMEOUT_SECONDS_0922 = 45.0
@@ -211,7 +220,8 @@ def visible_client_environment(port_version, host=LOCAL_HOST,
         return environment
     _apply_payload_identity_environment(
         environment, bundled_payload_identity(port_version))
-    for name in (HIDDEN_DESKTOP_ENV_0922, WORKER_READY_MARKER_ENV_0922):
+    for name in (HIDDEN_DESKTOP_ENV_0922, WORKER_READY_MARKER_ENV_0922,
+                 "BW_RES_PATH", "WOT_OFFLINE_WORKER_RES_PATH"):
         environment.pop(name, None)
     environment["WOT_OFFLINE_UI_LANGUAGE"] = ("zh" if language == "zh" else "en")
     environment[CLIENT_MODE_ENV_0922] = PLAYER_MODE_0922
@@ -251,6 +261,10 @@ def worker_environment(game_root, host=LOCAL_HOST,
         team1_size=team1_size, team2_size=team2_size)
     environment[CLIENT_SERVER_HOST_ENV_0922] = str(host)
     environment[CLIENT_SERVER_PORT_ENV_0922] = str(int(port))
+    # Both clients use the installed paths.xml, including its mod roots.
+    # Discard an inherited override left by an older launcher session.
+    environment.pop("BW_RES_PATH", None)
+    environment.pop("WOT_OFFLINE_WORKER_RES_PATH", None)
     return environment
 
 
@@ -1189,6 +1203,36 @@ def _transactional_install(game_root, staged_root, members, layout):
     return actions, len(operations)
 
 
+# Exit codes a field report actually produced.  A raw decimal tells a player
+# nothing, and the two that matter are not even crashes of ours: 0xC0000135 is
+# Windows refusing to start the client because a runtime DLL is missing, and 3
+# is the client's own abort() after its fatal-error handler ran.
+_EXIT_CODE_NOTES = {
+    3: ("the client stopped itself (abort); its own fatal-error message is "
+        "in the game log of that session"),
+    0xC0000005: "access violation inside the client",
+    0xC0000135: ("a DLL the client needs was not found, so Windows never "
+                 "started it: install the DirectX 9 (June 2010) end-user "
+                 "runtime and the Visual C++ x86 redistributable, then "
+                 "verify the game folder is complete"),
+}
+
+
+def describe_exit_code(code):
+    """Render a process exit code with its meaning when one is known."""
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return str(code)
+    unsigned = value & 0xFFFFFFFF
+    note = _EXIT_CODE_NOTES.get(unsigned)
+    if note is not None:
+        return "%d (0x%08X, %s)" % (value, unsigned, note)
+    if unsigned >= 0xC0000000:
+        return "%d (0x%08X, a Windows fatal status)" % (value, unsigned)
+    return str(value)
+
+
 def install_client_mod(game_root, port_version, base_dir=None, force=False):
     """Install the bundled mod and report what changed.
 
@@ -1480,6 +1524,14 @@ def _reset_state_name(name):
         prefix = base_name + ".invalid."
         if name.startswith(prefix) and name[len(prefix):].isdigit():
             return True
+        # The client keeps rotated and quarantined copies of a state file
+        # beside it (``garage_state.backup1.json``,
+        # ``garage_state.rejected-...json``).  A confirmed reset promises to
+        # remove what the player earned, and a copy of it is still that.
+        stem, extension = os.path.splitext(base_name)
+        if (name.startswith(stem + ".") and name.endswith(extension) and
+                name != base_name):
+            return True
     return False
 
 
@@ -1605,7 +1657,8 @@ def server_argv(port_version, base_dir=None):
 
 def server_environment(port_version, game_root, environment=None,
                        team_size=DEFAULT_TEAM_SIZE, loopback_only=False,
-                       team1_size=None, team2_size=None, bot_lineup=None):
+                       team1_size=None, team2_size=None, bot_lineup=None,
+                       bot_excluded_vehicles=None):
     """Build the endpoint and roster environment for one LAN server."""
     environment = dict(os.environ if environment is None else environment)
     if port_version == PORT_0_9_22:
@@ -1621,6 +1674,8 @@ def server_environment(port_version, game_root, environment=None,
         environment[SERVER_TEAM2_SIZE_ENV_0922] = str(team2_size)
         environment[SERVER_BOT_LINEUP_ENV_0922] = json.dumps(
             list(bot_lineup or ()), separators=(",", ":"))
+        environment[SERVER_BOT_EXCLUDED_VEHICLES_ENV_0922] = json.dumps(
+            list(bot_excluded_vehicles or ()), separators=(",", ":"))
         environment[SERVER_VEHICLE_OVERLAY_ROOT_ENV_0922] = os.path.abspath(
             game_root)
         if loopback_only:
@@ -1977,6 +2032,16 @@ def wait_for_server(port_version, host, port, timeout=20.0, interval=0.25,
         if clock() >= deadline:
             return False
         sleep(interval)
+
+
+def worker_startup_exit_hint(exit_code):
+    """Explain loader failures that happen before the client can write a log."""
+    if exit_code is not None and (int(exit_code) & 0xffffffff) == 0xc0000135:
+        return ("0xC0000135: a required DLL could not be loaded. "
+                "Verify the game files and install the DirectX 9 June 2010 "
+                "runtime and Visual C++ x86 runtime. The exit code alone "
+                "does not identify the missing DLL.")
+    return ""
 
 
 def wait_for_worker_ready(process, game_root,

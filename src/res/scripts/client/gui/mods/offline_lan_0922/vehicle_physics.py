@@ -43,9 +43,11 @@ SLOPE_GRIP_LNG_FULL_Y = math.cos(math.radians(27.5))
 SLOPE_GRIP_LNG_FULL = 1.0
 SLOPE_GRIP_LNG_MIN_Y = math.cos(math.radians(32.0))
 SLOPE_GRIP_LNG_MIN = 0.1
-# The contrib suspension trial applies a separate side-slip projection. These
-# two points came from the contributed implementation; this repository has not
-# proved that they reproduce the #1513 native curve.
+# Side grip. Exact #1513 ``g_defaultTankXPhysicsCfg['chassis']`` stores
+# ``slopeGripSdwTerrain = (0.9099612708765432, 1.0, 0.8746197071393957, 0.1)``,
+# which is (cos 24.5 deg, 1.0, cos 29 deg, 0.1): the same clamped two-point
+# form as the longitudinal curve above. The contrib suspension trial guessed
+# these two angles; this build's own configuration confirms them.
 SLOPE_GRIP_SDW_FULL_Y = math.cos(math.radians(24.5))
 SLOPE_GRIP_SDW_FULL = 1.0
 SLOPE_GRIP_SDW_MIN_Y = math.cos(math.radians(29.0))
@@ -399,6 +401,22 @@ def _native_power_ratio(td, power_w):
 	except (AttributeError, KeyError, TypeError, ValueError):
 		pass
 	return 1.0
+
+
+def descriptor_mass(td):
+	'''Read the same kilogram mass as derive_params without drive parameters.
+
+	Contact bodies do not consume engine power, traverse or terrain factors.
+	Read the mounted descriptor each time so an in-place equipment or Siege
+	change cannot leave a cached weight behind.
+	'''
+	try:
+		physics = getattr(td, 'physics', None) or {}
+		if 'weight' in physics:
+			return float(physics['weight'])
+	except Exception:
+		pass
+	return _DEFAULTS['mass']
 
 
 @observed('physics.derive_params')
@@ -856,22 +874,33 @@ def derive_suspension_params(descriptor):
 	}
 
 
-def suspension_point_offset(point, pitch=0.0, roll=0.0):
-	'''Rotate one local suspension point by the same YPR law as the hull.'''
-	x, y, z = float(point['x']), float(point.get('y', 0.0)), float(point['z'])
+def _suspension_rotation(pitch, roll):
+	'''Prepare one immutable pose; rebuild after each solver pose change.'''
 	sp, cp = math.sin(float(pitch)), math.cos(float(pitch))
 	sr, cr = math.sin(float(roll)), math.cos(float(roll))
+	return sp, cp, sr, cr
+
+
+def _suspension_point_offset(point, rotation):
+	x, y, z = float(point['x']), float(point.get('y', 0.0)), float(point['z'])
+	sp, cp, sr, cr = rotation
 	rolled_y = sr * x + cr * y
 	return (cr * x - sr * y, cp * rolled_y - sp * z,
 		sp * rolled_y + cp * z)
 
 
+def suspension_point_offset(point, pitch=0.0, roll=0.0):
+	'''Rotate one local suspension point by the same YPR law as the hull.'''
+	return _suspension_point_offset(point, _suspension_rotation(pitch, roll))
+
+
 def _suspension_world_points(points, position, yaw, pitch, roll):
 	x, unused_y, z = map(float, position)
 	sine, cosine = math.sin(float(yaw)), math.cos(float(yaw))
+	rotation = _suspension_rotation(pitch, roll)
 	result = []
 	for point in points:
-		local_x, unused_y, local_z = suspension_point_offset(point, pitch, roll)
+		local_x, unused_y, local_z = _suspension_point_offset(point, rotation)
 		result.append((x + cosine * local_x + sine * local_z,
 			z - sine * local_x + cosine * local_z))
 	return tuple(result)
@@ -1059,7 +1088,8 @@ def suspension_ground_plane(params, ground_heights,
 def suspension_world_ground_plane(params, ground_heights, position, yaw,
 		maximum_residual=None, pitch=0.0, roll=0.0):
 	'''Fit one suspension plane in stable world-space coordinates.'''
-	points = tuple(suspension_point_offset(spring, pitch, roll)
+	rotation = _suspension_rotation(pitch, roll)
+	points = tuple(_suspension_point_offset(spring, rotation)
 		for spring in params['springs'])
 	local_plane = suspension_ground_plane(
 		params, ground_heights, maximum_residual,
@@ -1141,6 +1171,19 @@ def suspension_support_vertical_velocity(plane, velocity_x, velocity_z):
 		return None
 	gradient_x, gradient_z, velocity_x, velocity_z = values
 	return gradient_x * velocity_x + gradient_z * velocity_z
+
+
+def suspension_drive_pitch(plane, yaw):
+	"""Project contacted terrain onto the hull-forward drive axis."""
+	try:
+		yaw = float(yaw)
+		if math.isnan(yaw) or math.isinf(yaw):
+			return None
+	except (TypeError, ValueError, OverflowError):
+		return None
+	tangent = suspension_support_vertical_velocity(
+		plane, math.sin(yaw), math.cos(yaw))
+	return None if tangent is None else -math.atan(tangent)
 
 
 def landing_impact_speed(world_velocity, support_normal):
@@ -1331,16 +1374,21 @@ def suspension_vertical_sweep_drop(vertical_speed, dt):
 	return max(0.0, -float(vertical_speed) * step + GRAVITY * step * step)
 
 
-def _rigid_point_height(state, point):
-	return float(state['height']) + suspension_point_offset(
-		point, state.get('pitch', 0.0), state.get('roll', 0.0))[1]
-
-
-def _rigid_point_height_gradients(state, point):
-	pitch, roll = float(state.get('pitch', 0.0)), float(state.get('roll', 0.0))
+def _rigid_point_height(state, point, rotation=None):
+	if rotation is None:
+		rotation = _suspension_rotation(
+			state.get('pitch', 0.0), state.get('roll', 0.0))
+	sp, cp, sr, cr = rotation
 	x, y, z = float(point['x']), float(point.get('y', 0.0)), float(point['z'])
-	sp, cp = math.sin(pitch), math.cos(pitch)
-	sr, cr = math.sin(roll), math.cos(roll)
+	return float(state['height']) + (cp * (sr * x + cr * y) - sp * z)
+
+
+def _rigid_point_height_gradients(state, point, rotation=None):
+	if rotation is None:
+		rotation = _suspension_rotation(
+			state.get('pitch', 0.0), state.get('roll', 0.0))
+	x, y, z = float(point['x']), float(point.get('y', 0.0)), float(point['z'])
+	sp, cp, sr, cr = rotation
 	return (-sp * (sr * x + cr * y) - cp * z, cp * (cr * x - sr * y))
 
 
@@ -1362,6 +1410,7 @@ def _spring_point_velocity(state, spring):
 def _suspension_contact_keys(params, state, ground_heights,
 		pseudo_ground_heights):
 	'''Return final geometric contacts, separated from within-step impacts.'''
+	rotation = None
 	contacts = set()
 	left = set()
 	right = set()
@@ -1369,9 +1418,12 @@ def _suspension_contact_keys(params, state, ground_heights,
 		ground = ground_heights[index]
 		if ground is None:
 			continue
+		if rotation is None:
+			rotation = _suspension_rotation(
+				state.get('pitch', 0.0), state.get('roll', 0.0))
 		compression = (
 			spring['static_compression'] + float(ground) -
-			_spring_height(state, spring))
+			_rigid_point_height(state, spring, rotation))
 		if compression <= 0.0:
 			continue
 		key = ('spring', index)
@@ -1384,7 +1436,10 @@ def _suspension_contact_keys(params, state, ground_heights,
 		ground = pseudo_ground_heights[index]
 		if ground is None:
 			continue
-		gap = float(ground) - _rigid_point_height(state, contact)
+		if rotation is None:
+			rotation = _suspension_rotation(
+				state.get('pitch', 0.0), state.get('roll', 0.0))
+		gap = float(ground) - _rigid_point_height(state, contact, rotation)
 		if gap < -CONTACT_PENETRATION:
 			continue
 		key = ('pseudo', index)
@@ -1398,32 +1453,31 @@ def _suspension_contact_keys(params, state, ground_heights,
 
 def suspension_limit_excess(params, state, ground_heights):
 	'''Return the largest compression beyond a projected hard limit.'''
+	rotation = None
 	maximum = 0.0
 	for index, spring in enumerate(params['springs']):
 		ground = ground_heights[index]
 		if ground is None:
 			continue
+		if rotation is None:
+			rotation = _suspension_rotation(
+				state.get('pitch', 0.0), state.get('roll', 0.0))
 		compression = (
 			spring['static_compression'] + float(ground) -
-			_spring_height(state, spring))
+			_rigid_point_height(state, spring, rotation))
 		maximum = max(maximum, compression - spring['max_compression'])
 	return maximum
 
 
-def _project_suspension_limits(params, state, ground_heights,
-		pseudo_ground_heights=None, support_vertical_velocity=0.0,
-		support_height_offset=0.0):
-	'''Resolve hard limits with an order-independent worst-contact projection.'''
-	inv_mass = 1.0 / params['mass']
-	inv_pitch = 1.0 / params['pitch_inertia']
-	inv_roll = 1.0 / params['roll_inertia']
+def _suspension_constraints(params, ground_heights, pseudo_ground_heights):
+	'''Prepare the fixed contacts of one immutable ground sample set.'''
 	constraints = []
 	for index, spring in enumerate(params['springs']):
 		ground = ground_heights[index]
 		if ground is not None:
 			constraints.append((
 				('spring', index), spring,
-				float(ground) + support_height_offset,
+				float(ground),
 				float(spring['max_compression']) -
 				float(spring['static_compression'])))
 	pseudo_ground_heights = pseudo_ground_heights or ()
@@ -1433,19 +1487,40 @@ def _project_suspension_limits(params, state, ground_heights,
 		if ground is not None:
 			constraints.append((
 				('pseudo', index), contact,
-				float(ground) + support_height_offset,
+				float(ground),
 				float(contact.get('penetration', ALLOWED_PENETRATION))))
+	return constraints
+
+
+def _project_suspension_limits(params, state, ground_heights,
+		pseudo_ground_heights=None, support_vertical_velocity=0.0,
+		support_height_offset=0.0, constraints=None):
+	'''Resolve hard limits with an order-independent worst-contact projection.'''
+	inv_mass = 1.0 / params['mass']
+	inv_pitch = 1.0 / params['pitch_inertia']
+	inv_roll = 1.0 / params['roll_inertia']
+	if constraints is None:
+		constraints = _suspension_constraints(
+			params, ground_heights, pseudo_ground_heights)
+	if not constraints:
+		return set()
+	if support_height_offset:
+		constraints = [(key, point, ground + support_height_offset, penetration)
+			for key, point, ground, penetration in constraints]
 	touched = set()
 	for unused_iteration in range(params['constraint_iterations']):
+		rotation = _suspension_rotation(
+			state.get('pitch', 0.0), state.get('roll', 0.0))
 		rows = []
 		maximum_excess = 0.0
 		for key, point, ground, penetration in constraints:
 			excess = (
-				ground - _rigid_point_height(state, point) - penetration)
+				ground - _rigid_point_height(state, point, rotation) - penetration)
 			if excess <= 1.0e-5:
 				continue
 			touched.add(key)
-			pitch_height, roll_height = _rigid_point_height_gradients(state, point)
+			pitch_height, roll_height = _rigid_point_height_gradients(
+				state, point, rotation)
 			pitch_grad, roll_grad = -pitch_height, -roll_height
 			denominator = (inv_mass + pitch_grad * pitch_grad * inv_pitch +
 				roll_grad * roll_grad * inv_roll)
@@ -1472,7 +1547,9 @@ def _project_suspension_limits(params, state, ground_heights,
 		velocity_roll = []
 		for point, excess, pitch_grad, roll_grad, denominator in selected:
 			point_velocity = (
-				_rigid_point_velocity(state, point) -
+				(float(state.get('vertical_velocity', 0.0)) +
+				-pitch_grad * float(state.get('pitch_velocity', 0.0)) +
+				-roll_grad * float(state.get('roll_velocity', 0.0))) -
 				support_vertical_velocity)
 			if point_velocity < 0.0:
 				velocity_impulse = -point_velocity / denominator
@@ -1501,8 +1578,10 @@ def _project_suspension_limits(params, state, ground_heights,
 	# projection (not a reported-value clamp) and satisfies every half-space at
 	# once without adding pitch/roll bias or another iterative sweep.
 	remaining_excess = 0.0
+	rotation = _suspension_rotation(
+		state.get('pitch', 0.0), state.get('roll', 0.0))
 	for key, point, ground, penetration in constraints:
-		excess = ground - _rigid_point_height(state, point) - penetration
+		excess = ground - _rigid_point_height(state, point, rotation) - penetration
 		if excess > 0.0:
 			remaining_excess = max(remaining_excess, excess)
 			touched.add(key)
@@ -1523,6 +1602,8 @@ def damper_suspension_step(params, state, ground_heights, dt,
 		pseudo_ground_heights = (None,) * len(pseudo_contacts)
 	if len(pseudo_ground_heights) != len(pseudo_contacts):
 		raise ValueError('pseudo-contact ground sample count mismatch')
+	constraints = _suspension_constraints(
+		params, ground_heights, pseudo_ground_heights)
 	try:
 		support_vertical_velocity = float(support_vertical_velocity)
 	except (TypeError, ValueError, OverflowError):
@@ -1550,6 +1631,8 @@ def damper_suspension_step(params, state, ground_heights, dt,
 	pitch_acceleration = 0.0
 	roll_acceleration = 0.0
 	for substep_index in range(steps):
+		rotation = (_suspension_rotation(result['pitch'], result['roll'])
+			if constraints else None)
 		# Horizontal travel moves the reduced heave constraint from the
 		# previous sample position to the current one.  Forces are evaluated at
 		# the start of this semi-implicit substep; its hard projection is
@@ -1573,7 +1656,7 @@ def damper_suspension_step(params, state, ground_heights, dt,
 			ground = float(ground) + support_force_offset
 			compression = (
 				spring['static_compression'] + ground -
-				_spring_height(result, spring))
+				_rigid_point_height(result, spring, rotation))
 			if compression <= 0.0:
 				continue
 			maximum_compression = max(maximum_compression, compression)
@@ -1585,8 +1668,12 @@ def damper_suspension_step(params, state, ground_heights, dt,
 				impact_speed = (substep_vertical_speed
 					if impact_speed is None else
 					min(impact_speed, substep_vertical_speed))
+			pitch_gradient, roll_gradient = _rigid_point_height_gradients(
+				result, spring, rotation)
 			relative_point_velocity = (
-				_spring_point_velocity(result, spring) -
+				(float(result['vertical_velocity']) +
+				pitch_gradient * float(result['pitch_velocity']) +
+				roll_gradient * float(result['roll_velocity'])) -
 				support_vertical_velocity)
 			force = (spring['stiffness'] * compression -
 				spring['damping'] * relative_point_velocity)
@@ -1596,8 +1683,6 @@ def damper_suspension_step(params, state, ground_heights, dt,
 					1.0 + excess / max(spring['max_compression'], 0.01))
 			force = max(0.0, min(spring['max_force'], force))
 			total_force += force
-			pitch_gradient, roll_gradient = _rigid_point_height_gradients(
-				result, spring)
 			pitch_torque += pitch_gradient * force
 			roll_torque += roll_gradient * force
 		for index, contact in enumerate(pseudo_contacts):
@@ -1605,7 +1690,7 @@ def damper_suspension_step(params, state, ground_heights, dt,
 			if ground is None:
 				continue
 			ground = float(ground) + support_force_offset
-			gap = ground - _rigid_point_height(result, contact)
+			gap = ground - _rigid_point_height(result, contact, rotation)
 			if gap < -CONTACT_PENETRATION:
 				continue
 			key = ('pseudo', index)
@@ -1640,7 +1725,7 @@ def damper_suspension_step(params, state, ground_heights, dt,
 		pre_projection_speed = result['vertical_velocity']
 		projected = _project_suspension_limits(
 			params, result, ground_heights, pseudo_ground_heights,
-			support_vertical_velocity, support_projection_offset)
+			support_vertical_velocity, support_projection_offset, constraints)
 		if projected:
 			if (not contact_transition_seen and
 					pre_projection_speed -
@@ -1684,13 +1769,15 @@ def damper_suspension_step(params, state, ground_heights, dt,
 	result['max_compression'] = maximum_compression
 	result['max_limit_excess'] = max(
 		0.0, suspension_limit_excess(params, result, ground_heights))
+	rotation = (_suspension_rotation(result['pitch'], result['roll'])
+		if constraints else None)
 	for index, contact in enumerate(pseudo_contacts):
 		ground = pseudo_ground_heights[index]
 		if ground is None:
 			continue
 		result['max_limit_excess'] = max(
 			result['max_limit_excess'], float(ground) -
-			_rigid_point_height(result, contact) -
+			_rigid_point_height(result, contact, rotation) -
 			float(contact.get('penetration', ALLOWED_PENETRATION)))
 	return result
 
@@ -1783,6 +1870,78 @@ def brake_force(p, active, terrainIdx=0, slope_pitch=0.0):
 		return p['mass'] * brake
 	return (rolling_resist_force(p, terrainIdx, False) +
 		p['mass'] * COAST_BRAKE_SHARE * brake)
+
+
+def contact_push_decel(p, rolling, terrainIdx=0, normal_y=1.0):
+	'''Return the (longitudinal, lateral) m/s^2 the tracks oppose an EXTERNAL
+	push with. This is the ground reaction to another hull shoving this one, so
+	it is deliberately anisotropic: a track rolls along the hull and scrubs
+	across it.
+
+	rolling=True means this hull's own drivetrain is already turning (it has
+	throttle or road speed), so a shove along the hull only fights
+	rolling_resist_force. rolling=False is the parked/wrecked hull whose tracks
+	are held; it resists with the same static perch limit longitudinal_step uses
+	for a parked hull on a slope. Sideways there is no rolling case at all - the
+	tracks always scrub - so the lateral axis keeps the fall-line hold
+	slope_slide_speed already applies, scaled by the #1513 side-grip curve.
+
+	No constant here is new: the whole point is that being pushed uses the same
+	track laws as driving, braking and sliding.'''
+	ny = normal_y if normal_y > 0.1 else 0.1
+	roll = rolling_resist_force(p, terrainIdx, False) / (
+		p['mass'] if p['mass'] > 1.0 else 1.0)
+	hold = SLIDE_HOLD_TAN * GRAVITY * ny
+	longitudinal = roll if rolling else (hold if hold > roll else roll)
+	lateral = SLIDE_HOLD_TAN * lateral_slope_grip(normal_y) * GRAVITY * ny
+	if lateral < roll:
+		lateral = roll
+	return longitudinal, lateral
+
+
+def _bleed(value, budget):
+	'''Coulomb bleed: remove up to budget, never crossing zero.'''
+	if budget <= 0.0:
+		return value
+	if value > budget:
+		return value - budget
+	if value < -budget:
+		return value + budget
+	return 0.0
+
+
+def contact_push_step(p, push_x, push_z, yaw, dt, rolling=False,
+                      terrainIdx=0, normal_y=1.0):
+	'''Advance one hull's external contact-push velocity by dt.
+
+	The push is a world-frame velocity a contact impulse gave this hull. Resolve
+	it into the hull frame, spend the matching track budget on each axis, and
+	rotate back. Dry friction removes a fixed amount of speed per second and
+	stops the hull dead, which is why a shove no longer creeps forever the way
+	an exponential decay did.'''
+	dt = float(dt)
+	if dt <= 0.0:
+		return float(push_x), float(push_z)
+	longitudinal, lateral = contact_push_decel(
+		p, rolling, terrainIdx, normal_y)
+	sine = math.sin(yaw)
+	cosine = math.cos(yaw)
+	forward = push_x * sine + push_z * cosine
+	right = push_x * cosine - push_z * sine
+	forward = _bleed(forward, longitudinal * dt)
+	right = _bleed(right, lateral * dt)
+	return (forward * sine + right * cosine,
+		forward * cosine - right * sine)
+
+
+def contact_push_is_held(p, push_x, push_z, yaw, dt, rolling=False,
+                         terrainIdx=0, normal_y=1.0):
+	'''Return whether the tracks absorb this whole push within one slice.
+
+	The static Coulomb test, expressed through the same budget contact_push_step
+	spends, so the predicate and the integration can never disagree.'''
+	return contact_push_step(
+		p, push_x, push_z, yaw, dt, rolling, terrainIdx, normal_y) == (0.0, 0.0)
 
 
 def _grip_decel(p, slope_pitch):

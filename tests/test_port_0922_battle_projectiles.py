@@ -1167,6 +1167,65 @@ class BattleProjectileTests(unittest.TestCase):
                     self.assertEqual(25.0, data['piercing_loss'])
                     self.assertEqual(1.0, data['penetration_factor'])
 
+    def test_landed_turret_stops_human_and_bot_shots_before_props(self):
+        for shooter_kind in ('player', 'bot'):
+            with self.subTest(shooter=shooter_kind):
+                battle, unused_world, unused_target, state = (
+                    self._vehicle_chord_battle(shooter_kind, 'bot'))
+                battle._projectile_server_time_ms = 2000
+                battle._projectile_server_local_time = 1.0
+                obstacle = mock.Mock()
+                obstacle.block_distance.return_value = 5.0
+                battle._detached_turret_obstacles = obstacle
+                reached = []
+
+                def scene(unused_world, unused_space, start, end,
+                          unused_direction, unused_shot, diagnostic=None):
+                    for prop_distance in (4.0, 7.0):
+                        if (end - start).length >= prop_distance:
+                            reached.append(prop_distance)
+                    return {'world_distance': 999999.0,
+                            'piercing_loss': 25.0,
+                            'stop_distance': None, 'continue_from': None}
+
+                battle._destructibles = types.SimpleNamespace(
+                    shot_world_distance=mock.Mock(side_effect=scene))
+                terminal = battle._projectile_chord(
+                    state, (0.0, 1.0, 0.0), (12.0, 1.0, 0.0), 0.0, 0.1)
+                data = battle._projectile_terminal_data[state['key']]
+                self.assertEqual('impact', terminal['reason'])
+                self.assertAlmostEqual(5.0 / 12.0, terminal['fraction'])
+                self.assertIsNone(data['target_key'])
+                self.assertEqual('detached_turret', data['stop_reason'])
+                self.assertEqual([4.0], reached)
+                self.assertEqual(1100, obstacle.block_distance.call_args.args[2])
+                self.assertEqual({'start_time_ms': 1000},
+                                 obstacle.block_distance.call_args.kwargs)
+
+    def test_a_landed_turret_behind_the_target_cannot_steal_its_hit(self):
+        battle, unused_world, target_key, state = self._vehicle_chord_battle(
+            'player', 'bot')
+        battle._detached_turret_obstacles = mock.Mock()
+        battle._detached_turret_obstacles.block_distance.return_value = 11.0
+        terminal = battle._projectile_chord(
+            state, (0.0, 1.0, 0.0), (12.0, 1.0, 0.0), 0.0, 0.1)
+        self.assertEqual('impact', terminal['reason'])
+        self.assertEqual(target_key,
+                         battle._projectile_terminal_data[state['key']]['target_key'])
+
+    def test_scenery_before_a_landed_turret_keeps_its_terminal(self):
+        battle, bigworld, unused_target, state = self._vehicle_chord_battle(
+            'player', 'bot')
+        bigworld.wall_x = 3.0
+        battle._detached_turret_obstacles = mock.Mock()
+        battle._detached_turret_obstacles.block_distance.return_value = 5.0
+        terminal = battle._projectile_chord(
+            state, (0.0, 1.0, 0.0), (12.0, 1.0, 0.0), 0.0, 0.1)
+        self.assertAlmostEqual(3.0 / 12.0, terminal['fraction'])
+        data = battle._projectile_terminal_data[state['key']]
+        self.assertIsNone(data['target_key'])
+        self.assertNotEqual('detached_turret', data['stop_reason'])
+
     def test_all_shooter_target_pairs_respect_a_wall_20_cm_before_hit(self):
         for shooter_kind in ('player', 'bot'):
             for target_kind in ('player', 'bot'):
@@ -3156,6 +3215,42 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual([receipt], kwargs['destructibles'])
         self.assertIn(
             'stage=effects reason=missing_live_direct', output.getvalue())
+
+    def test_wreck_diagnostic_failure_preserves_the_impact_terminal(self):
+        for failure in ('stdout', 'collision_detail'):
+            with self.subTest(failure=failure):
+                battle, unused_bigworld = _battle()
+                self.assertTrue(battle._accept_projectile_event(_event()))
+                battle._worker_mode = True
+                battle._records['bot:8'] = {
+                    'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+                    'local': False, 'ready': True,
+                    'state': {'health': 0, 'alive': False}}
+                battle._projectile_direct_effect = mock.Mock(return_value=None)
+                collision = types.SimpleNamespace(dist=5.0, compName='gun')
+                if failure == 'collision_detail':
+                    collision.dist = None
+                battle._projectile_terminal_data['player:7:1'] = {
+                    'target_key': 'bot:8',
+                    'impact': (5.0, 1.0, 0.0),
+                    'collisions': (collision,),
+                }
+                state = battle._projectiles.get('player:7:1')
+                output = io.StringIO()
+                if failure == 'stdout':
+                    output = mock.Mock()
+                    output.write.side_effect = IOError('log stream closed')
+                with mock.patch('sys.stdout', output):
+                    self.assertTrue(battle._projectile_terminal(
+                        state, {'reason': 'impact'}))
+
+                args, kwargs = battle.client.resolutions[-1]
+                self.assertEqual('impact', args[3])
+                self.assertEqual([5.0, 1.0, 0.0], args[5])
+                self.assertTrue(kwargs['hit_vehicle'])
+                self.assertEqual(
+                    {'target_kind': 'bot', 'target_id': 8},
+                    kwargs['wreck_hit'])
 
     def test_stock_max_29_projectile_debt_bounds_frame_and_reduces_scans(self):
         for warm_history in (False, True):
@@ -5516,6 +5611,7 @@ class BattleProjectileTests(unittest.TestCase):
                 mock.patch.object(
                     battle, '_projectile_he_blast_contact', return_value={
                         'damage': 200, 'collisions': (collision,),
+                        'point': (10.0, 1.0, 0.0),
                         'direction': (1.0, 0.0, 0.0)}), \
                 mock.patch.object(
                     combat_rules, 'damage', return_value=200), \
@@ -5541,7 +5637,7 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertGreater(cone.call_args.args[3].length, 0.0)
         self.assertTrue(cone.call_args.kwargs['deadeye'])
 
-    def test_direct_effect_publishes_the_exact_damage_roll(self):
+    def test_direct_effect_publishes_the_armour_ledger_potential(self):
         battle, unused_bigworld = _battle()
         source = battle._server_entity(41)
         target = types.SimpleNamespace(
@@ -5564,17 +5660,19 @@ class BattleProjectileTests(unittest.TestCase):
             'piercing_loss': 0.0, 'penetration_factor': 1.0,
         }
 
-        # The armour ledger needs the one roll the damage law consumed,
-        # truncated exactly as the law truncates it, for every verdict. A
-        # ricochet forces damage to zero afterwards and still owes the full
-        # roll, because that is the damage the armour actually stopped. A
-        # broad vehicle hit with no resolved armour contact remains terminal,
-        # but cannot claim that armour stopped its roll.
+        # A penetration spent the roll the damage law consumed, truncated
+        # exactly as the law truncates it, so that roll is its potential.
+        # Every verdict that stopped the shell -- a ricochet, a
+        # non-penetration, and a traversal that only found external plates
+        # and so resolved no armour contact -- never drew a roll at all, so
+        # the ledger owes the shell's published 390 instead of a sample
+        # nobody took.  This is the number the damage log's blocked rows and
+        # the #1513 damage indicator both report.
         for contact, result, damage, potential in (
-                ({'result': 0}, 0, 0, 312),
-                ({'result': 1}, 1, 0, 312),
+                ({'result': 0}, 0, 0, 390),
+                ({'result': 1}, 1, 0, 390),
                 ({'result': 2}, 2, 312, 312),
-                (None, 1, 0, None)):
+                (None, 1, 0, 390)):
             with self.subTest(contact=contact):
                 with mock.patch.object(
                         combat_rules, 'resolve_armor_contact',
@@ -5597,10 +5695,8 @@ class BattleProjectileTests(unittest.TestCase):
 
                 self.assertEqual(result, effect['shot_result'])
                 self.assertEqual(damage, effect['damage'])
-                if potential is None:
-                    self.assertNotIn('potential_damage', effect)
-                else:
-                    self.assertEqual(potential, effect['potential_damage'])
+                self.assertEqual(potential, effect['potential_damage'])
+                self.assertIs(False, effect['high_explosive'])
                 self.assertEqual(
                     (390.0, 32.5), gaussian.call_args.args)
 
@@ -5670,6 +5766,7 @@ class BattleProjectileTests(unittest.TestCase):
         with mock.patch.object(
                 battle, '_projectile_he_blast_contact', return_value={
                     'damage': 90, 'collisions': (),
+                    'point': (5.0, 1.0, 0.0),
                     'direction': (1.0, 0.0, 0.0)}), \
                 mock.patch.object(
                     critical_damage, 'propose_explosion',

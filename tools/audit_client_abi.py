@@ -471,6 +471,8 @@ EXPECTED_ABI = {
             'periodAdditionalInfo'),
         'PlayerAvatar.__setIsOnArena': ('self', 'onArena'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
+        'PlayerAvatar.makeVehicleMovementCommandByKeys': (
+            'self', 'forceFlags', 'forceMask'),
         'PlayerAvatar.moveVehicle': ('self', 'flags', 'isKeyDown'),
         'PlayerAvatar.handleVehicleCollidedVehicle': (
             'self', 'vehA', 'vehB', 'hitPt', 'time'),
@@ -547,6 +549,7 @@ EXPECTED_ABI = {
             'self', 'period', '*args'),
         'AvatarInputHandler.getAutorotation': ('self',),
         'AvatarInputHandler.setAutorotation': ('self', 'bValue'),
+        'AvatarInputHandler.switchAutorotation': ('self',),
         '_Targeting.__init__': ('self',),
         '_Targeting.getTargetEntity': ('self',),
         '_Targeting.enable': ('self', 'flag'),
@@ -566,6 +569,10 @@ EXPECTED_ABI = {
         '_ShellingControl.setTargetModelMatrix': (
             'self', 'worldMatrix'),
         '_ShellingControl.__createTargetModel': ('self', 'bDelete'),
+        'IControlMode.getPreferredAutorotationMode': ('self',),
+        'IControlMode.enableSwitchAutorotationMode': ('self',),
+        'SniperControlMode.getPreferredAutorotationMode': ('self',),
+        'SniperControlMode.enableSwitchAutorotationMode': ('self',),
         'ArcadeControlMode.handleKeyEvent': (
             'self', 'isDown', 'key', 'mods', 'event'),
         'SniperControlMode.handleKeyEvent': (
@@ -618,6 +625,35 @@ EXPECTED_ABI = {
         'Vehicle.removeEdge': ('self', 'forceSimpleEdge'),
         'Vehicle.onHealthChanged': (
             'self', 'newHealth', 'attackerID', 'attackReasonID'),
+        'Vehicle.confirmTurretDetachment': ('self',),
+    },
+    'scripts/client/DetachedTurret.pyc': {
+        'DetachedTurret.__init__': ('self',),
+        'DetachedTurret.prerequisites': ('self',),
+        'DetachedTurret.onEnterWorld': ('self', 'prereqs'),
+        'DetachedTurret.onLeaveWorld': ('self',),
+        'DetachedTurret.onStaticCollision': (
+            'self', 'energy', 'point', 'normal'),
+        'DetachedTurret.changeAppearanceVisibility': ('self', 'isVisible'),
+        'DetachedTurret.set_isUnderWater': ('self', 'prev'),
+        'DetachedTurret.set_isCollidingWithWorld': ('self', 'prev'),
+        'DetachedTurret.__checkIsBeingPulled': ('self',),
+        'DetachedTurret.__prepareModelAssembler': ('self',),
+        'SynchronousDetachment.__init__': ('self', 'turret'),
+        'SynchronousDetachment.onInit': ('self',),
+        'SynchronousDetachment.onEnterWorld': ('self',),
+        'SynchronousDetachment._onDirectTick': ('self', 'vehicle'),
+        'SynchronousDetachment._onCallbackTick': ('self', 'vehicle'),
+        'SynchronousDetachment._canAcceptVehicle': ('self', 'vehicle'),
+        'SynchronousDetachment.transferInputs': ('vehicle', 'turret'),
+        'VehicleEnterTimer.start': ('self',),
+        'VehicleEnterTimer.getVehicle': ('self',),
+        '_TurretDetachmentEffects.__init__': (
+            'self', 'turretModel', 'detachmentEffectsDesc', 'onGround'),
+        '_TurretDetachmentEffects.notifyAboutCollision': (
+            'self', 'energy', 'collisionPoint', 'effectMaterialIdx',
+            'groundEffect', 'underWater'),
+        '_TurretDetachmentEffects.__normalizeEnergy': ('self', 'energy'),
     },
     'scripts/client/VehicleGunRotator.pyc': {
         'VehicleGunRotator.start': ('self',),
@@ -713,7 +749,12 @@ EXPECTED_ABI = {
         'DamageFromShotDecoder.decodeSegment': (
             'segment', 'vehicleDescr'),
     },
+    'scripts/client/vehicle_systems/vehicle_damage_state.pyc': {
+        'VehicleDamageState.update': (
+            'self', 'health', 'isCrewActive', 'isUnderWater'),
+    },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.updateTurretVisibility': ('self',),
         'CompoundAppearance.start': ('self', 'prereqs'),
         'CompoundAppearance.__linkCompound': ('self',),
         'CompoundAppearance.__onModelsRefresh': (
@@ -782,6 +823,7 @@ EXPECTED_ABI = {
             'self', 'entityName', 'avatar'),
         'EquipmentsController.setEquipment': (
             'self', 'intCD', 'quantity', 'stage', 'timeRemaining'),
+        'EquipmentsController.clear': ('self', 'leave'),
     },
     'scripts/client/OfflineMapCreator.pyc': {
         'OfflineMapCreator.create': ('self', 'mapName'),
@@ -1186,7 +1228,8 @@ EXPECTED_CODE_NAMES = {
             '_PlayerAvatar__onInitStepCompleted'),
         'PlayerAvatar.__startVehicleVisual': (
             '_PlayerAvatar__ownVehicleStabMProv', 'target',
-            'stabilisedMatrix', 'matrix'),
+            'stabilisedMatrix', 'matrix', 'guiSessionProvider', 'shared',
+            'equipments', 'clear', 'setPlayerVehicle'),
         'PlayerAvatar.getOwnVehicleMatrix': (
             'getObservedVehicleMatrix', '_PlayerAvatar__ownVehicleMProv'),
         'PlayerAvatar.getOwnVehicleStabilisedMatrix': (
@@ -1196,8 +1239,14 @@ EXPECTED_CODE_NAMES = {
             '_PlayerAvatar__setIsOnArena', 'ARENA_PERIOD', 'BATTLE'),
         'PlayerAvatar.__setIsOnArena': (
             'moveVehicle', 'makeVehicleMovementCommandByKeys'),
+        'PlayerAvatar.makeVehicleMovementCommandByKeys': (
+            '_PlayerAvatar__stopUntilFire', '_PlayerAvatar__cruiseControlMode',
+            'CommandMapping', 'CRUISE_CONTROL25', 'CRUISE_CONTROL50',
+            'CMD_BLOCK_TRACKS'),
         'PlayerAvatar.moveVehicle': (
-            'filter', 'notifyInputKeysDown', 'base', 'vehicle_moveWith'),
+            'filter', 'notifyInputKeysDown', 'base', 'vehicle_moveWith',
+            '_MOVEMENT_FLAGS', 'BLOCK_TRACKS', 'inputHandler',
+            'setAutorotation'),
         'PlayerAvatar.getOwnVehicleSpeeds': (
             'BigWorld', 'entity', 'playerVehicleID', 'speedInfo', 'value'),
         'PlayerAvatar.__onSetOwnVehicleAuxPhysicsData': (
@@ -1308,6 +1357,12 @@ EXPECTED_CODE_NAMES = {
         'SniperControlMode.__siegeModeStateChanged': (
             'VEHICLE_SIEGE_STATE', 'ENABLED', 'DISABLED', '_cam',
             'aimingSystem', 'forceFullStabilization'),
+        'SniperControlMode.getPreferredAutorotationMode': (
+            'BigWorld', 'entities', 'get', 'player', 'playerVehicleID',
+            'typeDescriptor', 'chassis', 'rotationIsAroundCenter', 'gun',
+            'turretYawLimits', 'isYawHullAimingAvailable'),
+        'SniperControlMode.enableSwitchAutorotationMode': (
+            'getPreferredAutorotationMode',),
         'PostMortemControlMode.enable': (
             '_PostMortemControlMode__cam', 'consistentMatrices',
             'attachedVehicleMatrix', 'vehicleMProv', 'PostmortemDelay',
@@ -1348,6 +1403,14 @@ EXPECTED_CODE_NAMES = {
             'enableSwitchAutorotationMode',
             '_AvatarInputHandler__isAutorotation',
             'enableOwnVehicleAutorotation'),
+        'AvatarInputHandler.switchAutorotation': (
+            'setAutorotation', '_AvatarInputHandler__isAutorotation'),
+        'AvatarInputHandler.onControlModeChanged': (
+            '_AvatarInputHandler__curCtrl',
+            'getPreferredAutorotationMode',
+            '_AvatarInputHandler__isAutorotation',
+            '_AvatarInputHandler__prevModeAutorotation',
+            'enableOwnVehicleAutorotation'),
         'AvatarInputHandler.activatePostmortem': (
             '_CTRL_MODE', 'POSTMORTEM', 'onControlModeChanged'),
         '_Targeting.__init__': (
@@ -1382,7 +1445,16 @@ EXPECTED_CODE_NAMES = {
     },
     'scripts/client/Vehicle.pyc': {
         'Vehicle.__collideSegment': (
-            'SegmentCollisionResultExt', 'itemTypeName'),
+            'SegmentCollisionResultExt', 'itemTypeName', 'getComponents'),
+        # The turret/gun attachment bit is a collision fact, not a model one:
+        # getComponents publishes ``not self.isTurretDetached`` for both, and
+        # __collideSegment skips an unattached component before it ever
+        # reaches the hit tester.  This port's own component enumeration
+        # mirrors it, so an ammo-bay wreck stops answering above its ring.
+        'Vehicle.getComponents': (
+            'typeDescriptor', 'chassis', 'hullPosition', 'hull',
+            'turretPositions', 'turret', 'gun', 'isTurretDetached',
+            'appearance', 'turretMatrix', 'gunMatrix'),
         'Vehicle.__startWGPhysics': ('filter', 'syncGunAngles', 'speedInfo'),
         'Vehicle.getSpeed': ('_Vehicle__speedInfo', 'value'),
         'Vehicle.getServerGunAngles': (
@@ -1419,6 +1491,14 @@ EXPECTED_CODE_NAMES = {
             '_Vehicle__collideSegment',),
         'Vehicle.drawEdge': ('appearance', 'highlighter', 'highlight'),
         'Vehicle.removeEdge': ('appearance', 'highlighter', 'highlight'),
+    },
+    'scripts/client/DetachedTurret.pyc': {
+        'DetachedTurret.prerequisites': (
+            '_DetachedTurret__prepareModelAssembler',
+            '_DetachedTurret__vehDescr', 'prerequisites'),
+        'DetachedTurret.onEnterWorld': (
+            '_DetachedTurret__vehDescr', 'name', 'model', 'matrix',
+            '_DetachedTurret__detachConfirmationTimer', 'onEnterWorld'),
     },
     'scripts/client/AvatarInputHandler/gun_marker_ctrl.pyc': {
         '_CrosshairShotResults._getAllCollisionDetails': (
@@ -1565,7 +1645,8 @@ EXPECTED_CODE_NAMES = {
             '_VehicleMarkerPlugin__updateVehicleHealth'),
         'VehicleMarkerPlugin.__updateVehicleHealth': (
             '_invokeMarker', '_VehicleMarkerPlugin__getVehicleDamageType',
-            'ATTACK_REASONS'),
+            'ATTACK_REASONS', 'SPECIAL_VEHICLE_HEALTH',
+            'IS_AMMO_BAY_DESTROYED'),
         'VehicleMarkerPlugin.__getVehicleDamageType': (
             'vehicleID', '_VehicleMarkerPlugin__playerVehicleID',
             'DAMAGE_TYPE', 'FROM_PLAYER', 'FROM_ALLY'),
@@ -1676,6 +1757,7 @@ EXPECTED_CODE_NAMES = {
         '_ExpandedItem.getActivationCode': (
             'isEntityRequired', 'makeExtraName', 'index'),
         '_ExtinguisherItem.getActivationCode': ('id',),
+        'EquipmentsController.clear': ('_order', '_equipments', 'popitem', 'clear'),
     },
     'scripts/client/AreaDestructibles.pyc': {
         '_printErrDescNotAvailable': (
@@ -1724,7 +1806,14 @@ EXPECTED_CODE_NAMES = {
         'encodeFragile': ('int',),
         'decodeFragile': ('bool',),
     },
+    'scripts/client/vehicle_systems/vehicle_damage_state.pyc': {
+        'VehicleDamageState.update': (
+            'getState', 'getStateParams', '_VehicleDamageState__state',
+            '_VehicleDamageState__model', '_VehicleDamageState__effect'),
+    },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance.updateTurretVisibility': (
+            '_CompoundAppearance__requestModelsRefresh',),
         'CompoundAppearance': (
             'waterSensor', 'isInWater', 'isUnderwater'),
         'CompoundAppearance.start': ('getHitTesters', 'loadBspModel'),
@@ -2028,6 +2117,12 @@ EXPECTED_RESOURCE_STRINGS = {
 
 
 EXPECTED_PACKED_XML_PATH_VALUES = {
+    'scripts/item_defs/vehicles/common/vehicle.xml': {
+        ('materials', 'ammoBay', 'extra'): ((1, 'ammoBayHealth'),),
+        ('materials', 'ammoBay', 'damageKind'): ((1, 'device'),),
+        ('materials', 'ammoBay', 'chanceToHitByProjectile'): ((1, '0.27'),),
+        ('materials', 'ammoBay', 'chanceToHitByExplosion'): ((1, '0.27'),),
+    },
     'scripts/entity_defs/Avatar.def': {
         ('BaseMethods', 'vehicle_changeSetting', 'Exposed'): (
             (1, ''),),
@@ -2123,6 +2218,12 @@ EXPECTED_GLOBALS = {
         '_LOD_DISTANCE_TRAIL_PARTICLES': 100.0,
         'MAX_DISTANCE': 500,
     },
+    'scripts/client/DetachedTurret.pyc': {
+        # Below this impact speed stock plays no ground effect at all, and
+        # _MIN_COLLISION_ENERGY is derived from it, so it is the floor of the
+        # window the invented launch impulse has to land inside.
+        '_MIN_COLLISION_SPEED': 3.5,
+    },
     'scripts/common/AccountCommands.pyc': {
         'RES_FAILURE': -1,
         'RES_SUCCESS': 0,
@@ -2167,6 +2268,17 @@ EXPECTED_CLASS_CONSTANTS = {
         'ProjectileMover': {
             '_ProjectileMover__START_POINT_MAX_DIFF': 20,
             '_ProjectileMover__PROJECTILE_TIME_AFTER_DEATH': 2.0,
+        },
+    },
+    'scripts/client/DetachedTurret.pyc': {
+        # The touchdown effect's calibrated energy window.  98.1 is the
+        # specific energy of a 10 m free fall (0.5 * v ** 2 with
+        # v ** 2 = 2 * 9.81 * 10), and 3.5 m/s is the speed below which stock
+        # plays no ground impact.  The launch impulse in
+        # ``turret_detachment`` is chosen to land inside this window.
+        '_TurretDetachmentEffects': {
+            '_MAX_COLLISION_ENERGY': 98.10000000000001,
+            '_MIN_NORMALIZED_ENERGY': 0.1,
         },
     },
     'scripts/common/BattleFeedbackCommon.pyc': {
@@ -2256,6 +2368,13 @@ EXPECTED_CLASS_CONSTANTS = {
             'POWDER_BURN_OFF': 0,
             'POWDER_EXPLOSION': 1,
             'HE_DETONATION': 2,
+        },
+        # The ammo-bay wreck and the flying turret are selected purely by
+        # the vehicle's own health value; -13 is -5 with one further bit
+        # cleared, so a turret-detached wreck is also ammo-bay destroyed.
+        'SPECIAL_VEHICLE_HEALTH': {
+            'AMMO_BAY_DESTROYED': -5,
+            'TURRET_DETACHED': -13,
         },
         'ARENA_UPDATE': {
             'VEHICLE_ADDED': 2,
@@ -2361,6 +2480,23 @@ EXPECTED_ORDERED_INSTRUCTION_PATTERNS = {
             )),
     },
     'scripts/client/Avatar.pyc': {
+        'PlayerAvatar.__startVehicleVisual': (
+            'own vehicle visuals clear consumables without leaving battle', 0, (
+                ('LOAD_ATTR', 'value', 'clear'),
+                ('LOAD_GLOBAL', 'value', 'False'),
+                ('CALL_FUNCTION', 'argument', 1),
+            )),
+        'PlayerAvatar.updateVehicleHealth': (
+            'local death restores raw special health into Vehicle', 0, (
+                ('STORE_FAST', 'value', 'prevHealth'),
+                ('LOAD_FAST', 'value', 'rawHealth'),
+                ('LOAD_FAST', 'value', 'vehicle'),
+                ('STORE_ATTR', 'value', 'health'),
+                ('LOAD_FAST', 'value', 'vehicle'),
+                ('LOAD_ATTR', 'value', 'set_health'),
+                ('LOAD_FAST', 'value', 'prevHealth'),
+                ('CALL_FUNCTION', 'argument', 1),
+            )),
         'PlayerAvatar.showTracer': (
             'visible non-ricochet uses the current on-screen muzzle', 10, (
                 ('LOAD_FAST', 'value', 'refStartPoint'),
@@ -2410,6 +2546,91 @@ EXPECTED_ORDERED_INSTRUCTION_PATTERNS = {
                 ('BINARY_SUBTRACT', None, None),
                 ('LOAD_ATTR', 'value', 'length'),
                 ('STORE_FAST', 'value', 'vehSpeedSum'),
+            )),
+        'PlayerAvatar.moveVehicle': (
+            'a movement command without Space re-enables autorotation', 0, (
+                ('LOAD_ATTR', 'value', 'BLOCK_TRACKS'),
+                ('BINARY_AND', None, None),
+                ('UNARY_NOT', None, None),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'self'),
+                ('LOAD_ATTR', 'value', 'inputHandler'),
+                ('LOAD_ATTR', 'value', 'setAutorotation'),
+                ('LOAD_GLOBAL', 'value', 'True'),
+                ('CALL_FUNCTION', 'argument', 1),
+            )),
+    },
+    'scripts/client/AvatarInputHandler/__init__.pyc': {
+        'AvatarInputHandler.setAutorotation': (
+            'the control mode gates every autorotation request', 0, (
+                ('LOAD_FAST', 'value', 'self'),
+                ('LOAD_ATTR', 'value', '_AvatarInputHandler__curCtrl'),
+                ('LOAD_ATTR', 'value', 'enableSwitchAutorotationMode'),
+                ('CALL_FUNCTION', 'argument', 0),
+                ('POP_JUMP_IF_TRUE', None, None),
+                ('LOAD_CONST', 'value', None),
+                ('RETURN_VALUE', None, None),
+                ('LOAD_GLOBAL', 'value', 'BigWorld'),
+                ('LOAD_ATTR', 'value', 'player'),
+                ('CALL_FUNCTION', 'argument', 0),
+                ('LOAD_ATTR', 'value', 'isOnArena'),
+                ('POP_JUMP_IF_TRUE', None, None),
+            )),
+        'AvatarInputHandler.onControlModeChanged': (
+            'a preferring control mode saves and forces autorotation', 0, (
+                ('LOAD_ATTR', 'value', 'getPreferredAutorotationMode'),
+                ('CALL_FUNCTION', 'argument', 0),
+                ('STORE_FAST', 'value', 'newAutoRotationMode'),
+                ('LOAD_FAST', 'value', 'newAutoRotationMode'),
+                ('LOAD_CONST', 'value', None),
+                ('COMPARE_OP', 'argument', 9),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'prevCtrl'),
+                ('LOAD_ATTR', 'value', 'getPreferredAutorotationMode'),
+                ('CALL_FUNCTION', 'argument', 0),
+                ('LOAD_CONST', 'value', None),
+                ('COMPARE_OP', 'argument', 8),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'self'),
+                ('LOAD_ATTR', 'value',
+                 '_AvatarInputHandler__isAutorotation'),
+                ('LOAD_FAST', 'value', 'self'),
+                ('STORE_ATTR', 'value',
+                 '_AvatarInputHandler__prevModeAutorotation'),
+            )),
+    },
+    'scripts/client/AvatarInputHandler/control_modes.pyc': {
+        'SniperControlMode.getPreferredAutorotationMode': (
+            'sniper locks a limited-traverse hull', 0, (
+                ('LOAD_FAST', 'value', 'desc'),
+                ('LOAD_ATTR', 'value', 'chassis'),
+                ('LOAD_ATTR', 'value', 'rotationIsAroundCenter'),
+                ('STORE_FAST', 'value', 'isRotationAroundCenter'),
+                ('LOAD_FAST', 'value', 'desc'),
+                ('LOAD_ATTR', 'value', 'gun'),
+                ('LOAD_ATTR', 'value', 'turretYawLimits'),
+                ('LOAD_CONST', 'value', None),
+                ('COMPARE_OP', 'argument', 9),
+                ('STORE_FAST', 'value', 'turretHasYawLimits'),
+                ('LOAD_FAST', 'value', 'desc'),
+                ('LOAD_ATTR', 'value', 'isYawHullAimingAvailable'),
+                ('STORE_FAST', 'value', 'yawHullAimingAvailable'),
+                ('LOAD_FAST', 'value', 'yawHullAimingAvailable'),
+                ('JUMP_IF_TRUE_OR_POP', None, None),
+                ('LOAD_FAST', 'value', 'isRotationAroundCenter'),
+                ('JUMP_IF_FALSE_OR_POP', None, None),
+                ('LOAD_FAST', 'value', 'turretHasYawLimits'),
+                ('UNARY_NOT', None, None),
+                ('RETURN_VALUE', None, None),
+            )),
+        'SniperControlMode.enableSwitchAutorotationMode': (
+            'sniper refuses the X key only for a preferred lock', 0, (
+                ('LOAD_FAST', 'value', 'self'),
+                ('LOAD_ATTR', 'value', 'getPreferredAutorotationMode'),
+                ('CALL_FUNCTION', 'argument', 0),
+                ('LOAD_GLOBAL', 'value', 'False'),
+                ('COMPARE_OP', 'argument', 9),
+                ('RETURN_VALUE', None, None),
             )),
     },
     'scripts/client/ProjectileMover.pyc': {

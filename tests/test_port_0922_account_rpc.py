@@ -142,6 +142,12 @@ class _NativeLong(int):
 
 class AccountRpcTests(unittest.TestCase):
     def setUp(self):
+        refresh = mock.patch(
+            'gui.mods.offline_lan_0922.account_rpc.server._refresh_garage_views',
+            side_effect=lambda diff, after_refresh, after_failure=None, is_current=None:
+                after_refresh())
+        refresh.start()
+        self.addCleanup(refresh.stop)
         self.pending = []
         self.player = _Player()
         self.server = FakeServer(lambda: self.player,
@@ -281,6 +287,107 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual(set(), touched_items[10])
         self.assertEqual(set(), touched_items[11])
 
+    def test_inventory_ready_notification_waits_for_all_cache_refreshes(self):
+        refreshed = []
+        completed = []
+        self.server._context['on_inventory_refreshed'] = lambda: refreshed.append(
+            self.server.inventory_refresh_pending)
+        diff = {'inventory': {1: {'eqs': {9: [11001, 0, 0]}}}}
+        with mock.patch(
+                'gui.mods.offline_lan_0922.account_rpc.server.'
+                '_refresh_garage_views',
+                side_effect=lambda diff, after_refresh, after_failure=None, is_current=None: completed.append(
+                    after_refresh)):
+            self.server._push_update(diff)
+            self.server._push_update(diff)
+            self.assertTrue(self.server.inventory_refresh_pending)
+            self._run()
+            self._run()
+        self.assertEqual([], refreshed)
+        completed[0]()
+        completed[0]()
+        self.assertTrue(self.server.inventory_refresh_pending)
+        self.assertEqual([], refreshed)
+        completed[1]()
+        self.assertFalse(self.server.inventory_refresh_pending)
+        self.assertEqual([False], refreshed)
+
+    def test_retired_inventory_update_does_not_notify_replacement_account(self):
+        refreshed = mock.Mock()
+        self.server._context['on_inventory_refreshed'] = refreshed
+        self.server._push_update({'inventory': {}})
+        self.player = _Player()
+        self._run()
+        self.assertFalse(self.server.inventory_refresh_pending)
+        refreshed.assert_not_called()
+
+    def test_inventory_notification_waits_for_response_queued_update(self):
+        refreshed = mock.Mock()
+        self.server._context['on_inventory_refreshed'] = refreshed
+        completed = []
+
+        def queue_another(unused_player):
+            self.server._push_update({'inventory': {}})
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.account_rpc.server.'
+                '_refresh_garage_views',
+                side_effect=lambda diff, after_refresh, after_failure=None, is_current=None: completed.append(
+                    after_refresh)):
+            self.server._push_update(
+                {'inventory': {}}, after_publish=queue_another)
+            self._run()
+            completed[0]()
+            self.assertTrue(self.server.inventory_refresh_pending)
+            refreshed.assert_not_called()
+            self._run()
+            completed[1]()
+        refreshed.assert_called_once_with()
+        self.assertFalse(self.server.inventory_refresh_pending)
+
+    def test_failed_inventory_publication_releases_pending_state(self):
+        refreshed = mock.Mock()
+        self.server._context['on_inventory_refreshed'] = refreshed
+        self.player.update = mock.Mock(side_effect=RuntimeError('retired update'))
+        self.server._push_update({'inventory': {}})
+        self._run()
+        self.assertFalse(self.server.inventory_refresh_pending)
+        refreshed.assert_not_called()
+
+    def test_failed_crew_refresh_answers_failure_once(self):
+        self.player.update = mock.Mock(side_effect=ValueError('crew listener'))
+        result = account_requests.Result(commands.RES_SUCCESS)
+
+        def publish(complete):
+            def failed(error):
+                result.result_id = commands.RES_FAILURE
+                result.error = str(error)
+                complete()
+            self.server._push_update(
+                {'inventory': {}}, after_publish=lambda player: complete(),
+                after_failure=failed)
+        result.before_response = publish
+        result.wait_for_before_response = True
+        with mock.patch.object(account_requests, 'dispatch', return_value=result):
+            self.server.doCmdInt3(41, commands.CMD_EQUIP_TMAN, 9, 0, -1)
+        while self.pending:
+            self._run()
+        self.assertEqual(
+            [(41, commands.RES_FAILURE, 'crew listener')], self.player.responses)
+        self.assertFalse(self.server.inventory_refresh_pending)
+
+    def test_inventory_builder_failure_answers_instead_of_stranding_request(self):
+        result = account_requests.Result(
+            commands.RES_SUCCESS,
+            before_response=mock.Mock(side_effect=ValueError('bad crew diff')),
+            wait_for_before_response=True)
+        with mock.patch.object(account_requests, 'dispatch', return_value=result):
+            self.server.doCmdInt3(42, commands.CMD_EQUIP_TMAN, 9, 0, -1)
+        self._run()
+        self.assertEqual(1, len(self.player.responses))
+        self.assertEqual((42, commands.RES_FAILURE), self.player.responses[0][:2])
+        self.assertIn('bad crew diff', self.player.responses[0][2])
+
     def test_stats_update_does_not_run_the_inventory_refresh_fallback(self):
         with mock.patch(
                 'gui.mods.offline_lan_0922.account_rpc.server.'
@@ -378,7 +485,8 @@ class AccountRpcTests(unittest.TestCase):
         self.player.onCmdResponse = (
             lambda *args: trace.append('response'))
 
-        def delayed_refresh(unused_diff, after_refresh=None):
+        def delayed_refresh(unused_diff, after_refresh=None, after_failure=None,
+                            is_current=None):
             trace.append('refresh-start')
 
             def complete():
@@ -784,6 +892,20 @@ class AccountRpcTests(unittest.TestCase):
         self.assertEqual(7, data['rev'])
         self.assertEqual(set(range(1, 13)), set(data['inventory']))
         self.assertEqual({}, data['inventory'][1]['compDescr'])
+
+    def test_repeated_sync_keeps_existing_elite_vehicles_out_of_notifications(self):
+        snapshot = _full_garage_snapshot()
+        self.server.update_context({'selected_vehicle': snapshot})
+        for revision in (0, 7, 8):
+            self.server.doCmdInt3(37, commands.CMD_SYNC_DATA, revision, 0, 0)
+            self._run()
+            value = pickle.loads(self.player.ext_responses[-1][3])
+            self.assertEqual(revision + 1, value['rev'])
+            self.assertEqual({50001, 50002}, value['stats']['eliteVehicles'])
+            # AccountSyncData.__onSyncResponse enables events after the
+            # first sync. Account._update suppresses elite events only when
+            # prevRev is absent, marking this complete snapshot as full.
+            self.assertNotIn('prevRev', value)
 
     def test_sync_data_populates_all_exact_lobby_consumer_caches(self):
         self.server.doCmdInt3(37, commands.CMD_SYNC_DATA, 0, 0, 0)
@@ -1405,7 +1527,7 @@ class DepotTests(unittest.TestCase):
     def test_purchase_publishes_balance_before_acknowledgement(self):
         state = self._garage(item_type=11)
         events = []
-        def publish(diff, after_publish):
+        def publish(diff, after_publish, after_failure=None):
             self.assertEqual({'credits': 60000}, diff['stats'])
             self.assertEqual(2, diff['inventory'][11][4444])
             events.append('update')
@@ -1441,6 +1563,45 @@ class DepotTests(unittest.TestCase):
             lambda garage: garage.snapshot()['unlockItemCompactDescrs'].add(4444))
         result.before_response()
         self.assertEqual({4444}, pushed[0]['stats']['unlocks'])
+
+    def test_queued_research_notifies_each_new_elite_vehicle_once(self):
+        snapshot = _full_garage_snapshot()
+        snapshot['wallet'] = {'credits': 0, 'gold': 0, 'freeXP': 100}
+        snapshot['shopItemPrices'].update({
+            4444: {'credits': 10}, 5555: {'credits': 20}})
+        vehicle_types = {
+            50001: types.SimpleNamespace(unlocksDescrs=((10, 4444),)),
+            50002: types.SimpleNamespace(unlocksDescrs=((20, 5555),)),
+        }
+        vehicles = types.SimpleNamespace(
+            getVehicleType=vehicle_types.__getitem__,
+            getTypeOfCompactDescr=lambda value: 4)
+        state = account_requests.garage.GarageState(
+            snapshot, vehicles_module=vehicles)
+        pushed = []
+        context = {'garage': state, 'push_update': pushed.append}
+        # Commands mutate immediately; FakeServer schedules their publication.
+        # The first response must not also notify the second research result.
+        with mock.patch.dict(sys.modules, {
+                'items': types.SimpleNamespace(vehicles=vehicles)}):
+            results = [account_requests.dispatch(
+                commands.CMD_UNLOCK, context, (vehicle, 0))
+                for vehicle in (50001, 50002)]
+            for result in results:
+                self.assertEqual(commands.RES_SUCCESS, result.result_id)
+                result.before_response()
+            self.assertEqual([{50001}, {50002}], [
+                diff['stats']['eliteVehicles'] for diff in pushed])
+            self.assertEqual([{4444}, {5555}], [
+                diff['stats']['unlocks'] for diff in pushed])
+            self.assertEqual(70, state.snapshot()['wallet']['freeXP'])
+            # Researching an already unlocked item spends nothing and emits
+            # no additional unlock or elite notification.
+            result = account_requests.dispatch(
+                commands.CMD_UNLOCK, context, (50002, 0))
+            result.before_response()
+            self.assertNotIn('stats', pushed[-1])
+            self.assertEqual(70, state.snapshot()['wallet']['freeXP'])
 
     def test_special_mode_item_cannot_be_bought_or_supplied(self):
         state = self._garage(item_type=11)
@@ -1525,3 +1686,101 @@ class DepotTests(unittest.TestCase):
             snapshot, validate=False)['inventory']
 
         self.assertEqual(370, published[10][11010])
+
+
+class GarageRefreshCompletionTests(unittest.TestCase):
+    """Model #1513's callback dispatch outside the waiting generator."""
+
+    def setUp(self):
+        self.timers = {}
+        self.waiting = []
+        self.success = mock.Mock()
+        self.failure = mock.Mock()
+        self.manager = mock.Mock()
+        self.current = True
+        self.cache = types.SimpleNamespace(
+            update=lambda *args: lambda callback: self.waiting.append(callback))
+
+        def schedule(delay, callback):
+            self.assertGreater(delay, 0.0)
+            self.timers[1] = callback
+            return 1
+
+        def process(fn):
+            def start():
+                generator = fn()
+                def step(value=None):
+                    try:
+                        operation = generator.send(value)
+                    except StopIteration:
+                        return
+                    operation(step)
+                step()
+            return start
+
+        modules = {
+            'BigWorld': types.SimpleNamespace(
+                callback=schedule,
+                cancelCallback=lambda key: self.timers.pop(key)),
+            'adisp': types.SimpleNamespace(process=process),
+            'gui.ClientUpdateManager': types.SimpleNamespace(
+                g_clientUpdateManager=self.manager),
+            'gui.shared.items_cache': types.SimpleNamespace(
+                CACHE_SYNC_REASON=types.SimpleNamespace(CLIENT_UPDATE=1)),
+            'gui.shared.personality': types.SimpleNamespace(
+                ServicesLocator=types.SimpleNamespace(itemsCache=self.cache)),
+        }
+        patcher = mock.patch.dict(sys.modules, modules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def start(self):
+        from gui.mods.offline_lan_0922.account_rpc.server import _refresh_garage_views
+        return _refresh_garage_views(
+            {'inventory': {}}, after_refresh=self.success,
+            after_failure=self.failure, is_current=lambda: self.current)
+
+    def test_account_replaced_during_refresh_does_not_update_new_views(self):
+        self.start()
+        self.current = False
+        self.waiting[0]()
+        self.failure.assert_called_once()
+        self.success.assert_not_called()
+        self.manager.update.assert_not_called()
+        self.assertEqual({}, self.timers)
+
+    def test_delayed_refresh_completes_once_and_cancels_deadline(self):
+        self.start()
+        self.success.assert_not_called()
+        self.waiting[0]()
+        self.success.assert_called_once_with()
+        self.failure.assert_not_called()
+        self.assertEqual({}, self.timers)
+        self.manager.update.assert_called_once()
+
+    def test_lost_callback_times_out_and_late_completion_cannot_succeed(self):
+        self.start()
+        # An onSyncCompleted listener can raise before the stock dispatcher
+        # reaches the stored callback. No exception enters the generator.
+        self.timers.pop(1)()
+        self.failure.assert_called_once()
+        self.success.assert_not_called()
+        self.waiting[0]()
+        self.failure.assert_called_once()
+        self.success.assert_not_called()
+        self.manager.update.assert_not_called()
+
+    def test_synchronous_cache_failure_ends_wait_and_cancels_deadline(self):
+        self.cache.update = mock.Mock(side_effect=ValueError('bad inventory'))
+        self.start()
+        self.failure.assert_called_once()
+        self.success.assert_not_called()
+        self.assertEqual({}, self.timers)
+
+    def test_view_listener_failure_is_reported_as_failure(self):
+        self.manager.update.side_effect = ValueError('crew view failed')
+        self.start()
+        self.waiting[0]()
+        self.failure.assert_called_once()
+        self.success.assert_not_called()
+        self.assertEqual({}, self.timers)

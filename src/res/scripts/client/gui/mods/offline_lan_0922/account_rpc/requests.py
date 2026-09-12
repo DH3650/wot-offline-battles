@@ -75,6 +75,10 @@ def _fitting(context, mutate, extension=None):
     # rather than re-reading the inventory, so the mutation can name one.
     ext = None if extension is None else extension(outcome)
     context['selected_vehicle'] = state.snapshot()
+    # Capture this command's result before deferred publication. Another
+    # command may mutate the garage before publish runs; its new unlocks and
+    # elite vehicles must belong only to its own notification delta.
+    current_stats = data.stats(state.snapshot())['stats']
     mutated = _clock()
     store = context.get('garage_store')
     if store is not None:
@@ -100,7 +104,6 @@ def _fitting(context, mutate, extension=None):
             only_items=touched_items, touched_tankmen=moved_tankmen)
         # StatsRequester merges these fields before the command callback.
         # Publish the ledger with the inventory for every paid garage action.
-        current_stats = data.stats(state.snapshot())['stats']
         changed_stats = dict((name, current_stats[name]) for name in (
             'credits', 'gold', 'freeXP', 'slots', 'berths', 'vehicleSellsLeft',
             'vehTypeXP', 'unlocks', 'eliteVehicles')
@@ -131,17 +134,26 @@ def _fitting(context, mutate, extension=None):
             completed[0] = True
             on_complete()
 
+        def failed(error):
+            if completed[0]:
+                return
+            result.result_id = commands.RES_FAILURE
+            result.error = 'GARAGE_REFRESH_FAILED: %s' % error
+            complete()
+
         if callable(on_complete) and callable(push_and_wait):
-            if not push_and_wait(diff, after_publish=complete):
-                complete()
+            if not push_and_wait(diff, after_publish=complete,
+                                 after_failure=failed):
+                failed('account is unavailable')
         else:
             push(diff)
             complete()
         _report_fitting_cost(started, mutated, saved, built, diff)
 
-    return Result(
+    result = Result(
         commands.RES_SUCCESS, ext=ext, before_response=publish,
         wait_for_before_response=True)
+    return result
 
 
 def _report_fitting_cost(started, mutated, saved, built, diff):

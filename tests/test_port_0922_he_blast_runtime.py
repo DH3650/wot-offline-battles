@@ -201,7 +201,8 @@ def _record(network_id=17, native_remote=True):
     return {
         'engine_id': 55, 'network_id': network_id, 'kind': 'bot',
         'local': False, 'native_remote': bool(native_remote), 'ready': True,
-        'state': {'health': 1000, 'alive': True},
+        'state': {'health': 1000, 'alive': True,
+                  'combat_base_revision': 0, 'combat_ack_seq': 0},
     }
 
 
@@ -358,8 +359,138 @@ class HEBlastSurfaceRuntimeTests(unittest.TestCase):
             scene_start, (5.0005, 1.0, 0.0), burst))
         self.assertEqual(calls, len(bigworld.calls))
 
+    def test_landed_turret_blocks_he_rays_at_the_projectile_clock(self):
+        battle, unused_world = _runtime()
+        battle._detached_turret_obstacles = mock.Mock()
+        probe = battle._detached_turret_obstacles.block_distance
+        probe.return_value = 1.0
+        scene_start = _Vector((5.0, 1.0, 0.0))
+        burst = _Vector((5.002, 1.0, 0.0))
+        self.assertFalse(battle._projectile_he_world_visible(
+            scene_start, (8.0, 1.0, 0.0), burst, server_time_ms=1200))
+        self.assertEqual(1200, probe.call_args.args[2])
+        probe.return_value = None
+        self.assertTrue(battle._projectile_he_world_visible(
+            scene_start, (8.0, 1.0, 0.0), burst, server_time_ms=900))
+        self.assertEqual(900, probe.call_args.args[2])
+        probe.return_value = 3.0
+        self.assertTrue(battle._projectile_he_world_visible(
+            scene_start, (8.0, 1.0, 0.0), burst, server_time_ms=1200))
+
+
 
 class HEBlastEffectRuntimeTests(unittest.TestCase):
+
+    def _internal_blast_target(self, target, point):
+        descriptor = target.typeDescriptor
+        descriptor.radio = types.SimpleNamespace(maxHealth=100.0)
+        descriptor.gun.maxHealth = 100.0
+        target.getComponents = lambda: ((descriptor.hull, _Matrix(), True),)
+        return {'valid': True, 'targets': tuple({
+            'parent': 'hull', 'entity': name,
+            'primitives': ({
+                'shape': 'sphere', 'center': (
+                    point[0] + 0.5, point[1] + offset, point[2]),
+                'radius': 0.01, 'primitive_id': name + ':blast'},),
+        } for name, offset in (('gun', 0.1), ('radio', -0.1)))}
+
+    def test_he_penetration_can_damage_multiple_off_axis_modules(self):
+        battle, meta, target, collision, terminal, state = self._direct_fixture()
+        collision.matInfo.armor = 20.0
+        layout = self._internal_blast_target(target, (5.0, 1.0, 0.0))
+        bigworld = types.SimpleNamespace(player=lambda: types.SimpleNamespace(
+            playerVehicleID=-1))
+        with mock.patch.dict(sys.modules, {
+                'Math': battle._runtime.math, 'BigWorld': bigworld}), \
+                mock.patch.object(critical_damage, '_offh_internal_layout',
+                                  return_value=layout), \
+                mock.patch.object(random, 'gauss', return_value=400.0), \
+                mock.patch.object(random, 'uniform', return_value=60.0), \
+                mock.patch.object(random, 'random', return_value=0.0):
+            effect = battle._projectile_direct_effect(meta, state, terminal)
+        self.assertEqual(2, effect['shot_result'])
+        self.assertEqual(400, effect['damage'])
+        self.assertIsNotNone(effect.get('critical'))
+        devices = {item['name']: item['hp']
+                   for item in effect['critical']['devices']}
+        self.assertEqual({'gunHealth': 40.0, 'radioHealth': 40.0}, devices)
+        self.assertEqual({}, target.devices_hp)
+
+    def test_nonpenetrating_he_starts_internal_damage_at_reachable_plate(self):
+        battle, meta, target, unused_collision, terminal, state = \
+            self._direct_fixture()
+        point = (7.0, 1.0, 0.0)
+        layout = self._internal_blast_target(target, point)
+        plate = _collision(2.0, 20.0)
+        blast = {'damage': 120, 'point': point,
+                 'direction': (1.0, 0.0, 0.0), 'collisions': (plate,)}
+        bigworld = types.SimpleNamespace(player=lambda: types.SimpleNamespace(
+            playerVehicleID=-1))
+        with mock.patch.dict(sys.modules, {
+                'Math': battle._runtime.math, 'BigWorld': bigworld}), \
+                mock.patch.object(critical_damage, '_offh_internal_layout',
+                                  return_value=layout), \
+                mock.patch.object(battle, '_projectile_he_blast_contact',
+                                  return_value=blast), \
+                mock.patch.object(random, 'gauss', return_value=400.0), \
+                mock.patch.object(random, 'uniform', return_value=60.0), \
+                mock.patch.object(random, 'random', return_value=0.0):
+            effect = battle._projectile_direct_effect(meta, state, terminal)
+        self.assertEqual(1, effect['shot_result'])
+        self.assertEqual(120, effect['damage'])
+        self.assertIsNotNone(effect.get('critical'))
+        self.assertEqual({'gunHealth', 'radioHealth'}, {
+            item['name'] for item in effect['critical']['devices']})
+
+    def test_near_miss_can_reach_multiple_modules_inside_the_contacted_hull(self):
+        battle, meta, target, unused_collision, unused_terminal, unused_state = \
+            self._direct_fixture()
+        point = (3.0, 1.0, 0.0)
+        layout = self._internal_blast_target(target, point)
+        plate = _collision(3.0, 20.0)
+        blast = {'damage': 120, 'point': point,
+                 'direction': (1.0, 0.0, 0.0), 'collisions': (plate,)}
+        bigworld = types.SimpleNamespace(player=lambda: types.SimpleNamespace(
+            playerVehicleID=-1))
+        with mock.patch.dict(sys.modules, {
+                'Math': battle._runtime.math, 'BigWorld': bigworld}), \
+                mock.patch.object(critical_damage, '_offh_internal_layout',
+                                  return_value=layout), \
+                mock.patch.object(battle, '_projectile_he_blast_contact',
+                                  return_value=blast), \
+                mock.patch.object(random, 'gauss', return_value=400.0), \
+                mock.patch.object(random, 'uniform', return_value=60.0), \
+                mock.patch.object(random, 'random', return_value=0.0):
+            effects = battle._projectile_splash_effects(
+                meta, (0.0, 1.0, 0.0), None)
+        self.assertEqual(1, len(effects))
+        self.assertEqual(120, effects[0]['damage'])
+        self.assertIsNotNone(effects[0].get('critical'))
+        self.assertEqual({'gunHealth', 'radioHealth'}, {
+            item['name'] for item in effects[0]['critical']['devices']})
+
+    def test_stopped_he_cannot_score_native_modules_behind_unreached_armor(self):
+        battle, meta, target, armor, terminal, state = self._direct_fixture()
+        target.typeDescriptor.radio = types.SimpleNamespace(maxHealth=100.0)
+        track = _collision(4.9, 20.0, factor=0.0,
+                           component='vehicleChassis')
+        track.matInfo.extra = types.SimpleNamespace(name='leftTrackHealth')
+        radio = _collision(6.0, 0.0)
+        radio.matInfo.extra = types.SimpleNamespace(name='radioHealth')
+        terminal['collisions'] = (track, armor, radio)
+        bigworld = types.SimpleNamespace(player=lambda: types.SimpleNamespace(
+            playerVehicleID=-1))
+        with mock.patch.dict(sys.modules, {
+                'Math': battle._runtime.math, 'BigWorld': bigworld}), \
+                mock.patch.object(battle, '_projectile_he_blast_contact',
+                                  return_value=None), \
+                mock.patch.object(random, 'gauss', return_value=400.0), \
+                mock.patch.object(random, 'uniform', return_value=60.0), \
+                mock.patch.object(random, 'random', return_value=0.0):
+            effect = battle._projectile_direct_effect(meta, state, terminal)
+        self.assertEqual(0, effect['damage'])
+        self.assertEqual({'leftTrackHealth'}, {
+            item['name'] for item in effect['critical']['devices']})
 
     def _direct_fixture(self, kind='HIGH_EXPLOSIVE'):
         battle, unused_bigworld = _runtime()
@@ -438,11 +569,55 @@ class HEBlastEffectRuntimeTests(unittest.TestCase):
         self.assertEqual(
             combat_rules.collision_layers((screen, weak_hull)),
             critical.call_args.args[1])
-        self.assertEqual((5.0, 1.0, 0.0),
+        self.assertEqual((6.5, 1.0, 0.0),
                          _xyz(critical.call_args.args[2]))
         self.assertEqual((1.0, 0.0, 0.0),
                          _xyz(critical.call_args.args[3]))
         self.assertIs(True, critical.call_args.kwargs['allow_interior'])
+
+    def test_nonpenetrating_he_owes_the_published_damage_not_the_roll(self):
+        """A stopped HE shell owes its listed damage, never a live roll.
+
+        The blast that leaks through armour is derived from a roll, but the
+        shell never pierced, so the armour ledger reports the published 400
+        even when the roll came in high.  The blocked value the damage log
+        and the damage indicator show is ``potential - damage``, so this
+        also proves that a leaking HE hit cannot report zero or negative
+        blocked damage.
+        """
+        (battle, meta, unused_target, unused_collision,
+         terminal, state) = self._direct_fixture()
+        weak_hull = _collision(1.5, 25.0)
+        blast = {
+            'damage': 240, 'nominal_armor': 25.0, 'distance': 1.5,
+            'point': (6.5, 1.0, 0.0), 'direction': (1.0, 0.0, 0.0),
+            'collision': weak_hull, 'collisions': (weak_hull,),
+        }
+        contact = {
+            'result': 1, 'layer': 'structural', 'distance': 5.0,
+            'component': 'vehicleHull',
+        }
+
+        with mock.patch.object(
+                combat_rules, 'resolve_armor_contact', return_value=contact), \
+                mock.patch.object(random, 'gauss', return_value=480.0), \
+                mock.patch.object(
+                    battle, '_projectile_he_blast_contact',
+                    return_value=blast) as blast_contact, \
+                mock.patch.object(
+                    critical_damage, 'propose_explosion',
+                    return_value=(240, None, {})):
+            effect = battle._projectile_direct_effect(meta, state, terminal)
+
+        # The blast still consumed the +20 percent roll it drew.
+        self.assertEqual(480.0, blast_contact.call_args.args[5])
+        self.assertEqual(240, effect['damage'])
+        self.assertEqual(400, effect['potential_damage'])
+        self.assertGreater(
+            effect['potential_damage'] - effect['damage'], 0)
+        # The server holds no descriptors, so the shell kind travels with
+        # the terminal and keeps HE out of the armour ledger there.
+        self.assertIs(True, effect['high_explosive'])
 
     def test_penetrating_he_keeps_full_direct_damage_without_surface_search(self):
         battle, meta, unused_target, unused_collision, terminal, state = \
@@ -555,7 +730,7 @@ class HEBlastEffectRuntimeTests(unittest.TestCase):
         self.assertEqual(
             combat_rules.collision_layers((structural,)),
             critical.call_args.args[1])
-        self.assertEqual((0.0, 0.0, 0.0),
+        self.assertEqual((3.5, 0.0, 0.0),
                          _xyz(critical.call_args.args[2]))
         self.assertEqual((1.0, 0.0, 0.0),
                          _xyz(critical.call_args.args[3]))
@@ -608,6 +783,7 @@ class HEBlastEffectRuntimeTests(unittest.TestCase):
         battle._projectile_terminal_data = {meta['projectile_id']: data}
         battle._submit_projectile_resolution = mock.Mock(return_value=True)
         blast = {'damage': 120, 'collisions': (collision,),
+                 'point': (5.0, 1.0, 0.0),
                  'direction': (1.0, 0.0, 0.0)}
         with mock.patch.object(
                 battle, '_projectile_he_blast_contact',

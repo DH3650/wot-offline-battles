@@ -47,6 +47,7 @@ from vehicle_overlay_store import (
     VehicleOverlayStoreError,
 )
 from gui.mods.offline_lan_0922 import tank_collision
+from gui.mods.offline_lan_0922 import turret_obstacle_schema
 from gui.mods.offline_lan_0922.battle_achievements import (
     ACHIEVEMENT_CONDITIONS, AWARDABLE_ACHIEVEMENTS, RECEIPT_STAT_NAMES,
     award_battle_achievements)
@@ -454,6 +455,8 @@ CRITICAL_CAUSES = frozenset((
 TRACK_DEVICE_NAMES = frozenset(("leftTrackHealth", "rightTrackHealth"))
 OUTFIT_SEASONS = frozenset((1, 2, 4))
 MAX_OUTFIT_BYTES = 64 * 1024
+# dossiers2.custom.records caps the vehicle marksOnGun record at three.
+MAX_MARKS_ON_GUN = 3
 MAX_VEHICLE_COMPACT_BYTES = 64 * 1024
 
 
@@ -483,6 +486,23 @@ def _validated_outfits(value):
             raise ValueError("outfit catalogue is too large")
         result[str(season)] = base64.b64encode(raw).decode("ascii")
     return result
+
+
+def _validated_marks_on_gun(value):
+    """Return one gun-mark count, or raise ValueError.
+
+    ``dossiers2.custom.records`` stores ``marksOnGun`` as a 'B' capped at
+    three, and the client publishes only its own account's value.  This is
+    presentation bookkeeping on a trusted LAN, not an authority input: a
+    missing field is no marks rather than a refused join.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("invalid gun mark count")
+    if not 0 <= value <= MAX_MARKS_ON_GUN:
+        raise ValueError("invalid gun mark count")
+    return int(value)
 
 
 def _validated_vehicle_compact_descr(value):
@@ -1585,6 +1605,21 @@ def _track_repair_rows(value):
     return tuple(sorted(result, key=lambda row: row["name"]))
 
 
+def _even_shares(total, parts):
+    """Return ``parts`` integer shares of ``total`` that sum back to it.
+
+    A spotting assist is divided between the observers lighting the target,
+    and the statistic is a whole number of hit points, so the remainder goes
+    to the first shares in the caller's stable order rather than being lost.
+    """
+    parts = int(parts)
+    if parts <= 0:
+        return []
+    share, remainder = divmod(int(total), parts)
+    return [share + 1 if index < remainder else share
+            for index in range(parts)]
+
+
 def _destroyed_tracks(critical):
     """Return the track devices one critical payload reports as destroyed."""
     if not isinstance(critical, dict):
@@ -1629,6 +1664,7 @@ class _EndpointSendMixin:
         self._outbox_reliable_bytes = 0
         self._outbox_snapshot = None
         self._outbox_thread = None
+        self._outbox_failure_reported = False
 
     def __post_init__(self):
         self._initialize_outbox()
@@ -1666,11 +1702,64 @@ class _EndpointSendMixin:
             self.connected = False
             condition.notify_all()
 
+    def _record_outbound_failure(self, reason, message, payload=None,
+                                 error=None, sent_bytes=None):
+        """Record the first failed send without retaining or logging content."""
+        try:
+            with self._ensure_outbox():
+                if self._outbox_failure_reported or not self.connected:
+                    return
+                self._outbox_failure_reported = True
+                metadata = message if isinstance(message, dict) else {}
+                message_type = metadata.get("type")
+                worker = isinstance(self, SimulationWorker)
+                snapshot = self._outbox_snapshot
+                failure = {
+                    "endpoint_role": "worker" if worker else "player",
+                    "endpoint_id": (self.worker_id if worker else
+                                    self.player_id),
+                    "reason": reason,
+                    "message_type": (
+                        message_type[:64]
+                        if isinstance(message_type, str) else None),
+                    "round_id": metadata.get("round_id"),
+                    "server_tick": metadata.get("server_tick"),
+                    "payload_bytes": (
+                        len(payload) if payload is not None else None),
+                    "sent_bytes": sent_bytes,
+                    "reliable_messages": len(self._outbox_reliable),
+                    "reliable_bytes": self._outbox_reliable_bytes,
+                    "snapshot_bytes": (len(snapshot["payload"])
+                                       if snapshot is not None else 0),
+                    "error_type": (
+                        type(error).__name__[:64]
+                        if error is not None else None),
+                    "errno": getattr(error, "errno", None),
+                }
+                # Malformed framing metadata must not leak arbitrary values
+                # or prevent a diagnostic for the original encoding failure.
+                for key in ("endpoint_id", "round_id", "server_tick", "errno"):
+                    if (type(failure[key]) is not int or
+                            not -(1 << 63) <= failure[key] < (1 << 63)):
+                        failure[key] = None
+            _server_log("OUTBOUND FAILURE " + json.dumps(
+                failure, sort_keys=True, separators=(",", ":")))
+        except Exception:
+            # A broken log destination must not change send/close semantics.
+            pass
+
     def _serialize_message(self, message):
         outgoing = _monotonic_endpoint_server_time(self, message)
-        payload = (json.dumps(
-            outgoing, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            payload = (json.dumps(
+                outgoing, separators=(",", ":")) + "\n").encode("utf-8")
+        except Exception as error:
+            self._record_outbound_failure(
+                "encode_error", message, error=error, sent_bytes=0)
+            raise
         if len(payload) > MAX_LINE_BYTES:
+            self._record_outbound_failure(
+                "message_too_large", message, payload, sent_bytes=0)
             return None
         return payload
 
@@ -1691,42 +1780,54 @@ class _EndpointSendMixin:
     def _send_direct(self, message):
         if not self.connected:
             return False
+        # A restored endpoint may lack its outbox. Initialize before taking
+        # send_lock so a failure diagnostic cannot re-enter that plain lock.
+        self._ensure_outbox()
         try:
             with self.send_lock:
                 payload = self._serialize_message(message)
                 if payload is None:
                     return False
-                self._write_payload(payload)
+                self._write_payload(payload, message)
             self._mark_message_sent(message)
             return True
         except (BrokenPipeError, ConnectionError, OSError):
             self.connected = False
             return False
 
-    def _write_payload(self, payload):
+    def _write_payload(self, payload, message=None):
         """Finish one frame across short socket stalls without duplication."""
         sender = getattr(self.conn, "send", None)
-        if not callable(sender):
-            self.conn.sendall(payload)
-            return
-        offset = 0
+        # sendall does not expose partial progress if it raises.
+        offset = 0 if callable(sender) else None
         stalled_since = None
-        while offset < len(payload):
-            try:
-                count = sender(payload[offset:])
-                if count is None or int(count) <= 0:
-                    raise ConnectionError("peer closed during send")
-                offset += int(count)
-                stalled_since = None
-            except socket.timeout:
-                now = time.monotonic()
-                if stalled_since is None:
-                    stalled_since = now
-                elif (now - stalled_since >=
-                      OUTBOUND_STALL_TIMEOUT_SECONDS):
-                    raise socket.timeout(
-                        "peer did not accept LAN state for %.0f seconds" %
-                        OUTBOUND_STALL_TIMEOUT_SECONDS)
+        reason = "socket_error"
+        try:
+            if not callable(sender):
+                self.conn.sendall(payload)
+                return
+            while offset < len(payload):
+                try:
+                    count = sender(payload[offset:])
+                    if count is None or int(count) <= 0:
+                        reason = "peer_closed"
+                        raise ConnectionError("peer closed during send")
+                    offset += int(count)
+                    stalled_since = None
+                except socket.timeout:
+                    now = time.monotonic()
+                    if stalled_since is None:
+                        stalled_since = now
+                    elif (now - stalled_since >=
+                          OUTBOUND_STALL_TIMEOUT_SECONDS):
+                        reason = "send_stall"
+                        raise socket.timeout(
+                            "peer did not accept LAN state for %.0f seconds" %
+                            OUTBOUND_STALL_TIMEOUT_SECONDS)
+        except (BrokenPipeError, ConnectionError, OSError) as error:
+            self._record_outbound_failure(
+                reason, message, payload, error, offset)
+            raise
 
     def _start_outbox_locked(self):
         thread = self._outbox_thread
@@ -1761,6 +1862,12 @@ class _EndpointSendMixin:
                     MAX_RELIABLE_OUTBOUND_MESSAGES or
                     self._outbox_reliable_bytes + len(payload) >
                     MAX_RELIABLE_OUTBOUND_BYTES):
+                reason = ("reliable_message_limit"
+                          if len(self._outbox_reliable) >=
+                          MAX_RELIABLE_OUTBOUND_MESSAGES else
+                          "reliable_byte_limit")
+                self._record_outbound_failure(
+                    reason, message, payload, sent_bytes=0)
                 self._fail_outbox()
                 self._shutdown_transport()
                 return False
@@ -1776,6 +1883,7 @@ class _EndpointSendMixin:
         if done is None:
             return True
         if not done.wait(OUTBOUND_SYNC_TIMEOUT_SECONDS):
+            self._record_outbound_failure("sync_timeout", message, payload)
             self._fail_outbox()
             self._shutdown_transport()
             return False
@@ -1886,7 +1994,7 @@ class _EndpointSendMixin:
                     self._outbox_snapshot = None
             try:
                 with self.send_lock:
-                    self._write_payload(item["payload"])
+                    self._write_payload(item["payload"], item["message"])
             except (BrokenPipeError, ConnectionError, OSError):
                 self._fail_outbox(item)
                 self._shutdown_transport()
@@ -2038,6 +2146,7 @@ class Player(_EndpointSendMixin):
     capabilities: Tuple[str, ...] = field(default_factory=tuple)
     account_key: str = ""
     outfits: dict = field(default_factory=dict)
+    marks_on_gun: int = 0
     vehicle_compact_descr: str = ""
     effective_params: dict = field(default_factory=dict)
     delivered_receipt_id: str = ""
@@ -2087,7 +2196,7 @@ class BattleState:
                  team_size=15,
                  receipt_state_path=None, team1_size=None, team2_size=None,
                  bot_tier_mode='random', bot_lineup=None,
-                 bot_skill_mode=None):
+                 bot_skill_mode=None, bot_excluded_vehicles=None):
         self.map_option = map_name
         self.map_name = self._choose_map()
         self.client_build = None
@@ -2103,6 +2212,8 @@ class BattleState:
         self.bot_skill_mode = bot_gunnery.normalize_skill_mode(
             bot_skill_mode)
         self.bot_lineup = self._normalize_bot_lineup(bot_lineup)
+        self.bot_excluded_vehicles = self._normalize_bot_excluded_vehicles(
+            bot_excluded_vehicles)
         # Keep the old scalar on the wire for older protocol-v5 consumers.
         # New consumers use team_sizes; max remains a safe roster upper bound.
         self.team_size = max(team1_size, team2_size)
@@ -2128,6 +2239,7 @@ class BattleState:
         self.bot_manifest = []
         self.bot_manifest_revision = 0
         self.bot_states = {}
+        self.bot_unavailable_checkpoints = set()
         self.bot_terminal_criticals = {}
         self.bot_state_revision = 0
         self.bot_planner = BotPlanner()
@@ -2206,6 +2318,7 @@ class BattleState:
         self.capture_contributors = {1: {}, 2: {}}
         self.capture_cursors = {1: 0, 2: 0}
         self.destructibles = {}
+        self.detached_turrets = OrderedDict()
         self.destructible_revision = 0
         self.projectiles = {}
         self.projectile_tombstones = {}
@@ -2227,6 +2340,19 @@ class BattleState:
         self.last_projectile_resolve_reject = ""
         self.last_projectile_resolve_reject_code = ""
         self._logged_protocol_reject_codes = {}
+
+    @staticmethod
+    def _normalize_bot_excluded_vehicles(value):
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)) or len(value) > 4096:
+            raise ValueError("invalid Bot vehicle exclusions")
+        for name in value:
+            if (not isinstance(name, str) or len(name) > 96 or
+                    re.fullmatch(r"[a-z][a-z0-9_]*:[A-Za-z0-9][A-Za-z0-9_.-]*",
+                                 name) is None):
+                raise ValueError("invalid Bot vehicle exclusion name")
+        return sorted(set(value))
 
     @staticmethod
     def _normalize_bot_lineup(value):
@@ -2723,6 +2849,11 @@ class BattleState:
             except ValueError:
                 return None, "invalid_outfits"
             try:
+                marks_on_gun = _validated_marks_on_gun(
+                    hello.get("marks_on_gun"))
+            except ValueError:
+                return None, "invalid_marks_on_gun"
+            try:
                 vehicle_compact_descr = _validated_vehicle_compact_descr(
                     hello.get("vehicle_compact_descr"))
             except ValueError:
@@ -2796,6 +2927,7 @@ class BattleState:
                 capabilities=capabilities,
                 account_key=account_key,
                 outfits=outfits,
+                marks_on_gun=marks_on_gun,
                 vehicle_compact_descr=vehicle_compact_descr,
                 effective_params=effective_params,
             )
@@ -3004,6 +3136,8 @@ class BattleState:
             if round_failed:
                 self.worker_failure_reason = str(
                     failure_reason or "worker_disconnected")
+                failed_round_id = self.round_id
+                recorded_failure_reason = self.worker_failure_reason
                 self.pending_live_message = None
                 # A loading client has already entered the native offline
                 # arena. Publish the same explicit terminal result used in a
@@ -3024,7 +3158,7 @@ class BattleState:
             if round_failed:
                 _server_log(
                     "WORKER FAILURE round=%d reason=%s; round terminated" % (
-                        self.round_id, self.worker_failure_reason))
+                        failed_round_id, recorded_failure_reason))
         worker._shutdown_transport()
         return worker, round_failed
 
@@ -3043,6 +3177,10 @@ class BattleState:
             vehicle = _safe_vehicle(message.get("vehicle"), player.vehicle)
             try:
                 outfits = _validated_outfits(message.get("outfits"))
+                marks_on_gun = (
+                    player.marks_on_gun
+                    if message.get("marks_on_gun") is None
+                    else _validated_marks_on_gun(message.get("marks_on_gun")))
                 vehicle_compact_descr = \
                     _validated_vehicle_compact_descr(
                         message.get("vehicle_compact_descr"))
@@ -3052,6 +3190,7 @@ class BattleState:
                 return False
             if (vehicle == player.vehicle and max_health == player.max_health
                     and outfits == player.outfits and
+                    marks_on_gun == player.marks_on_gun and
                     vehicle_compact_descr ==
                     player.vehicle_compact_descr and
                     effective_params == player.effective_params):
@@ -3062,6 +3201,7 @@ class BattleState:
             player.siege_state = SIEGE_DISABLED
             player.siege_transition_ticks = 0
             player.outfits = outfits
+            player.marks_on_gun = marks_on_gun
             player.vehicle_compact_descr = vehicle_compact_descr
             player.effective_params = effective_params
             self.state_revision += 1
@@ -3301,6 +3441,7 @@ class BattleState:
         self.bot_manifest = []
         self.bot_manifest_revision = 0
         self.bot_states = {}
+        self.bot_unavailable_checkpoints = set()
         self.bot_terminal_criticals = {}
         self.bot_state_revision = 0
         self.bot_state_time_us = 0
@@ -3355,6 +3496,7 @@ class BattleState:
         self.capture_contributors = {1: {}, 2: {}}
         self.capture_cursors = {1: 0, 2: 0}
         self.destructibles = {}
+        self.detached_turrets = OrderedDict()
         self.destructible_revision = 0
         self.projectiles = {}
         self.projectile_tombstones = {}
@@ -3566,6 +3708,7 @@ class BattleState:
                 "bot_tier_mode": self.bot_tier_mode,
                 "bot_skill_mode": self.bot_skill_mode,
                 "bot_lineup": list(self.bot_lineup),
+                "bot_excluded_vehicles": list(self.bot_excluded_vehicles),
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": list(self.bot_manifest),
                 "bot_order_revision": self.bot_orders["revision"],
@@ -3574,6 +3717,7 @@ class BattleState:
                 "battle_result": self.battle_result,
                 "destructible_revision": self.destructible_revision,
                 "destructibles": list(self.destructibles.values()),
+                "detached_turrets": self._detached_turret_snapshot(),
             }
             start_message.update({
                 "authority_epoch": self.authority_epoch,
@@ -3855,6 +3999,7 @@ class BattleState:
                 "battle_result": self.battle_result,
                 "destructible_revision": self.destructible_revision,
                 "destructibles": list(self.destructibles.values()),
+                "detached_turrets": self._detached_turret_snapshot(),
             }
             message.update(self._authority_fields())
             return message
@@ -4246,6 +4391,7 @@ class BattleState:
                 "bot_tier_mode": self.bot_tier_mode,
                 "bot_skill_mode": self.bot_skill_mode,
                 "bot_lineup": list(self.bot_lineup),
+                "bot_excluded_vehicles": list(self.bot_excluded_vehicles),
                 "bot_authority_id": self.bot_authority_id,
                 "bot_manifest": takeover_manifest,
                 "bot_order_revision": self.bot_orders["revision"],
@@ -4254,6 +4400,7 @@ class BattleState:
                 "battle_result": self.battle_result,
                 "destructible_revision": self.destructible_revision,
                 "destructibles": list(self.destructibles.values()),
+                "detached_turrets": self._detached_turret_snapshot(),
             }
             message.update({
                 "authority_epoch": self.authority_epoch,
@@ -4728,6 +4875,7 @@ class BattleState:
                 (bot_id, set()) for bot_id in known_bots)
             direct_player_spots = dict(
                 (reporter_id, set()) for reporter_id in known_players)
+            team_lit = {1: {}, 2: {}}
             stale_observation = False
             contacts = []
             for raw in message.get("contacts"):
@@ -4779,8 +4927,16 @@ class BattleState:
                         int(target.get("team", 0)) == observing_team or
                         target_team != int(target.get("team", 0))):
                     return False
+                reported_fresh = bool(
+                    contact["visible_by_bot_ids"] or
+                    contact["visible_by_player_ids"])
+                if (contact["fresh"] != reported_fresh or
+                        contact["visible"] != (time_left > 0.0) or
+                        (reported_fresh and not contact["visible"]) or
+                        (not reported_fresh and
+                         contact["shootable_by_bot_ids"])):
+                    return False
                 bot_observer_ids = []
-                stale_contact = False
                 for raw_bot_id in contact.get("visible_by_bot_ids"):
                     try:
                         bot_id = _exact_int(
@@ -4788,15 +4944,15 @@ class BattleState:
                     except ValueError:
                         return False
                     bot = known_bots.get(bot_id)
-                    if bot is not None and not bot.get("alive"):
-                        stale_observation = True
-                        stale_contact = True
-                        continue
                     if (bot is None or
                             int(bot.get("team", 0)) != observing_team or
                             bot_id in bot_observer_ids):
                         return False
                     bot_observer_ids.append(bot_id)
+                    if not bot.get("alive"):
+                        stale_observation = True
+                bot_observer_ids = [bot_id for bot_id in bot_observer_ids
+                                    if known_bots[bot_id].get("alive")]
                 contact["visible_by_bot_ids"] = sorted(bot_observer_ids)
 
                 observer_ids = []
@@ -4808,17 +4964,15 @@ class BattleState:
                     except ValueError:
                         return False
                     observer = known_players.get(observer_id)
-                    if observer is not None and not observer.alive:
-                        stale_observation = True
-                        stale_contact = True
-                        continue
                     if (observer is None or
                             int(observer.team) != observing_team or
                             observer_id in observer_ids):
                         return False
                     observer_ids.append(observer_id)
-                if observer_ids and not contact["visible"]:
-                    return False
+                    if not observer.alive:
+                        stale_observation = True
+                observer_ids = [observer_id for observer_id in observer_ids
+                                if known_players[observer_id].alive]
                 contact["visible_by_player_ids"] = sorted(observer_ids)
                 shooter_ids = []
                 for raw_bot_id in contact.get("shootable_by_bot_ids"):
@@ -4828,15 +4982,15 @@ class BattleState:
                     except ValueError:
                         return False
                     bot = known_bots.get(bot_id)
-                    if bot is not None and not bot.get("alive"):
-                        stale_observation = True
-                        stale_contact = True
-                        continue
                     if (bot is None or
                             int(bot.get("team", 0)) != observing_team or
                             bot_id in shooter_ids):
                         return False
                     shooter_ids.append(bot_id)
+                    if not bot.get("alive"):
+                        stale_observation = True
+                shooter_ids = [bot_id for bot_id in shooter_ids
+                               if known_bots[bot_id].get("alive")]
                 contact["shootable_by_bot_ids"] = sorted(shooter_ids)
                 # A threat is advisory native geometry: a malformed row must
                 # not make an otherwise valid observation batch fail or give
@@ -4862,16 +5016,20 @@ class BattleState:
                     contact["threatened_bot_ids"] = sorted(
                         threatened_ids if contact["visible"] else ())
                 fresh = bool(bot_observer_ids or observer_ids)
-                if stale_contact and not fresh:
-                    continue
-                if (contact["fresh"] != fresh or
-                        contact["visible"] != (time_left > 0.0) or
-                        (fresh and not contact["visible"]) or
-                        (not fresh and shooter_ids)):
-                    return False
+                # An observer may die before its in-flight report arrives.
+                # Retire its direct sight and firing evidence, but keep the
+                # valid lease that still lights this target for the team.
+                contact["fresh"] = fresh
+                if not fresh:
+                    contact["shootable_by_bot_ids"] = []
+                    if "threatened_bot_ids" in contact:
+                        contact["threatened_bot_ids"] = []
                 contact["time_left"] = time_left
                 result_kind = ("player" if target_kind == "human"
                                else target_kind)
+                if contact["visible"]:
+                    team_lit[observing_team][
+                        (result_kind, target_id)] = time_left
                 for bot_id in bot_observer_ids:
                     direct_bot_spots[bot_id].add(
                         (result_kind, target_id))
@@ -4880,6 +5038,10 @@ class BattleState:
                         (result_kind, target_id))
                 contacts.append(contact)
             now = time.monotonic()
+            team_lit = {
+                team: {target: now + time_left
+                       for target, time_left in targets.items()}
+                for team, targets in team_lit.items()}
             accepted_visibility = []
             accepted_contacts = self.bot_planner.report_contacts(
                 contacts, known_targets, now,
@@ -4891,6 +5053,7 @@ class BattleState:
                 message.get("affordances"), known_bots, known_targets, now)
             self._replace_bot_spotted(direct_bot_spots)
             self._replace_player_spotted(direct_player_spots)
+            self._replace_team_lit(team_lit, now=now)
             self._commit_detections()
             if accepted_visibility:
                 return {
@@ -4926,6 +5089,20 @@ class BattleState:
         for player_id in sorted(direct_spots):
             spotted = frozenset(direct_spots[player_id])
             self.player_spotted[int(player_id)] = spotted
+        return True
+
+    def _replace_team_lit(self, lit_targets, now=None):
+        """Expire old leases before committing a complete deadline batch."""
+        now = time.monotonic() if now is None else now
+        for team in (1, 2):
+            # A lease can expire between reports without an explicit hidden
+            # sample. Compare the previous lease before a fresh observer's
+            # renewal replaces it, so that observer gets the new detection.
+            still_lit = {
+                target for target, deadline in
+                self.team_lit_targets[team].items() if deadline > now}
+            self.team_visible_targets[team].intersection_update(still_lit)
+            self.team_lit_targets[team] = dict(lit_targets.get(team, {}))
         return True
 
     @staticmethod
@@ -5890,7 +6067,8 @@ class BattleState:
         return result
 
     @staticmethod
-    def _validate_bot_ammo_transition(previous, current):
+    def _validate_bot_ammo_transition(previous, current,
+                                      unavailable_checkpoint=False):
         """Require conserved inventory and exact magazine boundaries."""
         if previous is None:
             return True
@@ -5925,8 +6103,6 @@ class BattleState:
             raise ValueError("bot clip checkpoint is invalid")
         expected = list(before)
         if fire_delta:
-            if not pending:
-                raise ValueError("bot shot did not enter reload state")
             previous_active = bool((previous or {}).get(
                 "burst_active", False))
             if previous_active:
@@ -5948,6 +6124,25 @@ class BattleState:
                     previous_pending and previous_clip == 0):
                 raise ValueError("bot fired from an empty clip")
             burst_shell = int(current.get("burst_shell_index", loaded))
+            if not pending:
+                if (not unavailable_checkpoint or reload_time != 0.0 or
+                        current.get("burst_active", False) or
+                        not 0 <= burst_shell < len(after)):
+                    raise ValueError("bot shot did not enter reload state")
+                # The missing checkpoint may span the shot and its completed
+                # reload. Validate those two ordinary transactions in order;
+                # neither ammunition conservation nor shell/clip identity is
+                # waived by the unavailable marker.
+                exhausted = after[burst_shell] == 0 and sum(after) > 0
+                post_shot_clip = 0 if exhausted else expected_clip
+                full_reload = post_shot_clip == 0 or clip_size == 1
+                shot = dict(
+                    current, shell_index=burst_shell,
+                    next_shell_index=loaded if full_reload else next_shell,
+                    clip=post_shot_clip, ammo_reload_pending=True,
+                    reload_time=float(current.get("reload_duration", 0.0)))
+                BattleState._validate_bot_ammo_transition(previous, shot)
+                return BattleState._validate_bot_ammo_transition(shot, current)
             if loaded != burst_shell or loaded != expected_loaded:
                 raise ValueError("bot loaded shell changed while firing")
             if (expected_clip < 0 or loaded >= len(expected) or
@@ -6214,6 +6409,46 @@ class BattleState:
         current["combat_base_revision"] = server_base
         current["combat_ack_seq"] = raw_seq
 
+    def _detached_turret_snapshot(self):
+        return copy.deepcopy(list(self.detached_turrets.values()))
+
+    def _admit_detached_turrets(self, message):
+        """Freeze each confirmed ammo-rack wreck once in the current round."""
+        try:
+            epoch = _exact_int(message.get("authority_epoch"),
+                               0, PROJECTILE_MAX_ID)
+        except ValueError:
+            return
+        rows = message.get("detached_turrets")
+        if (epoch != self.authority_epoch or
+                not isinstance(rows, (list, tuple))):
+            return
+        for raw in rows[:turret_obstacle_schema.MAX_ACTIVE_TURRETS]:
+            row = turret_obstacle_schema.normalize_proposal(raw)
+            if row is None:
+                continue
+            key = turret_obstacle_schema.row_key(row)
+            if (key in self.detached_turrets or
+                    len(self.detached_turrets) >=
+                    turret_obstacle_schema.MAX_ACTIVE_TURRETS):
+                continue
+            if row["actor_kind"] == "bot":
+                actor = self.bot_states.get(row["actor_id"])
+                confirmed = bool(
+                    actor is not None and actor.get("health", 1) <= 0 and
+                    not actor.get("alive", True) and
+                    actor.get("critical", {}).get("ammo_rack_death", False))
+            else:
+                actor = self.players.get(row["actor_id"])
+                confirmed = bool(
+                    actor is not None and actor.participating and
+                    actor.health <= 0 and not actor.alive and
+                    actor.critical.get("ammo_rack_death", False))
+            if not confirmed:
+                continue
+            row["created_time_ms"] = self._server_time_ms()
+            self.detached_turrets[key] = row
+
     def update_bot_states(self, player_id, message):
         received_raw_motion_time_us = self._motion_time_us()
         with self.lock:
@@ -6230,6 +6465,11 @@ class BattleState:
                 # A checkpoint encoded before the terminal result can still be
                 # waiting in the worker's reliable queue.  The result is
                 # canonical, so converge that tail packet as a quiet no-op.
+                # Its final ammo-rack death may still need its immutable
+                # detachment admitted after the combat result was frozen.
+                if (player_id == self.bot_authority_id and
+                        player_id == self.bot_manifest_authority_id):
+                    self._admit_detached_turrets(message)
                 return True
             if not self._combat_accepting():
                 return self._set_protocol_reject(
@@ -6372,6 +6612,7 @@ class BattleState:
                             incoming, (list, tuple)) else None,
                         len(identities)))
             next_states = {}
+            next_unavailable_checkpoints = set()
             human_ram_armors = self._validated_human_ram_armors(
                 message.get("human_ram_armors"))
             if human_ram_armors is None:
@@ -6394,7 +6635,18 @@ class BattleState:
                 if identity is None:
                     return self._set_protocol_reject(
                         "bot_state", "bot_identity", "bot=%s" % bot_id)
+                if bot_id in next_states:
+                    return self._set_protocol_reject(
+                        "bot_state", "batch_members",
+                        "duplicate bot=%s" % bot_id)
                 previous = self.bot_states.get(bot_id)
+                if len(row) == 1 and previous is not None:
+                    # The worker could not project this actor's checkpoint.
+                    # Retain all admitted ledgers without advancing its ACK;
+                    # the next valid row can reconcile the pending changes.
+                    next_states[bot_id] = previous
+                    next_unavailable_checkpoints.add(bot_id)
+                    continue
                 try:
                     raw = bot_state_codec.decode_row(row, identity)
                 except (bot_state_codec.BotStateCodecError, TypeError,
@@ -6475,7 +6727,9 @@ class BattleState:
                     try:
                         burst_edges = self._bot_burst_transition(
                             previous, current)
-                        self._validate_bot_ammo_transition(previous, current)
+                        self._validate_bot_ammo_transition(
+                            previous, current,
+                            bot_id in self.bot_unavailable_checkpoints)
                     except ValueError as error:
                         # The published magazine and burst clock do not follow
                         # from the last ones the server admitted, which a
@@ -6567,6 +6821,8 @@ class BattleState:
                     "missing=%s" % sorted(set(identities) - set(next_states)))
             self._commit_human_ram_armors(human_ram_armors)
             self.bot_states = next_states
+            self._admit_detached_turrets(message)
+            self.bot_unavailable_checkpoints = next_unavailable_checkpoints
             for bot_id in stun_clears:
                 self.pending_events.append({
                     "kind": "stun", "active": False,
@@ -7849,12 +8105,10 @@ class BattleState:
                     shells_before_shot == 1)
             if shooter_kind == "player":
                 shooter.fire_seq = shot_seq
-                if bool(intent.get("shell_change_pending", False)):
-                    shooter.shell_index = int(intent["next_shell_index"])
-                else:
-                    shooter.shell_index = shell_index
-                shooter.next_shell_index = shooter.shell_index
-                shooter.shell_change_pending = False
+                # The visible gun reports the post-shot shell selection in
+                # its next input checkpoint. A launch alone cannot promote a
+                # queued shell: the cassette may still contain rounds, and
+                # a newer input may already have changed the queued choice.
                 shooter.pending_fire_intents.pop(fire_intent_seq, None)
                 shooter.fire_intent_results[fire_intent_seq] = (
                     True, projectile_id)
@@ -7870,12 +8124,9 @@ class BattleState:
                     launch_time_us)
             statistics = self._statistics_row(shooter_kind, shooter_id)
             statistics["shots_fired"] += 1
-            # A pending shell change is applied above, so the round actually
-            # drawn is the shooter's resolved index rather than the one the
-            # launch message carried.
-            fired_index = str(max(0, min(9, int(
-                shooter.shell_index if shooter_kind == "player"
-                else shell_index))))
+            # Charge the shell frozen into this launch, independent of later
+            # loaded or queued selections reported by the visible client.
+            fired_index = str(shell_index)
             # The key is a string because this row is broadcast as JSON, which
             # would turn an integer key into one anyway and make the row stop
             # round-tripping.
@@ -8126,6 +8377,7 @@ class BattleState:
             "target_x", "target_y", "target_z",
             "damage_sticker",
             "structural_armor_hit",
+            "high_explosive",
         }
         required = {
             "target_kind", "target_id", "damage", "shot_result",
@@ -8147,6 +8399,13 @@ class BattleState:
         # Optional achievement metadata never owns projectile admission.
         # Unknown/malformed values are conservative external-module hits.
         structural_armor_hit = raw.get("structural_armor_hit") is True
+        # #1513 states its own armour-ledger rule in
+        # #battle_results:common/tooltip/armor/description: the counter takes
+        # ricochets and non-penetrations, and "HE and HESH shells are not
+        # included". Both are the one HIGH_EXPLOSIVE kind. The worker owns
+        # descriptors and reports the shell fact; an absent or malformed
+        # value stays a non-HE shell rather than discarding the terminal.
+        high_explosive = raw.get("high_explosive") is True
         shot_result = _exact_int(raw.get("shot_result"), 0, 2)
         pose = _bounded_vector(
             [raw.get("x"), raw.get("y"), raw.get("z")],
@@ -8247,6 +8506,7 @@ class BattleState:
             "target_alive": target_alive, "damage": damage,
             "potential_damage": potential_damage,
             "structural_armor_hit": structural_armor_hit,
+            "high_explosive": high_explosive,
             "shot_result": shot_result, "pose": pose,
             "critical": critical,
             "critical_delta": critical_delta,
@@ -8365,12 +8625,12 @@ class BattleState:
                     "target_kind", "target_id", "damage", "shot_result",
                     "x", "y", "z"}
                 # A bounce is the archetypal blocked-damage contact, so the
-                # harmless direct effect keeps the worker's potential-damage
-                # roll, decal identity and armour layer. Critical, stun and
-                # splash tokens stay forbidden on a continuing shell.
+                # harmless direct effect keeps the worker's potential damage,
+                # decal identity, armour layer and shell kind. Critical, stun
+                # and splash tokens stay forbidden on a continuing shell.
                 direct_optional = {
                     "damage_sticker", "potential_damage",
-                    "structural_armor_hit"}
+                    "structural_armor_hit", "high_explosive"}
                 if (not isinstance(raw_direct, dict) or
                         not direct_fields.issubset(raw_direct) or
                         set(raw_direct) - (direct_fields | direct_optional)):
@@ -8553,6 +8813,7 @@ class BattleState:
             attacker_key = "attacker_bot"
         blocked_damage = 0
         if (not proposal["splash"] and was_alive and
+                not proposal["high_explosive"] and
                 int(record["team"]) != int(proposal["target_team"]) and
                 proposal["shot_result"] != 2):
             blocked_damage = max(
@@ -9091,9 +9352,23 @@ class BattleState:
             key = (("contact", contact_player_id, contact_seq)
                    if has_contact_player else
                    ("authority", self.authority_epoch, player_id, ram_seq))
+            contact_positions = None
+            if "contact_positions" in message:
+                positions = message["contact_positions"]
+                if (target_kind != "bot" or
+                        not isinstance(positions, (list, tuple)) or
+                        len(positions) != 4):
+                    return False
+                try:
+                    contact_positions = tuple(
+                        _bounded_float(value, -5000.0, 5000.0)
+                        for value in positions)
+                except (TypeError, ValueError, OverflowError):
+                    return False
             fingerprint = (
                 bot_id, target_kind, target_id, damage_to_bot,
-                damage_to_target, contact_player_id, contact_seq)
+                damage_to_target, contact_player_id, contact_seq,
+                contact_positions)
             previous_fingerprint = (
                 self.bot_reported_ram_fingerprints.get(key))
             if previous_fingerprint is not None:
@@ -9134,8 +9409,14 @@ class BattleState:
                             else target.x)
                 target_z = (target.get("z") if target_kind == "bot"
                             else target.z)
-                if math.hypot(float(bot["x"]) - float(target_x),
-                              float(bot["z"]) - float(target_z)) > 12.5:
+                # A projection failure can defer this immutable contact past
+                # later movement. Validate its frozen geometry, not the pose
+                # of the recovery checkpoint that happened to carry it.
+                positions = contact_positions or (
+                    float(bot["x"]), float(bot["z"]),
+                    float(target_x), float(target_z))
+                if math.hypot(positions[0] - positions[2],
+                              positions[1] - positions[3]) > 12.5:
                     return False
             if ram_contact is not None and (
                     not bot.get("alive") or not target.alive):
@@ -11375,6 +11656,12 @@ class BattleState:
                     return self._finish_equipment_intent(
                         player, intent_seq, False,
                         "invalid_activation_code")
+            elif kind == "extinguisher":
+                # #1513 _ExtinguisherItem uses 65536 + equipment ID.
+                if extra_index != 1:
+                    return self._finish_equipment_intent(
+                        player, intent_seq, False,
+                        "invalid_activation_code")
             elif not repair_all and extra_index != 0:
                 return self._finish_equipment_intent(
                     player, intent_seq, False, "invalid_activation_code")
@@ -11411,8 +11698,24 @@ class BattleState:
                     player, intent_seq, False, "equipment_ineligible")
             payload = None
             if effect.get("action") != "set_rpm_limiter":
-                payload = player_critical_mechanics.apply_equipment(
-                    player, effect, now)
+                try:
+                    payload = player_critical_mechanics.apply_equipment(
+                        player, effect, now)
+                    if payload is not None:
+                        payload = _critical_payload(payload)
+                except Exception as error:
+                    # Resolution uses a detached target, before consuming the
+                    # kit or committing critical state. Finish this intent so
+                    # the client can retry with a new trigger after failure.
+                    detail = str(error).replace(
+                        "\r", " ").replace("\n", " ")[:160]
+                    _server_log(
+                        "EQUIPMENT INTENT failed sender=%d seq=%d item=%d "
+                        "error=%s detail=%s" % (
+                            player_id, intent_seq, equipment_id,
+                            type(error).__name__, detail))
+                    return self._finish_equipment_intent(
+                        player, intent_seq, False, "equipment_failed")
                 if payload is None and not effect.get("clearStun", False):
                     return self._finish_equipment_intent(
                         player, intent_seq, False, "equipment_no_effect")
@@ -11424,7 +11727,7 @@ class BattleState:
                     "canonical player equipment commit diverged")
             if payload is not None:
                 self._commit_player_critical_progress(
-                    player, _critical_payload(payload))
+                    player, payload)
             if effect.get("clearStun", False):
                 if not self._clear_vehicle_stun(("player", player_id)):
                     raise RuntimeError("canonical medkit stun clear diverged")
@@ -11714,6 +12017,11 @@ class BattleState:
         # team -> the enemies that team can currently see, so a vehicle that
         # goes dark and reappears is a new detection for whoever finds it.
         self.team_visible_targets = {1: set(), 2: set()}
+        # team -> enemy -> server monotonic deadline for the worker's spot
+        # lease. A target stays detected for as long as its lease holds, so
+        # neither a blocked line of sight nor a budgeted-out visibility probe
+        # can turn one continuous contact into a second detection.
+        self.team_lit_targets = {1: {}, 2: {}}
         # every vehicle any enemy ever directly detected.
         self.ever_spotted_targets = set()
         # actor -> damage it dealt to its own team.
@@ -11764,11 +12072,15 @@ class BattleState:
 
         A vehicle is detected when it becomes visible to a team that could
         not see it a moment ago; every direct observer on that team that saw
-        it at that instant detected it.  The statistic counts distinct
-        enemies, so re-acquiring a target the observer already revealed adds
-        nothing, while an enemy that goes dark and is revealed again credits
-        whoever found it that time.  This is the ``spotted`` column the
-        results screen shows and the count Patrol Duty (``scout``) reads.
+        it at that instant detected it.  A team keeps seeing a target for
+        as long as the worker's spot lease lights it, so a broken line of
+        sight or a budgeted-out visibility probe is not a second detection.
+        The statistic counts distinct enemies, so re-acquiring a target the
+        observer already revealed adds nothing, while an enemy whose lease
+        expired and is found again credits whoever finds it that time.  This
+        is the ``spotted`` column the results screen shows and the count
+        Scout (``scout``) reads, and ``_publish_detection`` gives a human
+        observer's client the in-battle ribbon for the same decision.
         """
         observers = [(("bot", int(bot_id)), spotted)
                      for bot_id, spotted in self.bot_spotted.items()]
@@ -11796,7 +12108,28 @@ class BattleState:
                     interaction["spotted"] = 1
                     row = self._statistics_row(*reporter)
                     row["spotted"] = int(row.get("spotted", 0)) + 1
-            self.team_visible_targets[team] = set(visible)
+                    self._publish_detection(reporter, target)
+            self.team_visible_targets[team] = set(visible) | set(
+                self.team_lit_targets.get(team, ()))
+
+    def _publish_detection(self, observer, target):
+        """Tell a human observer's client about the detection it just earned.
+
+        #1513 draws the in-battle spotting ribbon from the same detection the
+        results column counts, so the authority that owns the statistic owns
+        the ribbon.  A visible client cannot decide this for itself: it knows
+        only its own line of sight and the team's merged spot lease, never
+        whether its own sighting is what revealed the enemy.  A Bot has no
+        ribbon to draw, so only a human observer is published.
+        """
+        if observer[0] != "player":
+            return False
+        self.pending_events.append({
+            "kind": "detection",
+            "observer_kind": "player", "observer_id": int(observer[1]),
+            "target_kind": str(target[0]), "target_id": int(target[1]),
+        })
+        return True
 
     def _direct_spotters(self, target):
         """Return every enemy observer that directly sees ``target``.
@@ -12039,14 +12372,36 @@ class BattleState:
                 0 if value.get("target_kind") == "player" else 1,
                 int(value.get("target_id", 0))))]
 
+    def _spots_target(self, actor, target):
+        """Return whether one live observer currently sees this target."""
+        actor = (str(actor[0]), int(actor[1]))
+        target = (str(target[0]), int(target[1]))
+        if actor[0] == "player":
+            player = self.players.get(actor[1])
+            return bool(player is not None and player.connected and
+                        player.alive and
+                        target in self.player_spotted.get(actor[1], ()))
+        bot = self.bot_states.get(actor[1])
+        return bool(bot is not None and bot.get("alive") and
+                    target in self.bot_spotted.get(actor[1], ()))
+
     def _radio_assisters(self, attacker, target, target_team):
-        """Return live direct observers whose set contains this target."""
+        """Return the live observers one spotting assist is divided between.
+
+        Wargaming pays a spotting assist for damage done to a target the
+        observer is spotting "by team members who are not spotting them
+        themselves", divided "by the number of team members spotting the
+        target".  An attacker that sees its own target therefore earns
+        nobody an assist instead of merely being skipped, which is the rule
+        the Patrol Duty ledger in ``_record_damage`` already applies.
+        """
+        if self._spots_target(attacker, target):
+            return []
         result = []
         for reporter_id in sorted(self.player_spotted):
             reporter = self.players.get(reporter_id)
             if (reporter is None or not reporter.connected or
                     not reporter.alive or reporter.team == target_team or
-                    ("player", reporter_id) == attacker or
                     target not in self.player_spotted[reporter_id]):
                 continue
             result.append(("player", reporter_id))
@@ -12055,7 +12410,6 @@ class BattleState:
             reporter = ("bot", int(bot_id))
             if (bot is None or not bot.get("alive") or
                     int(bot.get("team", 0)) == target_team or
-                    reporter == attacker or
                     target not in self.bot_spotted[bot_id]):
                 continue
             result.append(reporter)
@@ -12123,26 +12477,32 @@ class BattleState:
         if (holder is not None and holder != attacker and
                 self._vehicle_team(*holder) != target_team and
                 _destroyed_tracks(target_critical)):
-            credits.append(("track", holder))
+            credits.append(("track", holder, damage))
         holder = self._active_stun_assister(target)
         if (holder is not None and holder != attacker and
                 self._vehicle_team(*holder) != target_team):
-            credits.append(("stun", holder))
+            credits.append(("stun", holder, damage))
+        # A track or a stun has one owner, but a spotting assist is shared by
+        # every observer lighting the target, so each of them is paid its
+        # share of this damage rather than the whole of it.
+        assisters = self._radio_assisters(attacker, target, target_team)
         credits.extend(
-            ("radio", assister) for assister in
-            self._radio_assisters(attacker, target, target_team))
-        for category, assister in credits:
+            ("radio", assister, share) for assister, share in
+            zip(assisters, _even_shares(damage, len(assisters))))
+        for category, assister, amount in credits:
+            if amount <= 0:
+                continue
             self._statistics_row(*assister)[
-                "damage_assisted_%s" % category] += damage
+                "damage_assisted_%s" % category] += amount
             self._increment_interaction(
-                assister, target, "assist_%s" % category, damage)
+                assister, target, "assist_%s" % category, amount)
             self.pending_events.append({
                 "kind": "assist",
                 "category": category,
                 "assister_kind": assister[0], "assister_id": assister[1],
                 "attacker_kind": attacker[0], "attacker_id": attacker[1],
                 "target_kind": target[0], "target_id": target[1],
-                "damage": damage,
+                "damage": amount,
             })
 
     def _frozen_player_participant(self, player_id):
@@ -13124,6 +13484,7 @@ class BattleState:
                 "projectile_revision": self.projectile_revision,
                 "projectiles": self._projectile_snapshot(),
                 "human_ram_probes": self._human_ram_probe_snapshot(),
+                "detached_turrets": self._detached_turret_snapshot(),
             })
             snapshot.update(self._authority_fields())
             # Freeze one exact wire image while holding the state lock. Bot,
@@ -13175,11 +13536,21 @@ class BattleState:
             # loss, or epoch change cannot invalidate this batch between
             # extraction and delivery; the reliable outbox fences its snapshot.
             if events_message is not None:
+                # The client accepts at most 256 events per envelope. A full
+                # human roster can earn 450 detections in one observation,
+                # so preserve every cause across ordered same-tick batches.
+                event_batches = [events_message]
+                if len(events) > 256:
+                    event_batches = [
+                        dict(events_message, events=events[offset:offset + 256])
+                        for offset in range(0, len(events), 256)]
                 for endpoint in recipients:
                     if id(endpoint) in failed_receipt_recipient_ids:
                         continue
-                    if not endpoint.offer_reliable(events_message):
-                        failed_event_recipients.append(endpoint)
+                    for event_batch in event_batches:
+                        if not endpoint.offer_reliable(event_batch):
+                            failed_event_recipients.append(endpoint)
+                            break
             snapshot_round_id = self.round_id
             snapshot_tick = self.tick
             snapshot_state_revision = self.state_revision
@@ -13304,6 +13675,10 @@ class BattleState:
             "team": player.team,
             "slot": player.slot,
             "requested_team": BattleState._requested_team_for_player(player),
+            # #1513 decals the gun barrel from publicInfo['marksOnGun'] on
+            # every roster row, so this rides even the lean rows that drop
+            # the much larger outfit and effective-parameter blocks.
+            "marks_on_gun": int(player.marks_on_gun),
             "participating": bool(player.participating),
             "world_pose": player.client_position,
             "spawn_x": (BattleState._spawn_x_for(player.slot)
@@ -13553,6 +13928,7 @@ class BattleState:
                     "bot_tier_mode": self.bot_tier_mode,
                     "bot_skill_mode": self.bot_skill_mode,
                     "bot_lineup": list(self.bot_lineup),
+                    "bot_excluded_vehicles": list(self.bot_excluded_vehicles),
                     "bot_authority_id": self.bot_authority_id,
                     "authority_epoch": self.authority_epoch,
                     "server_time_ms": self._server_time_ms(),
@@ -13563,6 +13939,7 @@ class BattleState:
                     "battle_result": self.battle_result,
                     "destructible_revision": self.destructible_revision,
                     "destructibles": list(self.destructibles.values()),
+                    "detached_turrets": self._detached_turret_snapshot(),
                 })
                 outgoing.update(self._authority_fields())
             else:
@@ -14072,6 +14449,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     "invalid_account_key": "invalid offline account identity",
                     "duplicate_account_key": "offline account identity is already connected",
                     "invalid_outfits": "invalid vehicle customization data",
+                    "invalid_marks_on_gun": "invalid gun mark count",
                     "invalid_max_health": "invalid vehicle maximum health",
                     "invalid_effective_params":
                         "invalid effective vehicle parameters",
@@ -14546,7 +14924,7 @@ def run_server(host, port, map_name, max_players,
                team1_size=None, team2_size=None,
                bot_tier_mode="random", bot_lineup=None,
                bot_skill_mode=None,
-               vehicle_overlay_root=None):
+               vehicle_overlay_root=None, bot_excluded_vehicles=None):
     if receipt_state_path is None:
         receipt_state_path = _default_result_receipt_state_path(port)
     state = BattleState(map_name=map_name, max_players=max_players,
@@ -14555,7 +14933,8 @@ def run_server(host, port, map_name, max_players,
                         team1_size=team1_size, team2_size=team2_size,
                         bot_tier_mode=bot_tier_mode,
                         bot_lineup=bot_lineup,
-                        bot_skill_mode=bot_skill_mode)
+                        bot_skill_mode=bot_skill_mode,
+                        bot_excluded_vehicles=bot_excluded_vehicles)
     if vehicle_overlay_root:
         try:
             overlay = VehicleOverlayStore(vehicle_overlay_root)

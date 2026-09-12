@@ -88,9 +88,103 @@ def _snapshot_with_members(members):
 
 
 class EffectiveParamsContractTests(unittest.TestCase):
+    def test_small_medkit_intent_restores_only_selected_crew_and_spends_once(self):
+        from gui.mods.offline_lan_0922 import equipment_mechanics
+        member = effective_params()['crew']['members'][0]
+        params = _snapshot_with_members([
+            dict(member, instance='commander', roles=['commander']),
+            dict(member, instance='driver', roles=['driver'])])
+        params['critical']['activation_targets'] = [
+            {'index': 7, 'name': 'commander'}, {'index': 2, 'name': 'driver'}]
+        params['equipment'] = [equipment_mechanics.project_equipment(
+            types.SimpleNamespace(
+                name='medkit', id=(15, 2), compactDescr=763,
+                cooldownSeconds=90.0, reuseCount=1, repairAll=False))]
+        state = BattleState()
+        player, error = state.add_player(
+            _Connection(), ('127.0.0.1', 2000), _hello(params))
+        self.assertIsNone(error)
+        self.assertTrue(state._install_player_equipments(player))
+        state.phase = 'battle'
+        state.tick = 10000
+        player.participating = True
+        player.critical['crew_ko'] = ['commander', 'driver']
+        equipment = player.equipment_states[0]
+        before_uses = equipment.uses_left
+        before_revision = player.equipment_revision
+        intent = {
+            'type': 'equipment_intent', 'round_id': state.round_id,
+            'intent_seq': 1, 'equipment_id': 2,
+            'activation_code': (7 << 16) | 2,
+            'selected': 'commander', 'requested_active': None,
+        }
+
+        with mock.patch.dict(sys.modules, {'BigWorld': None}):
+            self.assertTrue(state.submit_equipment_intent(player.player_id, intent))
+            self.assertTrue(state.submit_equipment_intent(player.player_id, intent))
+
+        self.assertEqual({'intent_seq': 1, 'accepted': True, 'reason': ''},
+                         player.equipment_intent_result)
+        self.assertEqual(['driver'], player.critical['crew_ko'])
+        self.assertEqual(before_uses - 1, equipment.uses_left)
+        self.assertEqual(before_revision + 1, player.equipment_revision)
+        self.assertEqual({'763': 1}, state._statistics_row(
+            'player', player.player_id)['equipment_used'])
+
+    def test_equipment_resolution_failure_finishes_without_spending_the_kit(self):
+        import lan_battle_server as server
+        from gui.mods.offline_lan_0922 import equipment_mechanics
+        equipment = equipment_mechanics.project_equipment(types.SimpleNamespace(
+            name='handExtinguishers', id=(15, 0), compactDescr=251,
+            cooldownSeconds=90.0, reuseCount=1))
+        params = effective_params()
+        params['equipment'] = [equipment]
+        state = BattleState()
+        player, error = state.add_player(
+            _Connection(), ('127.0.0.1', 2000), _hello(params))
+        self.assertIsNone(error)
+        self.assertTrue(state._install_player_equipments(player))
+        state.phase = 'battle'
+        state.tick = 10000
+        player.participating = True
+        player.critical['fire'] = True
+        intent = {
+            'type': 'equipment_intent', 'round_id': state.round_id,
+            'intent_seq': 1, 'equipment_id': 0, 'activation_code': 65536,
+            'selected': None, 'requested_active': None,
+        }
+        before_critical = copy.deepcopy(player.critical)
+        before_equipment = copy.deepcopy(player.equipment_states[0].snapshot(0.0))
+        before_revision = player.equipment_revision
+        with mock.patch.object(server.player_critical_mechanics,
+                               'apply_equipment',
+                               side_effect=ImportError('No module named BigWorld')) \
+                as resolve, mock.patch.object(server, '_server_log') as log:
+            self.assertTrue(state.submit_equipment_intent(player.player_id, intent))
+            self.assertEqual({
+                'intent_seq': 1, 'accepted': False,
+                'reason': 'equipment_failed'}, player.equipment_intent_result)
+            self.assertEqual(before_critical, player.critical)
+            self.assertEqual(before_equipment, player.equipment_states[0].snapshot(0.0))
+            self.assertEqual(before_revision, player.equipment_revision)
+            self.assertEqual({}, state._statistics_row(
+                'player', player.player_id)['equipment_used'])
+            self.assertTrue(state.submit_equipment_intent(player.player_id, intent))
+            resolve.assert_called_once()
+            self.assertIn('BigWorld', log.call_args[0][0])
+
+        # A failed operation is terminal; a new valid trigger can still use
+        # the unspent kit once the resolver is available again.
+        self.assertTrue(state.submit_equipment_intent(
+            player.player_id, dict(intent, intent_seq=2)))
+        self.assertTrue(player.equipment_intent_result['accepted'])
+        self.assertEqual(2, player.equipment_intent_result['intent_seq'])
+        self.assertFalse(player.critical['fire'])
+        self.assertEqual(before_revision + 1, player.equipment_revision)
+
     def test_zero_id_manual_extinguisher_joins_and_extinguishes_once(self):
         from gui.mods.offline_lan_0922 import equipment_mechanics
-        # Exact #1513 handExtinguishers: local ID 0, packed equipment ID 251.
+        # #1513 handExtinguishers: ID 0, compact 251, HUD activation 65536.
         equipment = equipment_mechanics.project_equipment(types.SimpleNamespace(
             name='handExtinguishers', id=(15, 0), compactDescr=251,
             cooldownSeconds=90.0, reuseCount=1))
@@ -121,18 +215,89 @@ class EffectiveParamsContractTests(unittest.TestCase):
         client.round_id = state.round_id
         messages = []
         client._send = lambda message: messages.append(message) or True
-        self.assertEqual(1, client.send_equipment_intent(0, activation_code=0))
+        self.assertEqual(1, client.send_equipment_intent(
+            0, activation_code=65536))
         self.assertTrue(state.submit_equipment_intent(player.player_id, messages[0]))
         self.assertTrue(player.equipment_intent_result['accepted'])
         self.assertFalse(player.critical['fire'])
+        mounted = player.equipment_states[0]
+        after_use = mounted.snapshot(player.equipment_clock)
+        self.assertEqual(1, after_use['usesLeft'])
+        self.assertEqual(90.0, after_use['cooldownTimeLeft'])
+        self.assertEqual({'251': 1}, state._statistics_row(
+            'player', player.player_id)['equipment_used'])
         revision = player.equipment_revision
         self.assertTrue(state.submit_equipment_intent(player.player_id, messages[0]))
         self.assertEqual(revision, player.equipment_revision)
+        self.assertEqual(after_use, mounted.snapshot(player.equipment_clock))
+        player.critical['fire'] = True
+        self.assertEqual(2, client.send_equipment_intent(
+            0, activation_code=65536))
+        self.assertTrue(state.submit_equipment_intent(player.player_id, messages[1]))
+        self.assertEqual({
+            'intent_seq': 2, 'accepted': False,
+            'reason': 'equipment_ineligible'}, player.equipment_intent_result)
+        self.assertTrue(player.critical['fire'])
+        self.assertEqual(revision, player.equipment_revision)
+        self.assertEqual(after_use, mounted.snapshot(player.equipment_clock))
         for invalid in (-1, False, 65536):
             self.assertIsNone(client.send_equipment_intent(
-                invalid, activation_code=0))
-            forged = dict(messages[0], equipment_id=invalid, intent_seq=2)
+                invalid, activation_code=65536))
+            forged = dict(messages[0], equipment_id=invalid, intent_seq=3)
             self.assertFalse(state.submit_equipment_intent(player.player_id, forged))
+
+    def test_extinguisher_activation_rejects_invalid_codes_targets_and_modes(self):
+        from gui.mods.offline_lan_0922 import equipment_mechanics
+        for automatic, equipment_id, compact_descr, name in (
+                (False, 0, 251, 'handExtinguishers'),
+                (True, 1, 507, 'autoExtinguishers')):
+            params = effective_params()
+            params['equipment'] = [equipment_mechanics.project_equipment(
+                types.SimpleNamespace(
+                    name=name, id=(15, equipment_id),
+                    compactDescr=compact_descr, autoactivate=automatic,
+                    cooldownSeconds=90.0, reuseCount=1))]
+            state = BattleState()
+            player, error = state.add_player(
+                _Connection(), ('127.0.0.1', 2000), _hello(params))
+            self.assertIsNone(error)
+            self.assertTrue(state._install_player_equipments(player))
+            state.phase = 'battle'
+            state.tick = 10000
+            player.participating = True
+            player.critical['fire'] = True
+            mounted = player.equipment_states[0]
+            before = mounted.snapshot(0.0)
+            revision = player.equipment_revision
+            cases = [
+                (0, None, None, 'invalid_activation_code'),
+                (2, None, None, 'invalid_activation_code'),
+                (32767, None, None, 'invalid_activation_code'),
+                (1, 'engineHealth', None, 'invalid_equipment_target'),
+                (1, None, True, 'invalid_activation_mode'),
+            ]
+            if automatic:
+                cases.append((1, None, None, 'automatic_only'))
+            for sequence, (high_word, selected, active, reason) in enumerate(
+                    cases, 1):
+                with self.subTest(automatic=automatic, sequence=sequence):
+                    intent = {
+                        'type': 'equipment_intent', 'round_id': state.round_id,
+                        'intent_seq': sequence, 'equipment_id': equipment_id,
+                        'activation_code': (high_word << 16) | equipment_id,
+                        'selected': selected, 'requested_active': active,
+                    }
+                    self.assertTrue(state.submit_equipment_intent(
+                        player.player_id, intent))
+                    self.assertEqual({
+                        'intent_seq': sequence, 'accepted': False,
+                        'reason': reason}, player.equipment_intent_result)
+                    self.assertTrue(player.critical['fire'])
+                    self.assertEqual(revision, player.equipment_revision)
+                    self.assertEqual(
+                        before, mounted.snapshot(player.equipment_clock))
+                    self.assertEqual({}, state._statistics_row(
+                        'player', player.player_id)['equipment_used'])
 
     def test_dynamic_spotting_ratios_use_native_factor_pairs(self):
         healthy = {
@@ -451,6 +616,26 @@ class EffectiveParamsContractTests(unittest.TestCase):
         over_limit['critical']['devices'][0]['max_hp'] = \
             contract.MAX_CRITICAL_DEVICE_HP + 1.0
         self.assertIsNone(contract.canonical(over_limit))
+
+    def test_2000_module_damage_survives_snapshot_and_launch_for_every_shell_kind(self):
+        from gui.mods.offline_lan_0922.lan_client import _strict_projectile_source_shot
+        for kind in ('ARMOR_PIERCING', 'ARMOR_PIERCING_CR', 'HOLLOW_CHARGE',
+                     'ARMOR_PIERCING_HE', 'HIGH_EXPLOSIVE'):
+            with self.subTest(kind=kind):
+                source = effective_params()
+                shell = source['gun']['shots'][0]['source_shot']['shell']
+                shell['kind'] = kind
+                shell['damage'][1] = 2000.0
+                canonical = contract.canonical(source)
+                self.assertIsNotNone(canonical)
+                frozen = _strict_projectile_source_shot(
+                    canonical['gun']['shots'][0]['source_shot'])
+                self.assertIsNotNone(frozen)
+                self.assertEqual(2000.0, frozen['shell']['damage'][1])
+                # A subsequent editor/shell selection change cannot rebind
+                # the law already admitted for this projectile.
+                shell['damage'][1] = 1.0
+                self.assertEqual(2000.0, frozen['shell']['damage'][1])
 
     def test_snapshot_preserves_complete_he_shell_factors(self):
         source = effective_params()

@@ -24,10 +24,17 @@ try:
 except ImportError:
     import core
 
+try:
+    from . import report_environment
+except ImportError:
+    import report_environment
+
 
 SESSION_SCHEMA = 1
 SESSION_STATE_FILENAME = "latest-error-report-session.json"
 REPORTS_DIRECTORY_NAME = "reports"
+REPORT_RETENTION_COUNT = 3
+_REPORT_NAME = re.compile(r"^wot-error-report-[0-9]{8}-[0-9]{6}-[0-9a-f]{12}\.zip$")
 SESSION_LOGS_DIRECTORY_NAME = "session-logs"
 SESSION_DUMPS_DIRECTORY_NAME = "session-dumps"
 SERVER_SESSION_ENV = "WOT_OFFLINE_REPORT_SESSION"
@@ -70,6 +77,21 @@ _DUMP_FILENAMES = {
     ROLE_VISIBLE_CLIENT: "visible-client.dmp",
     ROLE_HIDDEN_WORKER: "hidden-worker.dmp",
 }
+# The native sidecar appends one record per recorded first-chance fault. It
+# shares the session dump folder but is not a dump: it survives abort(), and
+# it is the only evidence when the faulting thread has already gone.
+_TRAIL_FILENAMES = {
+    ROLE_VISIBLE_CLIENT: "visible-client.exceptions.txt",
+    ROLE_HIDDEN_WORKER: "hidden-worker.exceptions.txt",
+}
+# BigWorld writes its own crash banner onto the faulting thread's stack. It is
+# read out of each dump as that dump is copied, so the sentence survives even
+# when the player does not upload a multi-hundred-MB dump.
+_CRASH_TEXT_FILENAMES = {
+    ROLE_VISIBLE_CLIENT: "visible-client.crash-text.txt",
+    ROLE_HIDDEN_WORKER: "hidden-worker.crash-text.txt",
+}
+TRAIL_MAX_BYTES = 1024 * 1024
 _SESSION_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 _CHUNK_BYTES = 64 * 1024
 LOG_MAX_BYTES = 16 * 1024 * 1024
@@ -636,6 +658,55 @@ def _open_valid_source(session, role, source):
         return None
 
 
+def session_trail_path(session, role):
+    """Return where one role records the faults #1513's reporter consumes."""
+    roles = _normalize_dump_roles((role,))
+    directory, _paths = _recorded_dump_layout(session)
+    _safe_dump_directory(directory, create=True)
+    return os.path.join(directory, _TRAIL_FILENAMES[roles[0]])
+
+
+def _open_recorded_trail(session, role):
+    """Open one fixed native exception trail inside this session's folder."""
+    layout = _recorded_dump_layout(session, required=False)
+    if layout is None or role not in DUMP_ROLES:
+        return None
+    directory, _paths = layout
+    try:
+        if not _safe_dump_directory(directory, create=False):
+            return None
+    except core.LauncherError:
+        return None
+    path = os.path.join(directory, _TRAIL_FILENAMES[role])
+    try:
+        path_stat = os.lstat(path)
+        if (_is_reparse_point(path_stat) or
+                stat.S_ISLNK(path_stat.st_mode) or
+                not stat.S_ISREG(path_stat.st_mode)):
+            return None
+        stream = open(path, "rb")
+    except (IOError, OSError):
+        return None
+    try:
+        value = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(value.st_mode) or
+                not _same_identity(
+                    _file_identity(path_stat), _file_identity(value))):
+            stream.close()
+            return None
+        size = int(value.st_size)
+        if size <= 0:
+            stream.close()
+            return None
+        # Keep the tail: the fault that ended the process is the last record.
+        length = min(size, TRAIL_MAX_BYTES)
+        stream.seek(size - length)
+        return stream, length
+    except Exception:
+        stream.close()
+        return None
+
+
 def _open_recorded_dump(session, role):
     """Open one fixed launcher-owned dump without selecting it for a ZIP."""
     layout = _recorded_dump_layout(session, required=False)
@@ -833,7 +904,7 @@ def _open_valid_dump(session, role):
     return _open_recorded_dump(session, role)
 
 
-def _write_slice(archive, archive_name, stream, length):
+def _write_slice(archive, archive_name, stream, length, observer=None):
     remaining = int(length)
     # Streamed members have no size in their initial header. Archive-level
     # allowZip64 alone cannot expand that header after a large dump is copied.
@@ -843,7 +914,45 @@ def _write_slice(archive, archive_name, stream, length):
             if not payload:
                 raise IOError("A diagnostic log changed while it was copied.")
             target.write(payload)
+            if observer is not None:
+                observer.feed(payload)
             remaining -= len(payload)
+
+
+def _write_text(archive, archive_name, text):
+    """Add one generated text member. Diagnostics never fail a report."""
+    try:
+        payload = text.encode("utf-8", "replace")
+    except Exception:
+        return None
+    with archive.open(archive_name, "w") as target:
+        target.write(payload)
+    return archive_name
+
+
+def _describe_environment(session, game_root):
+    """Return the generated members, each already reduced to text.
+
+    Every section is best effort and reports its own failure inline: a report
+    that cannot be written is worse than a report missing one section.
+    """
+    sections = (
+        ("environment.txt", report_environment.environment_report),
+        ("installed-mods.txt", report_environment.installed_mods_report),
+        ("missing-dependencies.txt",
+         report_environment.missing_dependencies_report),
+    )
+    generated = []
+    for archive_name, builder in sections:
+        try:
+            if builder is report_environment.environment_report:
+                text = builder(game_root, session)
+            else:
+                text = builder(game_root)
+        except Exception as error:
+            text = "%s could not be collected: %s\n" % (archive_name, error)
+        generated.append((archive_name, text))
+    return generated
 
 
 def _prepare_reports_directory():
@@ -860,6 +969,37 @@ def _prepare_reports_directory():
         raise core.LauncherError(
             "The error report folder is not a regular directory.")
     return directory
+
+
+def cleanup_reports():
+    """Keep the newest three completed launcher reports, without UI consent."""
+    try:
+        directory = _prepare_reports_directory()
+        candidates = []
+        for name in os.listdir(directory):
+            if not _REPORT_NAME.fullmatch(name):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                value = os.lstat(path)
+                if (_is_reparse_point(value) or stat.S_ISLNK(value.st_mode) or
+                        not stat.S_ISREG(value.st_mode) or value.st_size == 0):
+                    continue
+                candidates.append((value.st_mtime_ns, name, path))
+            except OSError:
+                continue
+        candidates.sort(reverse=True)
+        removed = []
+        for unused_time, unused_name, path in candidates[REPORT_RETENTION_COUNT:]:
+            try:
+                if delete_report(path):
+                    removed.append(path)
+            except core.LauncherError:
+                # A locked file must not prevent later cleanup or game startup.
+                continue
+        return tuple(removed)
+    except (OSError, core.LauncherError):
+        return ()
 
 
 def _publish_report(temporary, report_path):
@@ -895,6 +1035,7 @@ def create_report(now=None):
     temporary = report_path + ".tmp-" + uuid.uuid4().hex
     included_roles = []
     included_files = []
+    collected = []
     try:
         with zipfile.ZipFile(
                 temporary, "w", compression=zipfile.ZIP_DEFLATED,
@@ -915,21 +1056,54 @@ def create_report(now=None):
                 included_roles.append(role)
                 included_files.append(archive_name)
             for role in DUMP_ROLES:
-                opened = _open_valid_dump(session, role)
+                opened = _open_recorded_trail(session, role)
                 if opened is None:
                     continue
                 stream, length = opened
                 try:
-                    archive_name = _DUMP_FILENAMES[role]
+                    archive_name = _TRAIL_FILENAMES[role]
                     _write_slice(archive, archive_name, stream, length)
                 finally:
                     stream.close()
                 included_files.append(archive_name)
-        if not included_files:
+            for role in DUMP_ROLES:
+                opened = _open_valid_dump(session, role)
+                if opened is None:
+                    continue
+                stream, length = opened
+                scanner = report_environment.CrashTextScanner()
+                try:
+                    archive_name = _DUMP_FILENAMES[role]
+                    _write_slice(archive, archive_name, stream, length,
+                                 observer=scanner)
+                finally:
+                    stream.close()
+                included_files.append(archive_name)
+                banner = scanner.result()
+                if banner:
+                    written = _write_text(
+                        archive, _CRASH_TEXT_FILENAMES[role],
+                        banner + "\n")
+                    if written:
+                        included_files.append(written)
+            # A report is worth sending only when the session actually
+            # produced something; generated sections describe the machine and
+            # must not, on their own, make an empty session look collectable.
+            collected = list(included_files)
+            # Generated last so that a failure inside them cannot cost the
+            # logs and dumps that are already in the archive.
+            if collected:
+                for archive_name, text in _describe_environment(
+                        session, session.get("gameRoot")):
+                    written = _write_text(archive, archive_name, text)
+                    if written:
+                        included_files.append(written)
+        if not collected:
             raise core.LauncherError(
                 "The latest game session has not produced any diagnostic "
                 "logs yet. No earlier session was included.")
         _publish_report(temporary, report_path)
+        cleanup_reports()
     except Exception:
         try:
             os.unlink(temporary)

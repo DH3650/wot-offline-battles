@@ -34,11 +34,16 @@
 #define PLAYER_MODE L"--player"
 #define PAIRED_PLAYER_MODE L"--paired-player"
 #define WORKER_ONLY_MODE L"--worker-only"
+/* Kept at 60 s deliberately.  launcher/core.py waits
+ * WORKER_STARTER_READY_TIMEOUT_SECONDS_0922 plus a margin, so this side
+ * always reaches its own log_failure("wait_for_worker_ready") first and the
+ * report says why the worker never became ready. */
 #define WORKER_READY_TIMEOUT_MS 60000
 #define WORKER_READY_POLL_MS 50
 #define PLAYER_HANDOFF_GRACE_MS 10000
 #define PLAYER_HANDOFF_POLL_MS 100
 #define MAX_GAME_PROCESS_IDS 32
+#define BW_RES_PATH_ENV L"BW_RES_PATH"
 #define PROCDUMP_PATH_ENV L"WOT_OFFLINE_PROCDUMP_PATH"
 #define CRASH_DUMP_PATH_ENV L"WOT_OFFLINE_CRASH_DUMP_PATH"
 #define CRASH_DUMP_MODE_ENV L"WOT_OFFLINE_CRASH_DUMP_MODE"
@@ -1130,6 +1135,8 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 	SetEnvironmentVariableW(HIDDEN_DESKTOP_ENV, 0);
 	SetEnvironmentVariableW(WORKER_READY_MARKER_ENV, 0);
 	SetEnvironmentVariableW(WORKER_INTERNAL_READY_MARKER_ENV, 0);
+	/* The visible client keeps the player's own mods. */
+	SetEnvironmentVariableW(BW_RES_PATH_ENV, 0);
 	if (FAILED(StringCchPrintfW(child_command, 2 * MAX_PATH,
 			L"\"%s\" --config engine_config.offline-player.xml "
 			L"--logFilePrefix offline-player-", game_path))) {
@@ -1438,6 +1445,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 		goto worker_cleanup;
 	}
 
+	/* Use the client's paths.xml, including its installed mods. */
+	SetEnvironmentVariableW(BW_RES_PATH_ENV, 0);
 	if (FAILED(StringCchPrintfW(child_command, 2 * MAX_PATH,
 			L"\"%s\" --config engine_config.offline-worker.xml "
 			L"--logFilePrefix offline-worker-", game_path))) {
@@ -1598,6 +1607,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 
 
 worker_cleanup:
+	SetEnvironmentVariableW(BW_RES_PATH_ENV, 0);
 	SetEnvironmentVariableW(SERVER_HOST_ENV, 0);
 	SetEnvironmentVariableW(SERVER_PORT_ENV, 0);
 	SetEnvironmentVariableW(WORKER_READY_MARKER_ENV, 0);

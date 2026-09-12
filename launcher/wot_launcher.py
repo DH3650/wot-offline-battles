@@ -43,10 +43,14 @@ _SHOP_HELP = (
     "next game startup. Owned or queued vehicles cannot be added twice. "
     "Close the game before adding vehicles.")
 
-LAUNCHER_VERSION = "0.7.0"
+LAUNCHER_VERSION = "0.7.7"
 WINDOW_TITLE = "World of Tanks Offline Battles %s" % LAUNCHER_VERSION
 
 _CHINESE = {
+    core.worker_startup_exit_hint(0xc0000135):
+        "0xC0000135：无法加载必需的 DLL。请检查游戏文件完整性，并安装 "
+        "DirectX 9 June 2010 运行库和 Visual C++ x86 运行库。"
+        "仅凭退出码无法确定具体缺失哪个 DLL。",
     "Language": "语言",
     "Game client": "游戏客户端",
     "Game folder": "游戏目录",
@@ -126,6 +130,28 @@ _CHINESE = {
     "New save...": "新建存档…",
     "Rename save...": "重命名存档…",
     "Delete save...": "删除存档…",
+    "Open save folder": "打开存档文件夹",
+    "Back up save...": "备份存档…",
+    "Restore save...": "恢复存档…",
+    "Back up save": "备份存档",
+    "Restore save": "恢复存档",
+    "Save backup": "存档备份",
+    "Restore save?": "恢复存档？",
+    "Replace the contents of save '%s' with the backup of '%s'? The files "
+    "being replaced are kept in a pre-restore folder inside the save.":
+        "确定把存档“%s”的内容替换成“%s”的备份吗？被替换的文件会保留在存档内的 "
+        "pre-restore 文件夹里。",
+    "another save": "其他存档",
+    "The save folder could not be opened: %s": "无法打开存档文件夹：%s",
+    "Opened the save folder: %s": "已打开存档文件夹：%s",
+    "The save could not be backed up: %s": "存档备份失败：%s",
+    "Backed up save '%s' to %s (%d file(s)).":
+        "已把存档“%s”备份到 %s（%d 个文件）。",
+    "The backup could not be read: %s": "无法读取备份文件：%s",
+    "The save could not be restored: %s": "存档恢复失败：%s",
+    "Restored %d file(s) into save '%s'.": "已恢复 %d 个文件到存档“%s”。",
+    "The files that were replaced were kept in %s.":
+        "被覆盖的文件已保留在 %s。",
     "New save": "新建存档",
     "Rename save": "重命名存档",
     "Save name:": "存档名称：",
@@ -137,7 +163,19 @@ _CHINESE = {
     "Edit this save's balances and battle earnings. Before the first "
     "game, these are its starting funds. Close the game before editing.":
         "设置此存档的余额和战斗收益。首次进入游戏前，这些数值就是初始资金；修改前请关闭游戏。",
-    "Apply balances": "应用余额",
+    "Balances saved, but the earnings multiplier could not be saved: %s":
+        "余额已保存，但收益倍数保存失败：%s",
+    "Save changes": "保存",
+    "Nation": "国家",
+    "Vehicle type": "类型",
+    "All": "全部",
+    "ussr": "苏联", "germany": "德国", "usa": "美国",
+    "france": "法国", "uk": "英国", "china": "中国",
+    "japan": "日本", "czech": "捷克", "sweden": "瑞典",
+    "poland": "波兰", "italy": "意大利",
+    "Light tank": "轻型坦克", "Medium tank": "中型坦克",
+    "Heavy tank": "重型坦克", "Tank destroyer": "坦克歼击车",
+    "SPG": "自行火炮",
     "Customize save...": "自定义存档…",
     "Customize save: %s": "自定义存档：%s",
     "Close": "关闭",
@@ -206,8 +244,10 @@ _CHINESE = {
     "results are removed permanently.":
         "确定删除存档“%s”吗？它的车库、乘员、账号设置和战斗记录将被永久删除。",
     "Each save keeps its own garage, crew, account settings and battle "
-    "results. The selected save is the one the game starts with.":
-        "每个存档有独立的车库、乘员、账号设置和战斗记录。启动游戏时使用当前选中的存档。",
+    "results. The selected save is the one the game starts with. Back up a "
+    "save to a ZIP file, or open its folder and copy the files out yourself.":
+        "每个存档有独立的车库、乘员、账号设置和战斗记录。启动游戏时使用当前选中的"
+        "存档。可以把存档备份成 ZIP 文件，也可以打开存档文件夹自行复制文件。",
     "Repair": "修复",
     "Repair startup (keep saved data)": "修复启动问题（保留存档）",
     "Normal client stuck loading? Clean preferences...":
@@ -249,6 +289,9 @@ _CHINESE = {
     "The latest diagnostic session boundary is unreadable.":
         "最近一局的日志边界无法读取；不会打包旧日志。",
     "Created error report: %s": "已创建错误报告：%s",
+    "Error report ready": "错误报告已生成",
+    "Please send this ZIP file to the author to report the problem:\n\n%s":
+        "请将下面的 ZIP 文件发送给作者，以便排查问题：\n\n%s",
     "Included files: %s": "已包含文件：%s",
     "Missing logs from this session: %s": "本局缺少日志：%s",
     "Not run in this session: %s": "本局未运行：%s",
@@ -283,6 +326,7 @@ FULL_CRASH_DUMPS_SETTING = "full_crash_dumps"
 PROCDUMP_CONSENT_SETTING = "procdump_download_consent"
 PROCDUMP_PATH_ENV = "WOT_OFFLINE_PROCDUMP_PATH"
 CRASH_DUMP_PATH_ENV = "WOT_OFFLINE_CRASH_DUMP_PATH"
+EXCEPTION_TRAIL_PATH_ENV = "WOT_OFFLINE_EXCEPTION_TRAIL_PATH"
 CRASH_DUMP_MODE_ENV = "WOT_OFFLINE_CRASH_DUMP_MODE"
 _LAUNCHER_LOG_LOCK = error_reports.LAUNCHER_LOG_LOCK
 
@@ -695,11 +739,27 @@ class LauncherWindow(object):
             save_actions, text="", command=self._delete_save_slot)
         self.delete_save_slot_button.pack(
             side="left", fill="x", expand=True, padx=(6, 0))
+        # A save is a few small JSON files, so the recovery a player can
+        # always perform is copying them out and putting them back.
+        save_backup_actions = tk.Frame(self.save_panel)
+        save_backup_actions.grid(
+            row=2, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.open_save_folder_button = tk.Button(
+            save_backup_actions, text="", command=self._open_save_folder)
+        self.open_save_folder_button.pack(side="left", fill="x", expand=True)
+        self.backup_save_button = tk.Button(
+            save_backup_actions, text="", command=self._backup_save_slot)
+        self.backup_save_button.pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        self.restore_save_button = tk.Button(
+            save_backup_actions, text="", command=self._restore_save_slot)
+        self.restore_save_button.pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
         self.save_help_label = tk.Label(
             self.save_panel, text="", anchor="w", justify="left",
             wraplength=620)
         self.save_help_label.grid(
-            row=2, column=0, columnspan=2, sticky="we", pady=(8, 0))
+            row=3, column=0, columnspan=2, sticky="we", pady=(8, 0))
         self.save_panel.grid_columnconfigure(1, weight=1)
 
         # Gold is the one currency an offline account can never earn, so the
@@ -725,20 +785,13 @@ class LauncherWindow(object):
             padx=(6, 0), pady=(0, 4))
         self.earnings_entry = tk.Entry(earnings_row, width=8)
         self.earnings_entry.pack(side="left")
-        self.apply_earnings_button = tk.Button(
-            earnings_row, text="", command=self._apply_earnings)
-        self.apply_earnings_button.pack(side="left", padx=(6, 0))
         account_actions = tk.Frame(self.account_panel)
         account_actions.grid(
             row=len(save_ledger.CURRENCIES) + 1, column=0, columnspan=2,
             sticky="we", pady=(6, 0))
-        self.apply_balances_button = tk.Button(
-            account_actions, text="", command=self._apply_balances)
-        self.apply_balances_button.pack(side="left", fill="x", expand=True)
-        self.reload_balances_button = tk.Button(
-            account_actions, text="", command=self._refresh_balances)
-        self.reload_balances_button.pack(
-            side="left", fill="x", expand=True, padx=(6, 0))
+        self.save_account_button = tk.Button(
+            account_actions, text="", command=self._apply_account)
+        self.save_account_button.pack(side="left", fill="x", expand=True)
         self.account_help_label = tk.Label(
             self.account_panel, text="", anchor="w", justify="left",
             wraplength=620)
@@ -752,29 +805,39 @@ class LauncherWindow(object):
         # This is the only place a player can reach them.
         self._gold_offers = []
         self._gold_offer_by_label = {}
+        self.gold_nation = tk.StringVar(value="")
+        self.gold_class = tk.StringVar(value="")
+        self.gold_nation_label = tk.Label(self.shop_panel, text="")
+        self.gold_nation_label.grid(row=0, column=0, sticky="w")
+        self.gold_nation_box = self._ttk.Combobox(
+            self.shop_panel, textvariable=self.gold_nation, state="readonly")
+        self.gold_nation_box.grid(row=0, column=1, sticky="we", padx=(6, 0))
+        self.gold_class_label = tk.Label(self.shop_panel, text="")
+        self.gold_class_label.grid(row=1, column=0, sticky="w", pady=(4, 4))
+        self.gold_class_box = self._ttk.Combobox(
+            self.shop_panel, textvariable=self.gold_class, state="readonly")
+        self.gold_class_box.grid(row=1, column=1, sticky="we", padx=(6, 0))
+        for box in (self.gold_nation_box, self.gold_class_box):
+            box.bind("<<ComboboxSelected>>", self._filter_gold_shop)
         self.gold_vehicle_label = tk.Label(self.shop_panel, text="")
-        self.gold_vehicle_label.grid(row=0, column=0, sticky="w")
+        self.gold_vehicle_label.grid(row=2, column=0, sticky="w")
         self.gold_vehicle = tk.StringVar(value="")
         self.gold_vehicle_box = self._ttk.Combobox(
             self.shop_panel, textvariable=self.gold_vehicle, values=(),
             state="readonly", width=48)
-        self.gold_vehicle_box.grid(row=0, column=1, sticky="we", padx=(6, 0))
+        self.gold_vehicle_box.grid(row=2, column=1, sticky="we", padx=(6, 0))
         self.gold_vehicle_box.bind("<<ComboboxSelected>>", self._update_vehicle_add_button)
         shop_actions = tk.Frame(self.shop_panel)
         shop_actions.grid(
-            row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+            row=3, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.buy_gold_vehicle_button = tk.Button(
             shop_actions, text="", command=self._buy_gold_vehicle)
         self.buy_gold_vehicle_button.pack(side="left", fill="x", expand=True)
-        self.refresh_gold_shop_button = tk.Button(
-            shop_actions, text="", command=self._refresh_gold_shop)
-        self.refresh_gold_shop_button.pack(
-            side="left", fill="x", expand=True, padx=(6, 0))
         self.shop_help_label = tk.Label(
             self.shop_panel, text="", anchor="w", justify="left",
             wraplength=620)
         self.shop_help_label.grid(
-            row=2, column=0, columnspan=2, sticky="we", pady=(8, 0))
+            row=4, column=0, columnspan=2, sticky="we", pady=(8, 0))
         self.shop_panel.grid_columnconfigure(1, weight=1)
 
         self._bot_lineup_store = bot_lineup_profiles.normalize_store(
@@ -930,24 +993,26 @@ class LauncherWindow(object):
         self.new_save_slot_button.config(text=self._t("New save..."))
         self.rename_save_slot_button.config(text=self._t("Rename save..."))
         self.delete_save_slot_button.config(text=self._t("Delete save..."))
+        self.open_save_folder_button.config(
+            text=self._t("Open save folder"))
+        self.backup_save_button.config(text=self._t("Back up save..."))
+        self.restore_save_button.config(text=self._t("Restore save..."))
         self.save_help_label.config(text=self._t(
             "Each save keeps its own garage, crew, account settings and "
             "battle results. The selected save is the one the game starts "
-            "with."))
+            "with. Back up a save to a ZIP file, or open its folder and copy "
+            "the files out yourself."))
         self.account_panel.config(text=self._t("Account"))
         for name, label in self.balance_labels.items():
             label.config(text=self._t(_BALANCE_LABELS[name]))
-        self.apply_balances_button.config(text=self._t("Apply balances"))
-        self.reload_balances_button.config(text=self._t("Reload"))
+        self.save_account_button.config(text=self._t("Save changes"))
         self.earnings_label.config(text=self._t("Earnings multiplier"))
-        self.apply_earnings_button.config(text=self._t("Apply"))
         self.account_help_label.config(text=self._t(
             "Edit this save's balances and battle earnings. Before the first "
             "game, these are its starting funds. Close the game before editing."))
         self.shop_panel.config(text=self._t("Garage vehicles"))
         self.gold_vehicle_label.config(text=self._t("Gold and reward vehicle"))
         self.buy_gold_vehicle_button.config(text=self._t("Add to garage"))
-        self.refresh_gold_shop_button.config(text=self._t("Reload"))
         self.shop_help_label.config(text=self._t(_SHOP_HELP))
         self._refresh_save_slots()
         self.tools_tabs.tab(
@@ -1288,7 +1353,7 @@ class LauncherWindow(object):
             else:
                 entry.config(state="disabled")
         state = "normal" if editable else "disabled"
-        self.apply_balances_button.config(state=state)
+        self.save_account_button.config(state=state)
         return editable
 
     def _selected_save_record(self):
@@ -1315,14 +1380,14 @@ class LauncherWindow(object):
         text = "%.2f" % (percent / 100.0)
         return text.rstrip("0").rstrip(".") or "0"
 
-    def _apply_earnings(self):
+    def _apply_account(self):
         if self._busy or self._maintenance_busy:
             self._log("Wait for the current launcher operation to finish.")
             return False
         raw = self.earnings_entry.get().strip().rstrip("xX\u00d7")
         try:
             percent = int(round(float(raw) * 100))
-        except ValueError:
+        except (ValueError, OverflowError):
             self._log("The earnings multiplier must be a number.")
             self._refresh_earnings()
             return False
@@ -1332,24 +1397,6 @@ class LauncherWindow(object):
                       % (self._earnings_text(save_slots.MIN_EARNINGS_PERCENT),
                          self._earnings_text(save_slots.MAX_EARNINGS_PERCENT)))
             self._refresh_earnings()
-            return False
-        game_root = self.game_root.get().strip()
-        try:
-            save_slots.set_earnings_percent(
-                self._save_slot_id, percent, game_root or None)
-        except save_slots.SaveSlotError as error:
-            self._log("The earnings multiplier could not be saved: %s" % error)
-            self._refresh_earnings()
-            return False
-        self._save_slot_records = save_slots.list_slots(game_root or None)
-        self._refresh_earnings()
-        self._log("Earnings multiplier saved: %sx"
-                  % self._earnings_text(percent))
-        return True
-
-    def _apply_balances(self):
-        if self._busy or self._maintenance_busy:
-            self._log("Wait for the current launcher operation to finish.")
             return False
         wanted = {}
         for name, entry in self.balance_entries.items():
@@ -1371,10 +1418,21 @@ class LauncherWindow(object):
             self._log("The balances could not be saved: %s" % error)
             self._refresh_balances()
             return False
-        self._refresh_balances()
+        try:
+            save_slots.set_earnings_percent(
+                self._save_slot_id, percent, game_root or None)
+        except save_slots.SaveSlotError as error:
+            self._refresh_save_slots()
+            self._log(self._t(
+                "Balances saved, but the earnings multiplier could not be saved: %s")
+                % error)
+            return False
+        self._refresh_save_slots()
         self._log("Balances saved: %s" % ", ".join(
             "%s %d" % (self._t(_BALANCE_LABELS[name]), balances[name])
             for name in save_ledger.CURRENCIES))
+        self._log("Earnings multiplier saved: %sx"
+                  % self._earnings_text(percent))
         return True
 
     def _gold_offer_label(self, offer):
@@ -1416,12 +1474,41 @@ class LauncherWindow(object):
                 self._log("The gold vehicles could not be listed: %s" % error)
             offers = []
         self._gold_offers = offers
+        self.gold_nation_label.config(text=self._t("Nation"))
+        self.gold_class_label.config(text=self._t("Vehicle type"))
+        self._gold_nation_by_label = {self._t("All"): None}
+        self._gold_nation_by_label.update(
+            (self._t(nation), nation)
+            for nation in sorted(set(row["nation"] for row in offers)))
+        self._gold_class_by_label = {self._t("All"): None}
+        self._gold_class_by_label.update(
+            (self._t(label), name)
+            for name, label in vehicle_editor_ui.VEHICLE_CLASS_LABELS)
+        for box, variable, choices in (
+                (self.gold_nation_box, self.gold_nation, self._gold_nation_by_label),
+                (self.gold_class_box, self.gold_class, self._gold_class_by_label)):
+            box.config(values=tuple(choices))
+            if variable.get() not in choices:
+                variable.set(self._t("All"))
+        self.shop_help_label.config(text=self._t(_SHOP_HELP))
+        return self._filter_gold_shop()
+
+    def _filter_gold_shop(self, unused_event=None):
+        selected = self._gold_offer_by_label.get(self.gold_vehicle.get())
+        nation = self._gold_nation_by_label.get(self.gold_nation.get())
+        vehicle_class = self._gold_class_by_label.get(self.gold_class.get())
         self._gold_offer_by_label = {}
         values = []
-        for offer in offers:
+        for offer in self._gold_offers:
+            if nation is not None and offer["nation"] != nation:
+                continue
+            if vehicle_class is not None and offer.get("vehicleClass") != vehicle_class:
+                continue
             label = self._gold_offer_label(offer)
             self._gold_offer_by_label[label] = offer["name"]
             values.append(label)
+            if offer["name"] == selected:
+                self.gold_vehicle.set(label)
         self.gold_vehicle_box.config(values=tuple(values))
         if self.gold_vehicle.get() not in self._gold_offer_by_label:
             self.gold_vehicle.set(values[0] if values else "")
@@ -1451,7 +1538,6 @@ class LauncherWindow(object):
                 vehicle_overlays.VehicleOverlayError) as error:
             self._log(self._t("The vehicle could not be added: %s") % error)
             return False
-        self._refresh_balances()
         self._refresh_gold_shop()
         self._log(
             self._t("Added %s to the queue. It arrives on the next game startup.")
@@ -1569,6 +1655,96 @@ class LauncherWindow(object):
         self._save_settings()
         self._log("Deleted save '%s'." % record["name"])
         return True
+
+    def _open_save_folder(self):
+        record = self._selected_save_slot_record()
+        if record is None:
+            self._log("Select a save before opening its folder.")
+            return False
+        game_root = self.game_root.get().strip()
+        try:
+            directory = save_slots.open_slot_folder(
+                record["id"], game_root or None)
+        except save_slots.SaveSlotError as error:
+            self._log(self._t("The save folder could not be opened: %s")
+                      % error)
+            return False
+        self._log(self._t("Opened the save folder: %s") % directory)
+        return True
+
+    def _backup_save_slot(self):
+        record = self._selected_save_slot_record()
+        if record is None:
+            self._log("Select a save before backing it up.")
+            return False
+        game_root = self.game_root.get().strip()
+        suggested = "wot-offline-save-%s-%s.zip" % (
+            record["id"], time.strftime("%Y%m%d-%H%M%S"))
+        chosen = self._filedialog.asksaveasfilename(
+            title=self._t("Back up save"), initialfile=suggested,
+            defaultextension=".zip",
+            filetypes=((self._t("Save backup"), "*.zip"),))
+        if not chosen:
+            self._log("Save backup was cancelled.")
+            return False
+        try:
+            result = save_slots.backup_slot(
+                record["id"], chosen, game_root or None)
+        except save_slots.SaveSlotError as error:
+            self._log(self._t("The save could not be backed up: %s") % error)
+            return False
+        self._log(self._t("Backed up save '%s' to %s (%d file(s)).") % (
+            record["name"], result["path"], len(result["files"])))
+        return True
+
+    def _restore_save_slot(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        record = self._selected_save_slot_record()
+        if record is None:
+            self._log("Select the save to restore into.")
+            return False
+        chosen = self._filedialog.askopenfilename(
+            title=self._t("Restore save"),
+            filetypes=((self._t("Save backup"), "*.zip"),))
+        if not chosen:
+            self._log("Save restore was cancelled.")
+            return False
+        game_root = self.game_root.get().strip()
+        try:
+            backup = save_slots.read_backup(chosen)
+        except save_slots.SaveSlotError as error:
+            self._log(self._t("The backup could not be read: %s") % error)
+            return False
+        if not self._confirm_restore_save_slot(record, backup):
+            self._log("Save restore was cancelled.")
+            return False
+        try:
+            result = save_slots.restore_slot(
+                record["id"], chosen, game_root or None)
+        except save_slots.SaveSlotError as error:
+            self._log(self._t("The save could not be restored: %s") % error)
+            return False
+        self._log(self._t("Restored %d file(s) into save '%s'.") % (
+            len(result["files"]), record["name"]))
+        if result["replaced"]:
+            self._log(self._t("The files that were replaced were kept in %s.")
+                      % result["replaced"])
+        self._refresh_save_slots()
+        return True
+
+    def _confirm_restore_save_slot(self, record, backup):
+        from tkinter import messagebox
+
+        origin = backup["name"] or backup["id"] or self._t("another save")
+        return messagebox.askyesno(
+            self._t("Restore save?"),
+            self._t("Replace the contents of save '%s' with the backup of "
+                    "'%s'? The files being replaced are kept in a "
+                    "pre-restore folder inside the save.")
+            % (record["name"], origin),
+            icon="warning")
 
     def _refresh_bot_lineup_profiles(self):
         self._bot_lineup_store = bot_lineup_profiles.normalize_store(
@@ -1717,6 +1893,8 @@ class LauncherWindow(object):
                     self._log(self._t(
                         "Could not select the report in Windows Explorer: "
                         "%s") % error)
+                self.root.after(
+                    0, lambda: self._show_report_send_reminder(result["path"]))
             finally:
                 self._report_busy = False
                 self.root.after(0, self._update_action_controls)
@@ -1725,6 +1903,16 @@ class LauncherWindow(object):
         thread.daemon = True
         thread.start()
         return True
+
+    def _show_report_send_reminder(self, report_path):
+        from tkinter import messagebox
+
+        messagebox.showinfo(
+            self._t("Error report ready"),
+            self._t(
+                "Please send this ZIP file to the author to report the "
+                "problem:\n\n%s") % report_path,
+            parent=self.root)
 
     def _confirm_enable_crash_capture(self):
         from tkinter import messagebox
@@ -1843,6 +2031,8 @@ class LauncherWindow(object):
         try:
             dump_path = error_reports.session_dump_path(
                 self._active_report_session, role)
+            trail_path = error_reports.session_trail_path(
+                self._active_report_session, role)
         except core.LauncherError as error:
             self._log("Crash report collection could not start: %s" % error)
             return environment
@@ -1850,6 +2040,10 @@ class LauncherWindow(object):
         environment[CRASH_DUMP_PATH_ENV] = dump_path
         environment[CRASH_DUMP_MODE_ENV] = (
             "full" if self._full_crash_dump_enabled else "mini")
+        # The engine consumes its own unhandled exceptions, so a termination
+        # dump often has no faulting thread left. The native sidecar records
+        # the fault itself; this path is where it appends.
+        environment[EXCEPTION_TRAIL_PATH_ENV] = trail_path
         return environment
 
     def _confirm_crash_report(self):
@@ -2347,6 +2541,9 @@ class LauncherWindow(object):
                     "persistent": True,
                     "require_owned": True,
                 }
+                if prepared.get("botExcludedVehicles"):
+                    start_options["bot_excluded_vehicles"] = prepared[
+                        "botExcludedVehicles"]
                 if bot_lineup:
                     start_options["bot_lineup"] = bot_lineup
                 started = self._start_server(
@@ -2488,6 +2685,8 @@ class LauncherWindow(object):
                 else:
                     prepared = vehicle_overlays.prepare_vehicle_profile(
                         game_root, session.get("vehicle_profile"))
+                    session["bot_excluded_vehicles"] = prepared.get(
+                        "botExcludedVehicles", [])
                     if prepared["profile"] is None:
                         self._log(
                             "No launcher-owned vehicle profile is active; "
@@ -2510,6 +2709,9 @@ class LauncherWindow(object):
                 }
                 if session.get("bot_lineup"):
                     start_options["bot_lineup"] = session["bot_lineup"]
+                if session.get("bot_excluded_vehicles"):
+                    start_options["bot_excluded_vehicles"] = session[
+                        "bot_excluded_vehicles"]
                 started = self._start_server(
                     game_root, session["client"], **start_options)
                 if not started:
@@ -2735,21 +2937,24 @@ class LauncherWindow(object):
 
     def _start_server(self, game_root, port_version,
                       loopback_only=False, persistent=False,
-                      bot_lineup=None, require_owned=False):
+                      bot_lineup=None, require_owned=False,
+                      bot_excluded_vehicles=None):
         requested_context = {
             "game_root": os.path.normcase(os.path.realpath(
                 os.path.abspath(game_root))),
             "port_version": port_version,
             "loopback_only": bool(loopback_only),
             "bot_lineup": list(bot_lineup or ()),
+            "bot_excluded_vehicles": sorted(set(bot_excluded_vehicles or ())),
         }
         if self._server_is_running():
             current_context = dict(self._server_context or {})
             current_context.setdefault("bot_lineup", [])
+            current_context.setdefault("bot_excluded_vehicles", [])
             if current_context != requested_context:
                 self._log(
                     "The launcher-owned LAN server uses a different game "
-                    "or visibility setting, or a different exact lineup. "
+                    "or visibility setting, or different Bot roster rules. "
                     "Stop it before starting this session.")
                 return False
             self._log("Reusing the launcher-owned %s LAN server." %
@@ -2766,9 +2971,10 @@ class LauncherWindow(object):
                     "compatible server already uses port %d. Close it "
                     "first." % core.DEFAULT_SERVER_PORT)
                 return False
-            if bot_lineup:
+            if bot_lineup or bot_excluded_vehicles:
                 self._log(
-                    "The exact Bot lineup needs a fresh launcher-owned "
+                    "The exact Bot lineup or vehicle exclusions need a "
+                    "fresh launcher-owned "
                     "server. Stop the compatible server already using port "
                     "%d first." % core.DEFAULT_SERVER_PORT)
                 return False
@@ -2783,7 +2989,8 @@ class LauncherWindow(object):
         command = core.server_child_command(port_version)
         environment = core.server_environment(
             port_version, game_root, loopback_only=loopback_only,
-            bot_lineup=bot_lineup)
+            bot_lineup=bot_lineup,
+            bot_excluded_vehicles=bot_excluded_vehicles)
         server_log_path = core.server_log_path()
         report_session = self._active_report_session
         if report_session is not None:
@@ -2846,6 +3053,7 @@ class LauncherWindow(object):
         self.root.after(0, self._update_action_controls)
 
     def _start_worker(self, game_root, host, port, room_owned=False):
+        """Start once against the client's normal resource and mod paths."""
         self._worker_exited_unexpectedly = False
         starter = core.worker_starter_executable(game_root)
         if not os.path.isfile(starter):
@@ -2865,6 +3073,7 @@ class LauncherWindow(object):
         environment = core.worker_environment(game_root, host, port)
         environment = self._crash_capture_environment(
             environment, error_reports.ROLE_HIDDEN_WORKER)
+        self._log("Hidden worker resources: the client's own paths.xml.")
         # Stop intent belongs to the previous worker, not its replacement.
         self._stop_requested_roles.discard(error_reports.ROLE_HIDDEN_WORKER)
         worker = subprocess.Popen(
@@ -2897,7 +3106,10 @@ class LauncherWindow(object):
                 self._worker_exited_unexpectedly = True
                 self._log(
                     "The hidden simulation worker stopped with exit code %s." %
-                    exit_code)
+                    core.describe_exit_code(exit_code))
+                hint = core.worker_startup_exit_hint(exit_code)
+                if hint:
+                    self._log(hint)
             self._log_worker_failure(game_root)
         self._stop_worker(room_owned=room_owned)
         return False
@@ -3070,13 +3282,15 @@ class LauncherWindow(object):
         crashed = (error_reports.ROLE_VISIBLE_CLIENT in
                    self._observed_crash_roles)
         if crashed:
-            self._log("The game stopped with exit code %s." % exit_code)
+            self._log("The game stopped with exit code %s." %
+                      core.describe_exit_code(exit_code))
         if paired_worker:
             if worker_exit is not None and not self._stop_requested:
                 if self._worker_exited_unexpectedly:
                     self._log(
                         "The hidden simulation worker stopped with exit code "
-                        "%s; the game was closed." % worker_exit)
+                        "%s; the game was closed." %
+                        core.describe_exit_code(worker_exit))
                     self._log_worker_failure(game_root)
                     if (self._server is not None and
                             not self._server_persistent):
@@ -3181,6 +3395,7 @@ class LauncherWindow(object):
         self._prompt_initial_crash_collection()
 
     def run(self):
+        error_reports.cleanup_reports()
         self.root.after(0, self._show_startup_notices)
         self.root.mainloop()
 

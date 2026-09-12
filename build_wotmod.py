@@ -13,6 +13,13 @@ import time
 import uuid
 import zipfile
 
+try:
+    _STRING_TYPES = (basestring,)
+    _INTEGER_TYPES = (int, long)
+except NameError:
+    _STRING_TYPES = (str,)
+    _INTEGER_TYPES = (int,)
+
 
 _SCHEMA_ROOT = os.path.join(
     os.path.dirname(__file__), 'src', 'res', 'scripts', 'client', 'gui',
@@ -23,7 +30,7 @@ import navigation_graph_schema as _navigation_schema
 
 
 MOD_ID = 'org.peng.offline_lan_0922'
-MOD_VERSION = '0.7.0'
+MOD_VERSION = '0.7.7'
 BUILD_IDENTITY_ENV = 'WOT_OFFLINE_BUILD_IDENTITY'
 BUILD_IDENTITY_FILENAME = 'build_identity.json'
 BUILD_IDENTITY_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')
@@ -39,7 +46,7 @@ FOLIAGE_FORMAT = 'offline-lan-0922-foliage'
 FOLIAGE_VERSION = 4
 FOLIAGE_MANIFEST_FORMAT = FOLIAGE_FORMAT + '-manifest'
 DESTRUCTIBLE_FORMAT = 'offline-lan-0922-destructible-catalog'
-DESTRUCTIBLE_VERSION = 7
+DESTRUCTIBLE_VERSION = 9
 DESTRUCTIBLE_MANIFEST_FORMAT = DESTRUCTIBLE_FORMAT + '-manifest'
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 LEGAL_FILES = (
@@ -550,6 +557,32 @@ def _validate_destructibles(destructible_root):
                 seen_instance_signatures.add(signature)
                 previous_signature = signature
                 instance_kind_counts[resource['kind']] += 1
+            trees = data.get('tree_instances')
+            if not isinstance(trees, list):
+                raise ValueError('tree instance index is unavailable')
+            for row in trees:
+                if (not isinstance(row, list) or len(row) != 15 or
+                        any(type(value) is not int for value in row[:12]) or
+                        not isinstance(row[12], _STRING_TYPES) or
+                        not row[12].lower().endswith('.spt') or
+                        any(type(value) is not int or value < 0
+                            for value in row[13:]) or row[13] > 0xFFFFFFFF):
+                    raise ValueError('invalid tree instance row')
+                wire = tuple(row[13:])
+                if wire in seen_instance_wires:
+                    raise ValueError('duplicated tree instance wire')
+                seen_instance_wires.add(wire)
+            excluded = data.get('excluded_instances')
+            if not isinstance(excluded, list):
+                raise ValueError('excluded instance index is unavailable')
+            for row in excluded:
+                if (not isinstance(row, list) or len(row) != 3 or
+                        any(type(value) not in _INTEGER_TYPES or value < 0
+                            for value in row) or
+                        row[0] > 0xFFFFFFFF or row[2] > 0xFFFFFFFF or row[2] & 1 or
+                        tuple(row[:2]) in seen_instance_wires):
+                    raise ValueError('invalid excluded instance row')
+                seen_instance_wires.add(tuple(row[:2]))
             previous_signature = None
             ambiguous_candidate_count = 0
             for row in ambiguous_instances:

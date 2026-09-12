@@ -211,6 +211,12 @@ BOT_OVERTURN_WARNING_COSINE = vehicle_physics.OVERTURN_WARNING_COSINE
 BOT_OVERTURN_DANGER_COSINE = vehicle_physics.OVERTURN_DANGER_COSINE
 BOT_OVERTURN_DEATH_SECONDS = 30.0
 BOT_OVERTURN_DEATH_REASON = 7
+# A shoved wreck re-settles on the ground it slid onto. It has no engine, so
+# it may follow a drop of about one hull clearance and may not be lifted onto
+# anything it could not have rolled over. Outside that envelope the slide is
+# undone rather than left floating or sunk.
+WRECK_SUPPORT_DROP = 0.60
+WRECK_SUPPORT_RISE = 0.25
 
 # The ten-spring trial may follow a rise above the mature 0.6 m step gate only
 # when the last and current spring batches describe one continuous terrain
@@ -625,18 +631,24 @@ def _invisibility_aspect(profile, moving, still_device_ready):
 
 
 def _detection_upper_bound(distance, view_range, base_pair, moving,
-                           shot_factor, fired_recently):
+                           shot_factor, fired_recently, additive=0.0,
+                           multiplier=1.0):
     """Return detection with the best possible geometry for this pair.
 
-    Foliage camouflage is additive and clamped to a non-negative value, so
-    zero foliage is the minimum possible camouflage.  A clear line of sight is
-    likewise the maximum possible visibility.  If this upper bound is false,
-    neither the native collision ray nor the real foliage result can make the
-    target visible.
+    Vegetation camouflage is additive and clamped to a non-negative value, so
+    zero vegetation is the minimum possible camouflage.  A clear line of sight
+    is likewise the maximum possible visibility.  If this upper bound is
+    false, neither the native collision ray nor the real vegetation result can
+    make the target visible.
+
+    Every other term of the law is passed through rather than defaulted: a
+    multiplicative aspect below 1.0 would otherwise raise the assumed
+    camouflage above the real one and turn this bound into a false negative.
     """
     minimum_camouflage = spotting.effective_camouflage(
-        base_pair, moving=moving, shot_factor=shot_factor,
-        fired_recently=fired_recently, foliage_bonus=0.0)
+        base_pair, moving=moving, additive=additive, multiplier=multiplier,
+        shot_factor=shot_factor, fired_recently=fired_recently,
+        foliage_bonus=0.0)
     return spotting.is_detected(
         distance, view_range, minimum_camouflage, True)
 
@@ -1971,7 +1983,8 @@ class BotRuntime(object):
                  water_depth_probe=None, ram_contact_probe=None,
                  bot_equipment_resolver=None,
                  destructible_body_scan=None, control_seconds=None,
-                 incoming_lane_probe=None, combat_diagnostics=None):
+                 incoming_lane_probe=None, combat_diagnostics=None,
+                 turret_motion_probe=None, turret_hulls_provider=None):
         self.local_player_id = local_player_id
         self._combat_diagnostics = combat_diagnostics
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
@@ -2053,6 +2066,9 @@ class BotRuntime(object):
         self.native_motion = bool(native_motion)
         self.motion_resolver = motion_resolver
         self.motion_report = motion_report
+        self._turret_motion_probe = turret_motion_probe
+        self._turret_hulls_provider = turret_hulls_provider
+        self._turret_pending_landing_impacts = None
         self.world_receipt_probe = (
             self._adapt_world_receipt_probe(world_receipt_probe)
             if callable(world_receipt_probe) else None)
@@ -2853,9 +2869,22 @@ class BotRuntime(object):
         states = self._equipment_states.get(bot_id, ())
         self._equipment_wire_cache.pop(bot_id, None)
         self._equipment_wire_exposed_in_update.discard(bot_id)
-        self._equipment_passives[bot_id] = \
-            equipment_mechanics.passive_effects(states)
+        self._refresh_equipment_passives(bot_id)
         return states
+
+    def _refresh_equipment_passives(self, bot_id):
+        """Re-read one Bot's passives from its live consumable ledger.
+
+        An unused large repair kit lends its bonusValue to the repair factor
+        and a spent one does not, so the cached factor cannot outlive a
+        consumed charge or a restored ledger.
+        """
+        bot_id = int(bot_id)
+        self._equipment_passives[bot_id] = \
+            equipment_mechanics.passive_effects(
+                self._equipment_states.get(bot_id, ()))
+        self._repair_factors.pop(bot_id, None)
+        return self._equipment_passives[bot_id]
 
     def _advance_equipment_clock(self, step):
         """Advance cooldowns on simulation time, never wall-clock time."""
@@ -3998,6 +4027,8 @@ class BotRuntime(object):
             self._apply_bot_equipment_effect(
                 state, descriptor, effect, strict=True)
             effects.append(dict(effect))
+        if effects:
+            self._refresh_equipment_passives(state['id'])
         self._publish_equipment_state(state)
         return effects
 
@@ -4798,6 +4829,29 @@ class BotRuntime(object):
             cached is not None and cached[0] == cache_key and
             now < cached[1])
 
+    def _note_target_stillness(self, live_bots, live_humans, now):
+        """Sample every live target's stationary clock once per frame.
+
+        ``_target_still_seconds`` used to run only for a pair that survived
+        the visibility budget.  A target that moved while its pairs were
+        deferred therefore kept the stamp it had before it moved, and armed
+        its camouflage net the instant it stopped instead of waiting the
+        descriptor's ``activateWhenStillSec``.  Sampling here mirrors
+        ``_note_source_stillness`` and makes the clock independent of who
+        happened to look at it.
+        """
+        for state in live_bots:
+            self._target_still_seconds(
+                ('bot', int(state['id'])),
+                abs(_number(state.get('speed'), 0.0)) >
+                spotting.MOVING_SPEED_EPSILON, now)
+        for raw in live_humans:
+            self._target_still_seconds(
+                ('human', int(raw['id'])),
+                abs(_number(raw.get('speed'), 0.0)) >
+                spotting.MOVING_SPEED_EPSILON, now)
+        return True
+
     @timed('bot.visibility_schedule')
     def _prepare_visibility_frame(self, players, now, include_humans):
         """Select a bounded, fair stale-pair cohort before native calls."""
@@ -4812,6 +4866,7 @@ class BotRuntime(object):
                        if (isinstance(raw, dict) and
                            raw.get('id') is not None and
                            raw.get('alive', True))]
+        self._note_target_stillness(live_bots, live_humans, now)
         targets = []
         for state in live_bots:
             targets.append(('bot', int(state['id']),
@@ -5042,7 +5097,7 @@ class BotRuntime(object):
                  target, target_id, now, tick_cache)
             if not _detection_upper_bound(
                     distance, view_range, base_pair, moving, shot_factor,
-                    fired_recently):
+                    fired_recently, additive, multiplier):
                 value = False
             else:
                 if not self._visibility_probe_admitted(key):
@@ -6081,10 +6136,15 @@ class BotRuntime(object):
             position[0], position[2], position[1])
         if centre is not None:
             centre = float(centre)
-            if (follow_gap is not None and
-                    position[1] - centre > float(follow_gap)):
+            # Speed and a forward corridor grade can enlarge follow_gap
+            # beyond an entire trench. Check the tracks before accepting that
+            # drop; the dynamic envelope alone proves no surface continuity.
+            support_gap = (None if follow_gap is None else min(
+                float(follow_gap), vehicle_physics.GROUND_FOLLOW_MIN))
+            if (support_gap is not None and
+                    position[1] - centre > support_gap):
                 bridged = self._straddled_terrain_support(
-                    state, position, follow_gap)
+                    state, position, support_gap)
                 if bridged is not None and bridged > centre:
                     return bridged, bridged
             # The vertical law below always selects centre while it exists;
@@ -6220,7 +6280,7 @@ class BotRuntime(object):
                                     if int(state['id']) in pair),
         })
         print('[BOT MOTION] %s' % json.dumps(
-            trace, sort_keys=True, separators=(',', ':')))
+            trace, separators=(',', ':')))
 
     def set_camera_position(self, position):
         """Publish the viewpoint that drives the presentation detail tiers."""
@@ -6350,6 +6410,14 @@ class BotRuntime(object):
             state.get('half_length', 3.5),
             state.get('half_width', 1.7),
             terrain_pitch, state.get('roll', 0.0))
+        if self._turret_motion_probe is not None:
+            before = self._turret_state_pose(state)
+            after = dict(before)
+            after.update(pitch=pitch + suspension_pitch, roll=roll)
+            after['chassis'] = dict(before['chassis'], pitch=pitch, roll=roll)
+            if not self._turret_motion_probe(
+                    before, after, self._descriptors.get(int(state['id']))):
+                return False
         state['terrain_pitch'] = pitch
         state['pitch'] = pitch + suspension_pitch
         state['roll'] = roll
@@ -6474,6 +6542,10 @@ class BotRuntime(object):
     def _apply_bot_landing_impact(
             self, state, impact_speed, normal_impact=False):
         """Retain airborne skid and apply legacy or normal impact speed."""
+        pending = self._turret_pending_landing_impacts
+        if pending is not None:
+            pending.append((impact_speed, normal_impact))
+            return 0
         lateral_x = state.get('air_lateral_x', 0.0)
         lateral_z = state.get('air_lateral_z', 0.0)
         lateral_speed = math.sqrt(
@@ -6778,6 +6850,45 @@ class BotRuntime(object):
     def _update_vertical_motion(self, state, step, tick_pose=None,
                                 attempted_yaw=None,
                                 suspension_motion_pose=None):
+        """Commit suspension and landing only after the full turret sweep."""
+        if self._turret_motion_probe is None:
+            return self._integrate_vertical_motion(
+                state, step, tick_pose, attempted_yaw,
+                suspension_motion_pose)
+        before = self._turret_state_pose(state)
+        snapshot = self._snapshot_bot_suspension_state(state)
+        pending = []
+        self._turret_pending_landing_impacts = pending
+        try:
+            blocked = self._integrate_vertical_motion(
+                state, step, tick_pose, attempted_yaw,
+                suspension_motion_pose)
+        finally:
+            self._turret_pending_landing_impacts = None
+        if not self._turret_motion_probe(
+                before, self._turret_state_pose(state),
+                self._descriptors.get(int(state['id']))):
+            self._restore_bot_suspension_state(state, snapshot)
+            state['x'], state['y'], state['z'] = (
+                before['x'], before['y'], before['z'])
+            state['yaw'] = before['yaw']
+            state['speed'] = 0.0
+            state['movement_dir'] = 0
+            state['rotation_dir'] = 0
+            state['push_x'] = 0.0
+            state['push_z'] = 0.0
+            self._turn_speeds[int(state['id'])] = 0.0
+            self._invalidate_realised_motion(
+                int(state['id']), before['yaw'] if attempted_yaw is None
+                else attempted_yaw)
+            return True
+        for impact_speed, normal_impact in pending:
+            self._apply_bot_landing_impact(state, impact_speed, normal_impact)
+        return blocked
+
+    def _integrate_vertical_motion(self, state, step, tick_pose=None,
+                                   attempted_yaw=None,
+                                   suspension_motion_pose=None):
         """Run grounded/ballistic phases and reject false raised support."""
         params = self._suspension_params_for(state['id'])
         trace = state.get('_motion_stall_pending')
@@ -7862,6 +7973,8 @@ class BotRuntime(object):
                 'damage_to_bot': event['damage_to_self'],
                 'damage_to_target': event['damage_to_other'],
             }
+            if target_kind == 'bot':
+                report['contact_positions'] = list(event['contact_positions'])
             if (target_kind == 'human' and
                     isinstance(human_ram_receipt, dict)):
                 report['ram_contact_player_id'] = int(
@@ -7949,9 +8062,14 @@ class BotRuntime(object):
                 abs(math.cos(relative_yaw)))
             separation_distance = max(
                 1.0, move_distance + hull_support)
-            if not self._clear(
-                    _position(state), contact_yaw, contact_speed, None,
-                    separation_distance, corridor_half_width):
+            position = _position(state)
+            candidate = (position[0] + move_x, position[1],
+                         position[2] + move_z)
+            if (not self._turret_pose_is_clear(
+                    state, position, yaw, candidate, yaw) or
+                    not self._clear(
+                        position, contact_yaw, contact_speed, None,
+                        separation_distance, corridor_half_width)):
                 # Tank separation is not permission to cross static world
                 # geometry. Let the other hull keep its inverse-mass share.
                 move_x = 0.0
@@ -7960,10 +8078,124 @@ class BotRuntime(object):
                 push_z = 0.0
         state['x'] += move_x
         state['z'] += move_z
-        push_decay = (0.90 ** (max(0.0, float(step)) * 60.0)
-                      if advance_push else 1.0)
-        state['push_x'] = push_x * push_decay
-        state['push_z'] = push_z * push_decay
+        if not advance_push:
+            state['push_x'] = push_x
+            state['push_z'] = push_z
+            return
+        if state.get('alive', True):
+            # A live hull keeps the reviewed residual decay. Replacing it with
+            # the track budget below is the physically correct law, but a
+            # residual push is also today's only escape from a terrain wedge:
+            # with dry friction the Himmelsdorf and Airfield 24 FPS spawn
+            # guards each strand one Bot whose separation the world probe
+            # vetoes. That belongs to the wedge recovery, not to this change.
+            decay = 0.90 ** (max(0.0, float(step)) * 60.0)
+            state['push_x'] = push_x * decay
+            state['push_z'] = push_z * decay
+            return
+        state['push_x'], state['push_z'] = self._bleed_contact_push(
+            state, push_x, push_z, step)
+
+    def _bleed_contact_push(self, state, push_x, push_z, step):
+        """Spend one slice of this wreck's own track budget on its push.
+
+        A destroyed hull has no drivetrain, so both of its axes resist with
+        the held track laws: the parked perch limit along the hull and the
+        fall-line hold across it. Dry friction removes a fixed amount of
+        speed per second and stops the hull dead, which is what keeps a
+        shoved wreck from creeping for the rest of the round.
+        """
+        try:
+            params = self._physics_params_for(int(state['id']))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return push_x, push_z
+        if not params:
+            return push_x, push_z
+        return vehicle_physics.contact_push_step(
+            params, push_x, push_z, _number(state.get('yaw')), step,
+            rolling=False,
+            normal_y=(math.cos(_number(state.get('pitch'))) *
+                      math.cos(_number(state.get('roll')))))
+
+    def _wreck_tracks_absorb(self, state, result, step):
+        """Return whether this wreck's tracks hold against the whole impulse.
+
+        The applied impulse divided by the slice is the acceleration the
+        contact is asking of the hull. Comparing it against the same parked
+        perch hold that keeps a stopped tank on a slope is exactly the
+        Coulomb static test, so a light hull leaning on a heavy wreck moves
+        nothing while a heavy one breaks it loose.
+        """
+        try:
+            params = self._physics_params_for(int(state['id']))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if not params:
+            return False
+        return vehicle_physics.contact_push_is_held(
+            params,
+            state.get('push_x', 0.0) + result['delta_velocity'][0],
+            state.get('push_z', 0.0) + result['delta_velocity'][1],
+            _number(state.get('yaw')), step, rolling=False,
+            normal_y=(math.cos(_number(state.get('pitch'))) *
+                      math.cos(_number(state.get('roll')))))
+
+    def _apply_wreck_contact_response(self, state, result, step):
+        """Shove one destroyed hull and keep it standing on the ground.
+
+        A wreck has no planner, no drive step and no suspension pass, so this
+        is its whole integrator. It reuses the live contact response for the
+        horizontal move - including the same world-collision veto, so a wreck
+        can never be shoved through a wall - and then re-settles the hull on
+        the terrain it slid onto. A move whose new column has no usable
+        support is undone rather than left hanging: the last pose a dead hull
+        was seen at is always a legal one.
+        """
+        if self._wreck_tracks_absorb(state, result, step):
+            # Static friction: the pusher could not break the tracks loose.
+            # Baumgarte separation is not a force and would otherwise walk
+            # any wreck along at the pusher's inverse-mass share whatever its
+            # mass, so the pusher owns the whole overlap this tick instead.
+            state['push_x'] = 0.0
+            state['push_z'] = 0.0
+            return False
+        before = _position(state)
+        self._apply_tank_contact_response(state, result, step)
+        if (abs(state['x'] - before[0]) <= 1.0e-6 and
+                abs(state['z'] - before[2]) <= 1.0e-6):
+            return False
+        try:
+            ground = self._ground_probe_at(
+                state['x'], state['z'], state['y'])
+        except (TypeError, ValueError, AttributeError, RuntimeError,
+                OverflowError):
+            # Without a ground authority the new column cannot be verified.
+            # Undo this hull's slide rather than leave a dead tank hanging.
+            ground = None
+        if ground is None:
+            state['x'], state['y'], state['z'] = before
+            state['push_x'] = 0.0
+            state['push_z'] = 0.0
+            return False
+        rise = float(ground) - _number(state.get('y'))
+        if not -WRECK_SUPPORT_DROP <= rise <= WRECK_SUPPORT_RISE:
+            # A cliff lip or a step the hull could not have climbed. Keep the
+            # wreck where it already rested instead of dropping or lifting it.
+            state['x'], state['y'], state['z'] = before
+            state['push_x'] = 0.0
+            state['push_z'] = 0.0
+            return False
+        candidate = (state['x'], float(ground), state['z'])
+        if not self._turret_pose_is_clear(
+                state, before, state['yaw'], candidate, state['yaw']):
+            # The horizontal probe used the old support height. Settling can
+            # enter a landed turret even when that first sweep was clear.
+            state['x'], state['y'], state['z'] = before
+            state['push_x'] = 0.0
+            state['push_z'] = 0.0
+            return False
+        state['y'] = float(ground)
+        return True
 
     def _resolve_human_ram_receipts(self, players, now, step=None,
                                     processed_pairs=None,
@@ -8343,6 +8575,11 @@ class BotRuntime(object):
                 # the exception: it owns the velocity response so the local
                 # player does not inherit the teammate's lateral momentum.
                 'impulse': False,
+                # A dead human hull has no integrator at all: the visible
+                # client stops its drive step on death and this worker never
+                # owned the player pose.  Keep it as world geometry instead of
+                # handing it a share of a correction nobody applies.
+                'immovable': not alive,
                 'x': raw.get('x', 0.0), 'y': raw.get('y', 0.0),
                 'z': raw.get('z', 0.0), 'yaw': yaw,
                 'mass': profile['mass'], 'shape': profile['shape'],
@@ -8395,8 +8632,10 @@ class BotRuntime(object):
             return tuple(reversed(canonical))
 
         for state in self._ordered_states():
-            if not state.get('alive', True):
-                continue
+            # A wreck resolves too.  It has no engine and never rams, but it
+            # is a hull on tracks and its inverse-mass share of a live hull's
+            # push has to actually move it.
+            state_alive = bool(state.get('alive', True))
             own = by_id.get(int(state['id']))
             if own is None:
                 continue
@@ -8426,29 +8665,62 @@ class BotRuntime(object):
                 # A separated tank still owns residual contact momentum and
                 # must advance/decay it through the same world collision gate.
                 if state.get('push_x', 0.0) or state.get('push_z', 0.0):
-                    self._apply_tank_contact_response(state, {
-                        'correction': (0.0, 0.0),
-                        'delta_velocity': (0.0, 0.0),
-                    }, step)
+                    idle = {'correction': (0.0, 0.0),
+                            'delta_velocity': (0.0, 0.0)}
+                    if state_alive:
+                        self._apply_tank_contact_response(state, idle, step)
+                    else:
+                        self._apply_wreck_contact_response(state, idle, step)
                 continue
-            resolve_kwargs = {
-                'now': now,
-                'ram_cooldowns': self._ram_cooldowns,
-                'active_ram_contacts': frozenset(
-                    set(previous_ram_contacts) | current_ram_contacts),
-            }
-            if self.ram_contact_probe is not None:
-                resolve_kwargs['contact_armor_probe'] = \
-                    contact_armor_probe
+            if not state_alive:
+                # ``impulse`` false says the visible client owns the player's
+                # half of the pair and the Bot's half arrives as a ram
+                # receipt.  No receipt is ever produced for a wreck, so this
+                # solver is the only owner of the wreck's half; leaving the
+                # flag alone let a player's shove reach the hull as bare
+                # separation with its track resistance never consulted.
+                others = [dict(other, impulse=True)
+                          if (other.get('kind') == 'player' and
+                              not other.get('impulse', True)) else other
+                          for other in others]
+            if not state_alive and not (
+                    state.get('push_x', 0.0) or state.get('push_z', 0.0) or
+                    any(other.get('alive', True) or other['vx'] or
+                        other['vz'] for other in others)):
+                # Nothing in reach can move this wreck and it carries no
+                # momentum of its own. Two settled wrecks left overlapping by
+                # their death poses must not re-solve each other every tick
+                # for the rest of the round.
+                continue
+            if state_alive:
+                resolve_kwargs = {
+                    'now': now,
+                    'ram_cooldowns': self._ram_cooldowns,
+                    'active_ram_contacts': frozenset(
+                        set(previous_ram_contacts) | current_ram_contacts),
+                }
+                if self.ram_contact_probe is not None:
+                    resolve_kwargs['contact_armor_probe'] = \
+                        contact_armor_probe
+            else:
+                # ``now`` None keeps every separation and impulse while
+                # disabling ram admission, so a shoved wreck can never open a
+                # damage episode or consume an armour probe.
+                resolve_kwargs = {'now': None}
             result = tank_collision.resolve_tank(
                 own, others, **resolve_kwargs)
-            self._ram_cooldowns = result['cooldowns']
-            current_ram_contacts.update(result['contacts'])
+            if state_alive:
+                self._ram_cooldowns = result['cooldowns']
+                current_ram_contacts.update(result['contacts'])
+            if not state_alive:
+                self._apply_wreck_contact_response(state, result, step)
+                continue
             if (any(abs(value) > 0.0001
                     for value in result['delta_velocity']) or
                     any(abs(value) > 0.0001
                         for value in result['correction'])):
                 # Another hull owns this tank's lack of progress this tick.
+                # A wreck has no driver and no stuck timer to protect.
                 contacted_bot_ids.add(int(state['id']))
             self._apply_tank_contact_response(state, result, step)
             reports.extend(self._ram_reports(
@@ -8458,8 +8730,32 @@ class BotRuntime(object):
         self._ram_contacts = frozenset(current_ram_contacts)
         return reports
 
+    @staticmethod
+    def _turret_state_pose(state, position=None, yaw=None):
+        pose = dict((name, state.get(name, 0.0))
+                    for name in ('x', 'y', 'z', 'yaw', 'pitch', 'roll'))
+        if position is not None:
+            pose.update(x=position[0], y=position[1], z=position[2])
+        if yaw is not None:
+            pose['yaw'] = yaw
+        chassis = dict(pose)
+        chassis['pitch'] = state.get(
+            'terrain_pitch', pose['pitch'] - state.get('suspension_pitch', 0.0))
+        pose['chassis'] = chassis
+        return pose
+
+    def _turret_pose_is_clear(self, state, start, start_yaw, end, end_yaw):
+        """Keep turns and contact pushes outside the same landed turret body."""
+        probe = self._turret_motion_probe
+        if probe is None:
+            return True
+        descriptor = self._descriptors.get(int(state['id']))
+        before = self._turret_state_pose(state, start, start_yaw)
+        after = self._turret_state_pose(state, end, end_yaw)
+        return bool(probe(before, after, descriptor))
+
     def _publish_static_hulls(self, players):
-        """Give the navigator this tick's wrecks as static graph geometry.
+        """Give the navigator wrecks and landed turrets as static geometry.
 
         A destroyed vehicle is exact new world geometry that appears mid-round.
         Without it the terrain graph keeps returning the lane the wreck now
@@ -8494,6 +8790,8 @@ class BotRuntime(object):
             hulls.append((
                 player_id, _number(raw.get('x')), _number(raw.get('z')),
                 _number(raw.get('yaw')), shape[1], shape[0]))
+        if self._turret_hulls_provider is not None:
+            hulls.extend(self._turret_hulls_provider())
         publish(hulls)
 
     @staticmethod
@@ -8712,7 +9010,8 @@ class BotRuntime(object):
 
     @classmethod
     def _update_hydraulic_suspension(
-            cls, state, descriptor, world_yaw, world_pitch, elapsed):
+            cls, state, descriptor, world_yaw, world_pitch, elapsed,
+            motion_probe=None):
         try:
             params = hull_aiming.pitch_params(descriptor)
         except ValueError:
@@ -8731,6 +9030,12 @@ class BotRuntime(object):
             correction = hull_aiming.slew(
                 current, target, params['speed'], elapsed)
         terrain_pitch = cls._terrain_pitch(state)
+        if motion_probe is not None:
+            before = cls._turret_state_pose(state)
+            after = dict(before)
+            after['pitch'] = terrain_pitch + correction
+            if not motion_probe(before, after, descriptor):
+                return _number(state.get('suspension_pitch'))
         state['terrain_pitch'] = terrain_pitch
         state['suspension_pitch'] = correction
         state['pitch'] = terrain_pitch + correction
@@ -9273,7 +9578,8 @@ class BotRuntime(object):
                                (aim_position[1] + 1.0) - origin[1],
                                max(0.5, horizontal)))
         self._update_hydraulic_suspension(
-            state, descriptor, desired_yaw, world_pitch, step)
+            state, descriptor, desired_yaw, world_pitch, step,
+            self._turret_motion_probe)
         local_angles = self._local_gun_angles_for_world(
             state, desired_yaw, world_pitch)
         if local_angles is None:
@@ -10380,7 +10686,11 @@ class BotRuntime(object):
               launch_receipt=None, ammo_state=None, launch_preview=None,
               launch_time_us=None):
         if (state.get('_drowning', False) or
-                state.get('_overturned', False)):
+                state.get('_overturned', False) or
+                state.get('_wire_projection_failure') is not None):
+            # A later trigger would replace the unavailable checkpoint's
+            # burst identity before the server can admit its frozen launches.
+            # An already accepted burst still advances through its own path.
             return False
         if ammo_state is None:
             ammo_state = self._ammo_states.get(int(state.get('id', 0)))
@@ -11563,12 +11873,17 @@ class BotRuntime(object):
                     candidate_hull_yaw -= math.pi * 2.0
                 while candidate_hull_yaw < -math.pi:
                     candidate_hull_yaw += math.pi * 2.0
-                if not self._baked_pose_progress_clear(
+                if (not self._baked_pose_progress_clear(
                         state, position, old_hull_yaw,
-                        position, candidate_hull_yaw):
+                        position, candidate_hull_yaw) or
+                        (abs(_angle_delta(candidate_hull_yaw,
+                                          old_hull_yaw)) > 1.0e-8 and
+                         not self._turret_pose_is_clear(
+                             state, position, old_hull_yaw,
+                             position, candidate_hull_yaw))):
                     # Turning is a pose change even without translation. Keep
                     # the prior legal OBB until the hull first moves far enough
-                    # inward to rotate without crossing the official red line.
+                    # inward to rotate without crossing a red line or turret.
                     turn_speed = 0.0
                     candidate_hull_yaw = old_hull_yaw
                     state['rotation_dir'] = 0
@@ -11613,6 +11928,14 @@ class BotRuntime(object):
                     path_clear = False
                     throttle = 0.0
                     state['movement_dir'] = 0
+                # The corridor grade ranks future navigation, but a trench
+                # below that probe need not support the tracks now. Reuse the
+                # accepted suspension plane for drive gravity, projected onto
+                # the post-turn hull heading used by this integration slice.
+                supported_pitch = vehicle_physics.suspension_drive_pitch(
+                    state.get('_suspension_ground_plane'), candidate_hull_yaw)
+                if supported_pitch is not None:
+                    slope_pitch = supported_pitch
                 previous_speed = state['speed']
                 speed = (0.0 if siege_motion_locked else
                     vehicle_physics.longitudinal_step(
@@ -12115,7 +12438,8 @@ class BotRuntime(object):
             self._sample_time_us = step_end_time_us
             return []
         wire_rows = []
-        launches = [dict(launch) for launch in self._pending_launches]
+        failed_ids = set()
+        published_states = []
         for state in self._ordered_states():
             if diagnostic is not None:
                 diagnostic.actor(state['id'])
@@ -12126,16 +12450,45 @@ class BotRuntime(object):
             try:
                 row = observed_call(
                     'bot.wire_projection', bot_state_codec.encode_row, state)
-            except bot_state_codec.BotStateCodecError:
-                raise RuntimeError('bot publication projection failed')
+            except (bot_state_codec.BotStateCodecError, ValueError,
+                    TypeError, OverflowError) as error:
+                # An identity-only row explicitly retains the server's last
+                # checkpoint. Do not acknowledge combat or fabricate a pose.
+                bot_id = int(state['id'])
+                failed_ids.add(bot_id)
+                row = [bot_id]
+                previous = state.get('_wire_projection_failure')
+                reason = str(error)
+                if (previous is None or previous[0] != reason or
+                        now - previous[1] >= 5.0):
+                    print('[BOT STATE] projection unavailable round=%s '
+                          'bot=%s reason=%s' % (
+                              self.round_id, bot_id, reason))
+                    state['_wire_projection_failure'] = (reason, now)
+                wire_rows.append(row)
+                continue
+            state.pop('_wire_projection_failure', None)
+            published_states.append(state)
             if 'equipment_states' in state:
                 self._equipment_wire_exposed_in_update.add(int(state['id']))
             wire_rows.append(row)
         if diagnostic is not None:
             diagnostic.actor(None)
         self._sample_time_us = step_end_time_us
+        # Keep frozen launches and contact barriers pending until their
+        # participants can publish again; unrelated actors continue normally.
+        launches = [dict(launch) for launch in self._pending_launches
+                    if not failed_ids or int(launch['id']) not in failed_ids]
+        ram_reports = []
+        deferred_ram = []
+        for report in self._pending_ram_reports:
+            blocked = bool(failed_ids) and (
+                int(report['bot_id']) in failed_ids or
+                (report.get('target_kind') == 'bot' and
+                 int(report['target_id']) in failed_ids))
+            (deferred_ram if blocked else ram_reports).append(report)
         edge_sample_time_us, edge_revision = self._mark_publication_edge(
-            ordered_states, launches, self._pending_ram_reports,
+            published_states, launches, ram_reports,
             self._sample_time_us)
         publication = {
             'type': 'bot_state', 'rows': wire_rows,
@@ -12150,8 +12503,8 @@ class BotRuntime(object):
         outgoing = [publication]
         # The server validates ram proximity against its latest authority pose.
         # Publish state first, then the cooldown-gated damage reports.
-        outgoing.extend(self._pending_ram_reports)
-        self._pending_ram_reports = []
+        outgoing.extend(ram_reports)
+        self._pending_ram_reports = deferred_ram
         if collect_observation:
             self._next_observation = now + OBSERVATION_SECONDS
             outgoing.append({

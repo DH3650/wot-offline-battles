@@ -5,11 +5,13 @@ try:
 except ImportError:
     import pickle as _pickle
 import zlib
+import traceback
 
 from gui.mods.offline_lan_0922.account_rpc import commands, data, requests
 
 
-def _refresh_garage_views(diff, after_refresh=None):
+def _refresh_garage_views(diff, after_refresh=None, after_failure=None,
+                          is_current=None):
     """Complete the stock refresh chain for a locally applied inventory diff.
 
     ``gui/shared/personality.onClientUpdate`` runs
@@ -21,18 +23,26 @@ def _refresh_garage_views(diff, after_refresh=None):
     ``Hangar.__updateParams``.  Running the second alone would recompute the
     parameters panel from the pre-mount descriptor.
 
-    This is a fallback: when the stock listener already completes the chain,
-    both calls are idempotent.  Any failure here is presentation only.
-    ``after_refresh`` is called exactly once after the chain finishes or can
-    no longer be started.
+    This is a fallback for the stock listener. Complete through exactly one
+    of ``after_refresh`` and ``after_failure``. A failure must end the command
+    wait without reporting that CurrentVehicle is ready.
     """
     completed = [False]
+    timer = [None]
+    import BigWorld
 
-    def complete():
+    def complete(error=None):
         if completed[0]:
             return
         completed[0] = True
-        if callable(after_refresh):
+        if timer[0] is not None:
+            BigWorld.cancelCallback(timer[0])
+            timer[0] = None
+        if error is not None:
+            print('[Offline LAN 0.9.22] garage refresh failed: %s' % error)
+            if callable(after_failure):
+                after_failure(error)
+        elif callable(after_refresh):
             after_refresh()
 
     try:
@@ -40,28 +50,41 @@ def _refresh_garage_views(diff, after_refresh=None):
         from gui.ClientUpdateManager import g_clientUpdateManager
         from gui.shared.items_cache import CACHE_SYNC_REASON
         from gui.shared.personality import ServicesLocator
-    except ImportError:
-        complete()
+    except ImportError as error:
+        complete(error)
         return False
+
+    def expired():
+        timer[0] = None
+        complete('inventory refresh callback timed out')
+
+    # #1513 invokes onSyncCompleted before its adisp callback. An exception
+    # in that later event dispatch never resumes the waiting generator.
+    # Bound the wait and report failure, without pretending the cache is ready.
+    timer[0] = BigWorld.callback(10.0, expired)
 
     @adisp.process
     def refresh():
         try:
             yield ServicesLocator.itemsCache.update(
                 CACHE_SYNC_REASON.CLIENT_UPDATE, diff)
+            if completed[0]:
+                return
+            if callable(is_current) and not is_current():
+                complete('account changed during inventory refresh')
+                return
             g_clientUpdateManager.update(diff)
         except Exception as error:
-            print('[Offline LAN 0.9.22] the garage views did not refresh: '
-                  '%s' % error)
-        finally:
+            traceback.print_exc()
+            complete(error)
+        else:
             complete()
 
     try:
         refresh()
     except Exception as error:
-        print('[Offline LAN 0.9.22] the garage refresh could not start: %s'
-              % error)
-        complete()
+        traceback.print_exc()
+        complete(error)
         return False
     return True
 
@@ -81,6 +104,7 @@ class FakeServer(object):
     def __init__(self, player_getter, callback=None, context=None):
         self._player_getter = player_getter
         self._context = dict(context or {})
+        self._pending_inventory_updates = 0
         if self._context.get('account_state') is None:
             from gui.mods.offline_lan_0922.account_rpc.state import AccountState
             self._context['account_state'] = AccountState(path=None)
@@ -97,7 +121,11 @@ class FakeServer(object):
         self._context.setdefault(
             'push_update_and_wait', self._push_update)
 
-    def _push_update(self, diff, after_publish=None):
+    @property
+    def inventory_refresh_pending(self):
+        return self._pending_inventory_updates > 0
+
+    def _push_update(self, diff, after_publish=None, after_failure=None):
         """Publish one account diff through the exact #1513 entity method.
 
         ``PlayerAccount.update`` unpickles its argument and forwards it to
@@ -127,29 +155,68 @@ class FakeServer(object):
         diff.setdefault('prevRev', revision)
         diff.setdefault('rev', revision + 1)
         payload = _pickle.dumps(diff, _pickle.HIGHEST_PROTOCOL)
+        inventory = 'inventory' in diff
+        completed = [False]
+        if inventory:
+            self._pending_inventory_updates += 1
+
+        def release():
+            if completed[0]:
+                return False
+            completed[0] = True
+            if inventory:
+                self._pending_inventory_updates -= 1
+            return True
+
+        def finish():
+            if not release() or self._player() is not player:
+                return
+            try:
+                if callable(after_publish):
+                    after_publish(player)
+            finally:
+                # Account.update is queued and ItemsCache refresh can yield.
+                # The room may read CurrentVehicle only after both complete,
+                # including any inventory update queued by the response.
+                notify = self._context.get('on_inventory_refreshed')
+                if (inventory and not self.inventory_refresh_pending and
+                        self._player() is player and callable(notify)):
+                    try:
+                        notify()
+                    except Exception as error:
+                        print('[Offline LAN 0.9.22] refreshed garage could '
+                              'not be published to the room: %s' % error)
+
+        def fail(error):
+            if not release() or self._player() is not player:
+                return
+            print('[Offline LAN 0.9.22] account update failed: %s' % error)
+            if callable(after_failure):
+                after_failure(error)
 
         def publish():
             if self._player() is not player:
+                release()
                 return
-            player.update(payload)
+            try:
+                player.update(payload)
+                if self._player() is not player:
+                    release()
+                    return
+                if inventory:
+                    _refresh_garage_views(
+                        diff, after_refresh=finish, after_failure=fail,
+                        is_current=lambda: self._player() is player)
+                else:
+                    finish()
+            except Exception as error:
+                traceback.print_exc()
+                fail(error)
 
-            def finish():
-                if (self._player() is player and
-                        callable(after_publish)):
-                    after_publish(player)
-
-            # The fallback exists for fitting changes whose inventory payload
-            # must be re-read by the current-vehicle cache.  Reapplying a
-            # stats-only update needlessly runs that expensive inventory path
-            # a second time.  An accepted fitting command chains its success
-            # response through ``after_publish``, so finish only after the
-            # CurrentVehicle listener can read the new descriptor.
-            if 'inventory' in diff:
-                _refresh_garage_views(diff, after_refresh=finish)
-            else:
-                finish()
-
-        self._callback(0.0, publish)
+        try:
+            self._callback(0.0, publish)
+        except Exception as error:
+            fail(error)
         return True
 
     def _player(self):
@@ -208,12 +275,26 @@ class FakeServer(object):
         result = requests.dispatch(command, self._context, args)
 
         def before_response(on_complete):
-            if callable(result.before_response):
-                if result.wait_for_before_response:
-                    result.before_response(on_complete)
-                    return
-                result.before_response()
-            on_complete()
+            completed = [False]
+
+            def complete():
+                if not completed[0]:
+                    completed[0] = True
+                    on_complete()
+
+            try:
+                if callable(result.before_response):
+                    if result.wait_for_before_response:
+                        result.before_response(complete)
+                        return
+                    result.before_response()
+            except Exception as error:
+                if completed[0]:
+                    raise
+                result.result_id = commands.RES_FAILURE
+                result.error = 'GARAGE_UPDATE_FAILED: %s' % error
+                print('[Offline LAN 0.9.22] %s' % result.error)
+            complete()
 
         if result.result_id == commands.RES_STREAM:
             desc, payload = pack_stream(result.stream)

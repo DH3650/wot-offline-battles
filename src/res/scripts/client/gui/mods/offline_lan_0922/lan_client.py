@@ -16,6 +16,7 @@ from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import siege_mechanics
 from gui.mods.offline_lan_0922 import spotting
+from gui.mods.offline_lan_0922 import turret_obstacle_schema
 
 
 PROTOCOL_VERSION = 5
@@ -66,6 +67,8 @@ MAX_OUTBOUND_DEPTH = 16
 MAX_PROJECTILE_BATCH = 30
 MAX_HUMAN_RAM_PROBES = 64
 MAX_PROJECTILE_DESTRUCTIBLES = 64
+# ``dossiers2.custom.records`` stores marksOnGun as a 'B' capped at three.
+MAX_MARKS_ON_GUN = 3
 MAX_PROJECTILE_ID = 2147483647
 MAX_PROJECTILE_DAMAGE_STICKER = (1 << 64) - 1
 PLAYER_LANDING_MAX_IMPACT_SPEED = 200.0
@@ -961,10 +964,12 @@ def _strict_projectile_effect(value):
     damage_sticker_fields = frozenset(('damage_sticker',))
     potential_fields = frozenset(('potential_damage',))
     structural_fields = frozenset(('structural_armor_hit',))
+    high_explosive_fields = frozenset(('high_explosive',))
     keys = set(value)
     if not required.issubset(keys) or not keys.issubset(
             required | critical_fields | stun_fields | target_pose_fields |
-            damage_sticker_fields | potential_fields | structural_fields):
+            damage_sticker_fields | potential_fields | structural_fields |
+            high_explosive_fields):
         return None
     kind = value.get('target_kind')
     target_id = _projectile_int_range(
@@ -983,6 +988,7 @@ def _strict_projectile_effect(value):
     has_damage_sticker = 'damage_sticker' in value
     has_potential_damage = 'potential_damage' in value
     has_structural_armor_hit = 'structural_armor_hit' in value
+    has_high_explosive = 'high_explosive' in value
     expected = (required |
                 (critical_fields if has_critical else frozenset()) |
                 (stun_fields if has_stun else frozenset()) |
@@ -992,6 +998,7 @@ def _strict_projectile_effect(value):
                 (potential_fields if has_potential_damage else frozenset()))
     expected |= (structural_fields if has_structural_armor_hit else
                  frozenset())
+    expected |= (high_explosive_fields if has_high_explosive else frozenset())
     if (kind not in ('player', 'bot') or target_id is None or
             damage is None or shot_result is None or
             any(component is None for component in position) or
@@ -1042,7 +1049,7 @@ def _strict_projectile_effect(value):
             return None
         result['damage_sticker'] = damage_sticker
     if has_potential_damage:
-        # The armour ledger's un-reduced roll shares the damage bound the
+        # The armour ledger's un-reduced value shares the damage bound the
         # server enforces; a splash proposal never carries one.
         potential_damage = _projectile_int_range(
             value.get('potential_damage'), 0, 5000)
@@ -1054,6 +1061,11 @@ def _strict_projectile_effect(value):
         # or malformed value must not discard an otherwise valid terminal.
         result['structural_armor_hit'] = (
             value.get('structural_armor_hit') is True)
+    if has_high_explosive:
+        # #1513 keeps HE and HESH out of the armour ledger. This field only
+        # selects that rule, so a malformed value must not discard the
+        # terminal along with its reload and ammunition bookkeeping.
+        result['high_explosive'] = value.get('high_explosive') is True
     if has_target_pose:
         target_position = []
         for axis in ('x', 'y', 'z'):
@@ -1457,6 +1469,20 @@ def _canonical_effective_params(value):
     return effective_params_wire.canonical(value)
 
 
+def _canonical_marks_on_gun(value):
+    """Return a gun-mark count inside the #1513 dossier record's range.
+
+    ``dossiers2.custom.records`` caps ``marksOnGun`` at three, and the value
+    only ever describes this client's own account.  A missing or unreadable
+    count is no marks, never a refused selection.
+    """
+    try:
+        marks = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(marks, MAX_MARKS_ON_GUN))
+
+
 def _same_canonical_source(left, right):
     """Compare JSON values without equating bools, integers and floats."""
     if isinstance(left, bool) or isinstance(right, bool):
@@ -1504,7 +1530,8 @@ class LANClient(object):
     def __init__(self, host, port, name, vehicle, max_health=100,
                  on_event=None, bigworld=None, account_key=None,
                  outfits=None, requested_team=0,
-                 vehicle_compact_descr=None, effective_params=None):
+                 vehicle_compact_descr=None, effective_params=None,
+                 marks_on_gun=0):
         self.host = _safe_text(host, '127.0.0.1', 255)
         self.port = int(port or 28782)
         self.name = _safe_text(name, 'Player')
@@ -1516,6 +1543,7 @@ class LANClient(object):
         self.vehicle_compact_descr = (
             _canonical_vehicle_compact_descr(vehicle_compact_descr) or '')
         self.effective_params = _canonical_effective_params(effective_params)
+        self.marks_on_gun = _canonical_marks_on_gun(marks_on_gun)
         self.requested_team = _team_choice(requested_team)
         self._published_player_outfits = {}
         self._published_player_outfit_sources = {}
@@ -1551,6 +1579,8 @@ class LANClient(object):
         self.server_capabilities = []
         self._schema_negotiated = False
         self.last_snapshot = None
+        self._detached_turret_round_id = None
+        self._detached_turrets = {}
         self.last_error = None
         self.rtt_ms = None
         self.minimum_rtt_ms = None
@@ -1616,6 +1646,8 @@ class LANClient(object):
             self.server_capabilities = []
             self._schema_negotiated = False
             self.authority_epoch = None
+            self._detached_turret_round_id = None
+            self._detached_turrets = {}
             self.server_time_ms = None
             self.rtt_ms = None
             self.minimum_rtt_ms = None
@@ -1666,6 +1698,7 @@ class LANClient(object):
             'outfits': dict(self.outfits),
             'vehicle_compact_descr': self.vehicle_compact_descr,
             'effective_params': effective_params,
+            'marks_on_gun': _canonical_marks_on_gun(self.marks_on_gun),
         }
         if self.requested_team in (1, 2):
             payload['requested_team'] = self.requested_team
@@ -1774,8 +1807,14 @@ class LANClient(object):
         return self._send(message)
 
     def select_vehicle(self, vehicle, max_health, outfits=None,
-                       vehicle_compact_descr=None, effective_params=None):
-        """Publish one waiting-room garage change for the next round."""
+                       vehicle_compact_descr=None, effective_params=None,
+                       marks_on_gun=None):
+        """Accept the current loadout, sending only a changed selection.
+
+        The gun-mark count travels with the selection because a battle can
+        earn a mark on the vehicle the player keeps: the count changes while
+        the vehicle, its outfits and its effective parameters do not.
+        """
         if not self.ready or self.phase != 'waiting':
             return False
         vehicle = _safe_text(vehicle, '', 64)
@@ -1791,23 +1830,28 @@ class LANClient(object):
         params = _canonical_effective_params(
             self.effective_params if effective_params is None
             else effective_params)
+        marks = _canonical_marks_on_gun(
+            self.marks_on_gun if marks_on_gun is None else marks_on_gun)
         if outfits is None or compact is None or params is None:
             return False
         if (vehicle == self.vehicle and max_health == self.max_health and
                 outfits == self.outfits and
                 compact == self.vehicle_compact_descr and
-                params == self.effective_params):
-            return False
+                params == self.effective_params and
+                marks == self.marks_on_gun):
+            return True
         message = {'type': 'select_vehicle', 'vehicle': vehicle,
                    'max_health': max_health,
                    'vehicle_compact_descr': compact,
-                   'effective_params': params}
+                   'effective_params': params,
+                   'marks_on_gun': marks}
         if publishes_outfits:
             message['outfits'] = outfits
         if not self._send(message):
             return False
         self.vehicle_compact_descr = compact
         self.effective_params = params
+        self.marks_on_gun = marks
         return True
 
     def select_team(self, team):
@@ -1877,6 +1921,9 @@ class LANClient(object):
             params = entry.get('effective_params')
             if params is not None:
                 self.effective_params = params
+            if 'marks_on_gun' in entry:
+                self.marks_on_gun = _canonical_marks_on_gun(
+                    entry.get('marks_on_gun'))
             return
 
     def _prepare_player_static_inputs(
@@ -2956,10 +3003,12 @@ class LANClient(object):
             'target_kind', 'target_id', 'damage', 'shot_result',
             'x', 'y', 'z'}
         # A bounce is the archetypal blocked-damage contact, so a continuing
-        # shell still publishes its potential-damage roll, decal identity and
-        # armour layer. Critical, stun and splash tokens stay forbidden here.
+        # shell still publishes its potential damage, decal identity, armour
+        # layer and shell kind. Critical, stun and splash tokens stay
+        # forbidden here.
         direct_optional = {
-            'damage_sticker', 'potential_damage', 'structural_armor_hit'}
+            'damage_sticker', 'potential_damage', 'structural_armor_hit',
+            'high_explosive'}
         if (parsed_epoch is None or parsed_epoch != _exact_int(
                 self.authority_epoch) or parsed_projectile_id is None or
                 parsed_base is None or parsed_time is None or
@@ -3104,9 +3153,44 @@ class LANClient(object):
                 player_collision_profiles or ())[:64]
         return self._send(message)
 
+    def _attach_detached_turret_proposals(self, message, rows):
+        proposals = []
+        if isinstance(rows, (list, tuple)):
+            for raw in rows[:turret_obstacle_schema.MAX_ACTIVE_TURRETS]:
+                row = turret_obstacle_schema.normalize_proposal(raw)
+                if row is not None:
+                    proposals.append(row)
+        message['detached_turrets'] = proposals
+        message['authority_epoch'] = self.authority_epoch
+
+    def _adopt_detached_turrets(self, message):
+        """Retain immutable server records until the accepted round changes."""
+        round_id = message.get('round_id')
+        if self._detached_turret_round_id != round_id:
+            self._detached_turret_round_id = round_id
+            self._detached_turrets = {}
+        rows = message.get('detached_turrets')
+        if isinstance(rows, (list, tuple)):
+            for raw in rows[:turret_obstacle_schema.MAX_ACTIVE_TURRETS]:
+                row = turret_obstacle_schema.normalize_record(raw)
+                if row is None:
+                    continue
+                key = turret_obstacle_schema.row_key(row)
+                if (key not in self._detached_turrets and
+                        len(self._detached_turrets) <
+                        turret_obstacle_schema.MAX_ACTIVE_TURRETS):
+                    self._detached_turrets[key] = row
+        if 'detached_turrets' not in message and not self._detached_turrets:
+            return message
+        message = dict(message)
+        message['detached_turrets'] = [
+            turret_obstacle_schema.normalize_record(self._detached_turrets[key])
+            for key in sorted(self._detached_turrets)]
+        return message
+
     def send_bot_state(self, rows, sample_time_us=None,
                        source_batch_horizon_us=None,
-                       human_ram_armors=None):
+                       human_ram_armors=None, detached_turrets=None):
         if not self.is_bot_authority():
             return False
         rows = list(rows or ())[:30]
@@ -3134,13 +3218,16 @@ class LANClient(object):
             if human_ram_armors is None:
                 return False
             message['human_ram_armors'] = human_ram_armors
+        if detached_turrets is not None:
+            self._attach_detached_turret_proposals(message, detached_turrets)
         return self._send(message)
 
     def send_projected_bot_state(self, rows, sample_time_us=None,
                                  source_batch_horizon_us=None,
                                  human_ram_armors=None,
                                  edge_sample_time_us=None,
-                                 edge_revision=None):
+                                 edge_revision=None,
+                                 detached_turrets=None):
         """Send BotRuntime's already-projected canonical publication once."""
         del edge_sample_time_us, edge_revision
         if not self.is_bot_authority():
@@ -3170,6 +3257,8 @@ class LANClient(object):
             if human_ram_armors is None:
                 return False
             message['human_ram_armors'] = human_ram_armors
+        if detached_turrets is not None:
+            self._attach_detached_turret_proposals(message, detached_turrets)
         return self._send(message)
 
     def send_team_command(self, command, target_kind=None, target_id=None,
@@ -3246,7 +3335,8 @@ class LANClient(object):
 
     def send_bot_ram(self, bot_id, target_kind, target_id, ram_seq,
                      damage_to_bot, damage_to_target,
-                     ram_contact_player_id=None, ram_contact_seq=None):
+                     ram_contact_player_id=None, ram_contact_seq=None,
+                     contact_positions=None):
         """Report one receipt-owned tank collision as authority."""
         if not self.is_bot_authority():
             return False
@@ -3264,6 +3354,8 @@ class LANClient(object):
                 ram_contact_seq is not None):
             message['ram_contact_player_id'] = int(ram_contact_player_id)
             message['ram_contact_seq'] = int(ram_contact_seq)
+        if contact_positions is not None:
+            message['contact_positions'] = list(contact_positions)
         return self._send(message)
 
     def send_rules_state(self, bases):
@@ -3442,18 +3534,27 @@ class LANClient(object):
                 return
             if len(self._pending) >= MAX_PENDING_MESSAGES:
                 latest_manifests = {}
+                latest_turrets = {}
                 for index, value in enumerate(self._pending):
                     lineage = self._snapshot_lineage(value)
                     if (lineage is not None and
                             'bot_manifest' in value):
                         latest_manifests[lineage] = index
+                    if lineage is not None and value.get('detached_turrets'):
+                        latest_turrets[lineage] = index
                 incoming_lineage = self._snapshot_lineage(message)
                 if (incoming_lineage is not None and
                         'bot_manifest' in message):
                     # The incoming full snapshot supersedes an older barrier
                     # for this exact lineage.
                     latest_manifests.pop(incoming_lineage, None)
+                turret_index = latest_turrets.get(incoming_lineage)
+                if (turret_index is not None and
+                        self._pending[turret_index].get('detached_turrets') ==
+                        message.get('detached_turrets')):
+                    latest_turrets.pop(incoming_lineage, None)
                 protected_snapshots = set(latest_manifests.values())
+                protected_snapshots.update(latest_turrets.values())
                 snapshot_index = next((
                     index for index, value in enumerate(self._pending)
                     if (index not in protected_snapshots and
@@ -3781,9 +3882,12 @@ class LANClient(object):
         for message in messages:
             if message.get('type') == 'snapshot':
                 if (latest_snapshot is not None and
-                        'bot_manifest' in latest_snapshot and
-                        'bot_manifest' not in message):
-                    # A manifest-bearing snapshot is a static-lineage
+                        (('bot_manifest' in latest_snapshot and
+                          'bot_manifest' not in message) or
+                         (latest_snapshot.get('detached_turrets') and
+                          latest_snapshot.get('detached_turrets') !=
+                          message.get('detached_turrets')))):
+                    # A manifest or newly accepted turret is a static-lineage
                     # barrier, not a replaceable motion sample.  During native
                     # space loading several server ticks can accumulate in one
                     # poll; consuming only the last lean snapshot would leave
@@ -5068,6 +5172,10 @@ class LANClient(object):
                 'code': _safe_text(message.get('code'), '', 32),
             })
             return
+        if kind in ('battle_start', 'snapshot', 'events'):
+            message = self._adopt_detached_turrets(message)
+            if kind == 'snapshot':
+                self.last_snapshot = message
         self._notify(kind, message)
 
     def _notify(self, kind, message):

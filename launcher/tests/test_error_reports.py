@@ -18,6 +18,57 @@ class ErrorReportTest(unittest.TestCase):
     SESSION_1 = "20260823T120000Z-111111111111"
     SESSION_2 = "20260823T130000Z-222222222222"
 
+    def test_retention_keeps_latest_three_without_a_prompt_response(self):
+        directory = error_reports._prepare_reports_directory()
+        paths = []
+        for index in range(6):
+            path = os.path.join(directory,
+                "wot-error-report-20260909-12000%d-111111111111.zip" % index)
+            self._write(path, b"completed report")
+            os.utime(path, (100 + index, 100 + index))
+            paths.append(path)
+        protected = ["notes.zip", "wot-error-report-20260909-120009-111111111111.zip.tmp-work",
+                     "hidden-worker.dmp"]
+        for name in protected:
+            self._write(os.path.join(directory, name), b"preserve")
+        self.assertEqual(set(paths[:3]), set(error_reports.cleanup_reports()))
+        self.assertTrue(all(os.path.isfile(path) for path in paths[3:]))
+        self.assertTrue(all(os.path.isfile(os.path.join(directory, name))
+                            for name in protected))
+        self.assertEqual((), error_reports.cleanup_reports())
+
+    def test_report_creation_prunes_old_reports_before_returning_to_ui(self):
+        visible = self._game_log(error_reports.ROLE_VISIBLE_CLIENT)
+        session = error_reports.begin_session(self.game, session_id=self.SESSION_1)
+        self._write(visible, b"new session log")
+        error_reports.finalize_session(session)
+        paths = []
+        for index in range(5):
+            report = error_reports.create_report(
+                now=datetime.datetime(2026, 9, 9, 12, 0, index))
+            paths.append(report['path'])
+            self.assertTrue(os.path.isfile(report['path']))
+        self.assertFalse(any(os.path.exists(path) for path in paths[:2]))
+        self.assertTrue(all(os.path.isfile(path) for path in paths[2:]))
+
+    def test_retention_retries_locked_report_later(self):
+        directory = error_reports._prepare_reports_directory()
+        paths = []
+        for index in range(5):
+            path = os.path.join(directory,
+                "wot-error-report-20260909-12000%d-111111111111.zip" % index)
+            self._write(path, b"report")
+            os.utime(path, (100 + index, 100 + index))
+            paths.append(path)
+        original = error_reports.delete_report
+        def delete(path):
+            if path == paths[1]:
+                raise core.LauncherError("locked")
+            return original(path)
+        with mock.patch.object(error_reports, "delete_report", side_effect=delete):
+            self.assertEqual((paths[0],), error_reports.cleanup_reports())
+        self.assertEqual((paths[1],), error_reports.cleanup_reports())
+
     def test_streamed_report_member_can_cross_zip64_limit(self):
         payload = b"diagnostic dump data\n" * 32
         output = io.BytesIO()
@@ -59,10 +110,27 @@ class ErrorReportTest(unittest.TestCase):
             stream.write(payload)
 
     @staticmethod
-    def _archive(report):
+    def _archive_all(report):
         with zipfile.ZipFile(report["path"], "r") as archive:
             return dict((name, archive.read(name))
                         for name in archive.namelist())
+
+    @classmethod
+    def _archive(cls, report):
+        """The collected members only.
+
+        Generated sections (environment, installed mods, missing
+        dependencies, crash banners) describe the machine rather than the
+        session, so they are excluded here: every assertion below is about
+        which *logs and dumps* were selected, and that is what must not
+        drift. `_archive_all` sees everything.
+        """
+        generated = set(error_reports._CRASH_TEXT_FILENAMES.values())
+        generated.update(("environment.txt", "installed-mods.txt",
+                          "missing-dependencies.txt"))
+        return dict((name, payload)
+                    for name, payload in cls._archive_all(report).items()
+                    if name not in generated)
 
     @staticmethod
     def _minidump(*stream_types):
@@ -460,6 +528,164 @@ class ErrorReportTest(unittest.TestCase):
         self.assertFalse(
             error_reports.visible_client_exited_cleanly(session))
 
+    def test_native_exception_trails_travel_with_the_session_report(self):
+        # The engine consumes its own unhandled exceptions, so a termination
+        # dump often keeps no faulting thread. The trail is the only record
+        # of what actually faulted, and it must reach the ZIP even when no
+        # dump was written at all.
+        session = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1,
+            started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        self._write(
+            self._game_log(error_reports.ROLE_HIDDEN_WORKER), b"worker\n")
+        worker_trail = error_reports.session_trail_path(
+            session, error_reports.ROLE_HIDDEN_WORKER)
+        self._write(worker_trail, b"EXC session pid=1\r\nEXC seq=1 \r\n")
+        error_reports.finalize_session(session, ended_at="end")
+
+        report = error_reports.create_report()
+        payloads = self._archive(report)
+
+        self.assertIn("hidden-worker.exceptions.txt", payloads)
+        self.assertEqual(
+            b"EXC session pid=1\r\nEXC seq=1 \r\n",
+            payloads["hidden-worker.exceptions.txt"])
+        self.assertNotIn("visible-client.exceptions.txt", payloads)
+        self.assertIn("hidden-worker.exceptions.txt", report["included"])
+
+    def test_trail_paths_are_two_fixed_names_inside_the_session_folder(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1)
+
+        paths = dict(
+            (role, error_reports.session_trail_path(session, role))
+            for role in error_reports.DUMP_ROLES)
+        dumps = error_reports.session_dump_paths(session)
+
+        self.assertEqual(
+            sorted(error_reports.DUMP_ROLES), sorted(paths))
+        for role, path in paths.items():
+            self.assertEqual(
+                os.path.dirname(dumps[role]), os.path.dirname(path))
+            self.assertTrue(path.endswith(".exceptions.txt"))
+        self.assertEqual(len(set(paths.values())), len(paths))
+
+    def test_an_empty_or_oversized_trail_never_breaks_the_report(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1,
+            started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        self._write(
+            error_reports.session_trail_path(
+                session, error_reports.ROLE_VISIBLE_CLIENT), b"")
+        self._write(
+            error_reports.session_trail_path(
+                session, error_reports.ROLE_HIDDEN_WORKER),
+            b"E" * (error_reports.TRAIL_MAX_BYTES + 4096))
+        error_reports.finalize_session(session, ended_at="end")
+
+        payloads = self._archive(error_reports.create_report())
+
+        self.assertNotIn("visible-client.exceptions.txt", payloads)
+        self.assertEqual(
+            error_reports.TRAIL_MAX_BYTES,
+            len(payloads["hidden-worker.exceptions.txt"]))
+
+    def test_the_report_describes_the_machine_it_ran_on(self):
+        # Report 20260909-234646 carried a launcher log and a server log and
+        # nothing that said what kind of machine it was, so the only clue was
+        # a lowercase `C:\users\xuser` path in a log line.
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        error_reports.finalize_session(session, ended_at="end")
+
+        payloads = self._archive_all(error_reports.create_report())
+
+        for name in ("environment.txt", "installed-mods.txt",
+                     "missing-dependencies.txt"):
+            self.assertIn(name, payloads)
+            self.assertTrue(payloads[name])
+        environment = payloads["environment.txt"].decode("utf-8")
+        self.assertIn("== machine", environment)
+        self.assertIn("== game", environment)
+        self.assertIn("session: %s" % self.SESSION_1, environment)
+
+    def test_a_dump_gives_up_its_crash_banner_as_text(self):
+        # The 1.27 GB dump in report 20260909-232240 was worth exactly one
+        # sentence, which the client had already written onto its own stack.
+        banner = (b"\0Application C:/wot/WorldOfTanks.exe crashed "
+                  b"09.09.2026 at 23:22:27\r\nMessage:\r\nFATAL ERROR: The "
+                  b"device has been removed. \r\nMemory status:\r\n"
+                  b"System: 1022021632/3221225472 [31.73% used]\0")
+        session = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1,
+            started_at="start")
+        paths = error_reports.session_dump_paths(session)
+        self._write(paths[error_reports.ROLE_HIDDEN_WORKER],
+                    b"\0" * 4096 + banner + b"\0" * 4096)
+        self.assertTrue(error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_HIDDEN_WORKER]))
+        error_reports.finalize_session(session, ended_at="end")
+
+        report = error_reports.create_report()
+        payloads = self._archive_all(report)
+
+        text = payloads["hidden-worker.crash-text.txt"].decode("utf-8")
+        self.assertIn("FATAL ERROR: The device has been removed.", text)
+        self.assertIn("System: 1022021632/3221225472 [31.73% used]", text)
+        self.assertIn("hidden-worker.crash-text.txt", report["included"])
+        # The dump itself is still copied whole, byte for byte.
+        self.assertEqual(b"\0" * 4096 + banner + b"\0" * 4096,
+                         payloads["hidden-worker.dmp"])
+
+    def test_a_dump_without_a_banner_adds_no_crash_text(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1,
+            started_at="start")
+        paths = error_reports.session_dump_paths(session)
+        self._write(paths[error_reports.ROLE_HIDDEN_WORKER], b"no banner here")
+        self.assertTrue(error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_HIDDEN_WORKER]))
+        error_reports.finalize_session(session, ended_at="end")
+
+        payloads = self._archive_all(error_reports.create_report())
+
+        self.assertNotIn("hidden-worker.crash-text.txt", payloads)
+        self.assertIn("hidden-worker.dmp", payloads)
+
+    def test_a_session_with_nothing_collected_is_still_refused(self):
+        # The generated sections describe the machine, not the session. They
+        # must not make an empty session look like a collectable report.
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        error_reports.finalize_session(session, ended_at="end")
+
+        with self.assertRaises(core.LauncherError):
+            error_reports.create_report()
+
+    def test_a_failing_section_does_not_cost_the_logs(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        error_reports.finalize_session(session, ended_at="end")
+
+        with mock.patch.object(
+                error_reports.report_environment, "installed_mods_report",
+                side_effect=RuntimeError("disk fell over")):
+            payloads = self._archive_all(error_reports.create_report())
+
+        self.assertEqual(b"visible\n", payloads["visible-client.log"])
+        self.assertIn(
+            "disk fell over",
+            payloads["installed-mods.txt"].decode("utf-8"))
+        self.assertIn("environment.txt", payloads)
+
     def test_partial_single_player_report_names_missing_current_logs(self):
         session = error_reports.begin_session(
             self.game, needs_worker=True, local_server=True,
@@ -470,7 +696,11 @@ class ErrorReportTest(unittest.TestCase):
 
         report = error_reports.create_report()
 
-        self.assertEqual(("visible-client.log",), report["included"])
+        # The generated sections are named too: the player is sending a
+        # description of their machine and mod list, so the launcher says so.
+        self.assertEqual(
+            ("visible-client.log", "environment.txt", "installed-mods.txt",
+             "missing-dependencies.txt"), report["included"])
         self.assertEqual(
             ("server.log", "hidden-worker.log"), report["missing"])
         self.assertEqual((), report["notRun"])

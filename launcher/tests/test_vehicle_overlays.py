@@ -752,33 +752,54 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertEqual(8, by_name["R12_Test"]["level"])
         self.assertTrue(by_name["R12_Test"]["notInShop"])
 
-    def test_the_gold_shop_lists_every_vehicle_priced_in_gold(self):
+    def test_the_gold_shop_keeps_hidden_rewards_and_excludes_observers(self):
         rows = vehicle_overlays.list_gold_vehicles(self.game)
-
-        # Highest tier first, which is the order a shop is read in.
-        self.assertEqual(
-            ["ussr:R12_Test", "ussr:Observer"],
-            [row["name"] for row in rows])
+        self.assertEqual(["ussr:R12_Test"], [row["name"] for row in rows])
         self.assertEqual(12500, rows[0]["gold"])
+        self.assertEqual("lightTank", rows[0]["vehicleClass"])
         self.assertEqual(8, rows[0]["level"])
         self.assertTrue(rows[0]["notInShop"])
-        self.assertFalse(rows[1]["notInShop"])
 
-    def test_the_gold_shop_offers_what_the_editor_refuses_to_touch(self):
-        """A vehicle the data editor will not rewrite is still ownable.
+    def test_the_gold_shop_includes_zero_price_rewards_but_not_starter_tanks(self):
+        def record(vehicle, credits, gold, not_in_shop, level):
+            return dict(nation="germany", vehicle=vehicle,
+                        tags=("heavyTank", "secret", "unrecoverable"),
+                        vehicleClass="heavyTank",
+                        credits=credits, gold=gold, notInShop=not_in_shop,
+                        level=level)
 
-        ``selectable`` keeps native construction hazards out of an editor that
-        changes a vehicle's data.  Buying one is a different question, and the
-        client answers it when it builds the record.
-        """
-        choices = vehicle_overlays.list_vehicle_choices(self.game)
+        records = [
+            record("G04_PzVI_Tiger_IA", 0, 0, True, 7),
+            record("Starter", 0, 0, False, 1),
+            record("CreditTank", 1000, 0, False, 3),
+            record("HiddenCreditTank", 1000, 0, True, 3),
+        ]
+        with mock.patch.object(vehicle_overlays, "_vehicle_roster_from_archive",
+                               return_value=records):
+            rows = vehicle_overlays.list_gold_vehicles(self.game)
+        self.assertEqual(["germany:G04_PzVI_Tiger_IA"],
+                         [row["name"] for row in rows])
+        self.assertEqual(0, rows[0]["gold"])
 
-        self.assertNotIn(
-            "Observer", [choice["vehicle"] for choice in choices])
-        self.assertIn(
-            "Observer",
-            [row["vehicle"]
-             for row in vehicle_overlays.list_gold_vehicles(self.game)])
+    def test_the_gold_shop_excludes_unavailable_save_vehicles(self):
+        unavailable = [
+            ("germany", "G138_VK168_02_Mauerbrecher", ("heavyTank",)),
+            ("germany", "G65_JagdTiger_SdKfz_185_IGR", ("AT-SPG", "premiumIGR")),
+            ("usa", "A13_T34_hvy_IGR", ("heavyTank", "premiumIGR")),
+            ("ussr", "R54_KV-5_IGR", ("heavyTank", "premiumIGR")),
+            ("germany", "G48_E-25_IGR", ("AT-SPG", "premiumIGR")),
+            ("france", "F28_105_leFH18B2_IGR", ("SPG", "premiumIGR")),
+            ("ussr", "R31_Valentine_LL_IGR", ("lightTank", "premiumIGR")),
+            ("ussr", "Event", ("lightTank", "event_battles")),
+            ("ussr", "Fallout", ("heavyTank", "fallout")),
+            ("ussr", "Tank_bootcamp", ("lightTank", "secret")),
+        ]
+        records = [dict(nation=nation, vehicle=vehicle, tags=tags, gold=1,
+                        credits=0, notInShop=False)
+                   for nation, vehicle, tags in unavailable]
+        with mock.patch.object(vehicle_overlays, "_vehicle_roster_from_archive",
+                               return_value=records):
+            self.assertEqual([], vehicle_overlays.list_gold_vehicles(self.game))
 
     def test_vehicle_browser_resolves_shared_topology_and_impact(self):
         choices = vehicle_overlays.list_vehicle_choices(self.game)
@@ -1122,15 +1143,15 @@ class VehicleOverlayTest(unittest.TestCase):
         field_path = "Shell-A/damage/devices"
 
         result = vehicle_overlays.apply_vehicle_edit(
-            self.game, self.SHELLS, field_path, "30",
+            self.game, self.SHELLS, field_path, "2000",
             is_running=lambda: False)
 
         value = vehicle_overlays._find_value(
             self._root(self.SHELLS), field_path)
         self.assertEqual(packed.TYPE_INTEGER, value.value_type)
-        self.assertEqual(30, value.value)
+        self.assertEqual(2000, value.value)
         self.assertEqual("27", result["originalValue"])
-        self.assertEqual("30", result["currentValue"])
+        self.assertEqual("2000", result["currentValue"])
 
     def test_ids_resources_compressed_strings_and_missing_children_are_refused(self):
         refused = (
@@ -1837,6 +1858,197 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertEqual(["Heavy"],
                          vehicle_overlays.list_vehicle_profiles(self.game))
 
+    def _bot_exclusion_profile(self, name="Tuning"):
+        vehicle_overlays.create_vehicle_profile(self.game, name)
+        vehicle_overlays.set_vehicle_profile_options(self.game, name, True)
+        return name
+
+    def _profile_excluded_after_edit(self, member, field_path, value,
+                                     name="Tuning"):
+        vehicle_overlays.apply_profile_edit(
+            self.game, name, member, field_path, value,
+            is_running=lambda: False)
+        return vehicle_overlays.profile_bot_excluded_vehicles(self.game, name)
+
+    def test_bot_exclusion_defaults_false_for_new_and_legacy_profiles(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "New")
+        self.assertEqual(
+            {"excludeEditedVehiclesFromBots": False},
+            vehicle_overlays.get_vehicle_profile_options(self.game, "New"))
+        path = vehicle_overlays.profile_store_path(self.game)
+        with open(path, "r", encoding="utf-8") as stream:
+            store = json.load(stream)
+        store["profiles"][0].pop("excludeEditedVehiclesFromBots", None)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(store, stream)
+        self.assertEqual(
+            {"excludeEditedVehiclesFromBots": False},
+            vehicle_overlays.get_vehicle_profile_options(self.game, "New"))
+        self.assertEqual([], self._profile_excluded_after_edit(
+            self.VEHICLE, "speedLimits/forward", "40", name="New"))
+        self.assertEqual([], vehicle_overlays.profile_bot_excluded_vehicles(
+            self.game, None))
+
+    def test_bot_exclusion_options_are_isolated_and_survive_clear(self):
+        self._bot_exclusion_profile("Fast")
+        vehicle_overlays.create_vehicle_profile(self.game, "Heavy")
+        self.assertEqual(
+            {"excludeEditedVehiclesFromBots": True},
+            vehicle_overlays.get_vehicle_profile_options(self.game, "Fast"))
+        self.assertEqual(
+            {"excludeEditedVehiclesFromBots": False},
+            vehicle_overlays.get_vehicle_profile_options(self.game, "Heavy"))
+        self.assertEqual([], vehicle_overlays.profile_bot_excluded_vehicles(
+            self.game, "Fast"))
+        self.assertEqual(["ussr:R11_MS-1"], self._profile_excluded_after_edit(
+            self.VEHICLE, "speedLimits/forward", "40", name="Fast"))
+        vehicle_overlays.clear_vehicle_profile(
+            self.game, "Fast", is_running=lambda: False)
+        self.assertEqual(
+            {"excludeEditedVehiclesFromBots": True},
+            vehicle_overlays.get_vehicle_profile_options(self.game, "Fast"))
+        self.assertEqual([], vehicle_overlays.profile_bot_excluded_vehicles(
+            self.game, "Fast"))
+
+    def test_bot_exclusion_option_requires_a_boolean_in_api_and_store(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Tuning")
+        for value in (None, 0, 1, "true", [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(vehicle_overlays.VehicleOverlayError):
+                    vehicle_overlays.set_vehicle_profile_options(
+                        self.game, "Tuning", value)
+                self.assertEqual(
+                    {"excludeEditedVehiclesFromBots": False},
+                    vehicle_overlays.get_vehicle_profile_options(
+                        self.game, "Tuning"))
+        path = vehicle_overlays.profile_store_path(self.game)
+        with open(path, "r", encoding="utf-8") as stream:
+            original = json.load(stream)
+        for value in (None, 0, 1, "true", [], {}):
+            store = copy.deepcopy(original)
+            store["profiles"][0]["excludeEditedVehiclesFromBots"] = value
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(store, stream)
+            with self.subTest(stored_value=value):
+                with self.assertRaises(vehicle_overlays.VehicleOverlayError):
+                    vehicle_overlays.get_vehicle_profile_options(
+                        self.game, "Tuning")
+
+    def test_bot_exclusions_ignore_numeric_noops_and_deduplicate_direct_edits(self):
+        guns = packed.read_packed_xml(self.members[self.GUNS])
+        gun = child(child(guns, "shared").value, "Gun-A").value
+        child(gun, "reloadTime").value = b"2.50"
+        self.members[self.GUNS] = packed.write_packed_xml(guns)
+        self._write_package()
+        self._bot_exclusion_profile()
+        self.assertEqual([], self._profile_excluded_after_edit(
+            self.VEHICLE, "speedLimits/forward", "32"))
+        self.assertEqual([], self._profile_excluded_after_edit(
+            self.GUNS, "shared/Gun-A/reloadTime", "2.5"))
+        self.assertEqual(["ussr:R11_MS-1"], self._profile_excluded_after_edit(
+            self.VEHICLE, "speedLimits/forward", "40"))
+        self.assertEqual(["ussr:R11_MS-1"], self._profile_excluded_after_edit(
+            self.VEHICLE, "speedLimits/backward", "10"))
+        self.assertEqual(["ussr:R11_MS-1"], self._profile_excluded_after_edit(
+            self.VEHICLE, "speedLimits/forward", "32"))
+        self.assertEqual([], self._profile_excluded_after_edit(
+            self.VEHICLE, "speedLimits/backward", "8"))
+
+    def test_bot_exclusions_follow_component_leaves_and_local_overrides(self):
+        root = packed.read_packed_xml(self.members[self.VEHICLE])
+        engines = child(root, "engines").value
+        engines.children = [(b"GAZ-M1", element([
+            (b"power", scalar(packed.TYPE_INTEGER, 95)),
+        ]))]
+        self.members[self.VEHICLE] = packed.write_packed_xml(root)
+        engines_root = packed.read_packed_xml(self.members[self.ENGINES])
+        shared = child(engines_root, "shared").value
+        shared.children.append((b"Unused", copy.deepcopy(
+            child(shared, "GAZ-M1"))))
+        self.members[self.ENGINES] = packed.write_packed_xml(engines_root)
+        self._write_package()
+        self._bot_exclusion_profile()
+        self.assertEqual([], self._profile_excluded_after_edit(
+            self.ENGINES, "shared/Unused/power", "120"))
+        self.assertEqual(
+            ["ussr:Observer", "ussr:R12_Test"],
+            self._profile_excluded_after_edit(
+                self.ENGINES, "shared/GAZ-M1/power", "120"))
+        self.assertEqual(
+            ["ussr:Observer", "ussr:R11_MS-1", "ussr:R12_Test"],
+            self._profile_excluded_after_edit(
+                self.ENGINES, "shared/GAZ-M1/maxHealth", "60"))
+
+    def test_bot_exclusions_keep_a_shared_gun_user_with_one_inherited_mount(self):
+        root = packed.read_packed_xml(self.members[self.VEHICLE])
+        turrets = child(root, "turrets0").value
+        turret = child(turrets, "T-18_mod").value
+        gun = child(child(turret, "guns").value, "Gun-A").value
+        gun.children.append((b"reloadTime", scalar(packed.TYPE_STRING, b"3.2")))
+        self.members[self.VEHICLE] = packed.write_packed_xml(root)
+        self._write_package()
+        self._bot_exclusion_profile()
+        self.assertEqual(
+            ["ussr:Observer", "ussr:R12_Test"],
+            self._profile_excluded_after_edit(
+                self.GUNS, "shared/Gun-A/reloadTime", "1.5"))
+        second = copy.deepcopy(turret)
+        child(child(second, "guns").value, "Gun-A").value.children = []
+        turrets.children.append((b"Second-turret", element(second.children)))
+        self.members[self.VEHICLE] = packed.write_packed_xml(root)
+        self._write_package()
+        self.assertEqual(
+            ["ussr:Observer", "ussr:R11_MS-1", "ussr:R12_Test"],
+            vehicle_overlays.profile_bot_excluded_vehicles(self.game, "Tuning"))
+
+    def test_bot_exclusions_follow_shell_users_across_distinct_guns(self):
+        guns_root = packed.read_packed_xml(self.members[self.GUNS])
+        shared = child(guns_root, "shared").value
+        shared.children.append((b"Gun-B", copy.deepcopy(child(shared, "Gun-A"))))
+        third = copy.deepcopy(child(shared, "Gun-A"))
+        shots = child(third.value, "shots").value
+        shots.children = [(b"Shell-B", value) for unused, value in shots.children]
+        shared.children.append((b"Gun-C", third))
+        self.members[self.GUNS] = packed.write_packed_xml(guns_root)
+        for member, gun_name in ((self.VEHICLE_TWO, b"Gun-B"),
+                                 (self.OBSERVER, b"Gun-C")):
+            root = packed.read_packed_xml(self.members[member])
+            turret = child(child(root, "turrets0").value, "T-18_mod").value
+            child(turret, "guns").value.children = [(gun_name, element([]))]
+            self.members[member] = packed.write_packed_xml(root)
+        self._write_package()
+        self._bot_exclusion_profile("Shot")
+        self.assertEqual(["ussr:R11_MS-1"], self._profile_excluded_after_edit(
+            self.GUNS, "shared/Gun-A/shots/Shell-A/piercingPower", "30 24",
+            name="Shot"))
+        self._bot_exclusion_profile("Shell")
+        self.assertEqual(
+            ["ussr:R11_MS-1", "ussr:R12_Test"],
+            self._profile_excluded_after_edit(
+                self.SHELLS, "Shell-A/damage/armor", "20", name="Shell"))
+
+    def test_bot_exclusions_map_direct_and_shared_siege_edits_to_base_vehicle(self):
+        self._install_siege_pair()
+        self._bot_exclusion_profile("Direct siege")
+        self.assertEqual(["ussr:R13_Siege"], self._profile_excluded_after_edit(
+            self.SIEGE_MODE, "speedLimits/forward", "10", name="Direct siege"))
+        self.assertEqual(["ussr:R13_Siege"], self._profile_excluded_after_edit(
+            self.SIEGE_VEHICLE, "hull/weight", "2500", name="Direct siege"))
+        siege_root = packed.read_packed_xml(self.members[self.SIEGE_MODE])
+        child(siege_root, "engines").value.children = [
+            (b"Siege-engine", scalar(packed.TYPE_STRING, b"shared"))]
+        self.members[self.SIEGE_MODE] = packed.write_packed_xml(siege_root)
+        engines_root = packed.read_packed_xml(self.members[self.ENGINES])
+        shared = child(engines_root, "shared").value
+        shared.children.append((b"Siege-engine", copy.deepcopy(
+            child(shared, "GAZ-M1"))))
+        self.members[self.ENGINES] = packed.write_packed_xml(engines_root)
+        self._write_package()
+        self._bot_exclusion_profile("Shared siege")
+        self.assertEqual(["ussr:R13_Siege"], self._profile_excluded_after_edit(
+            self.ENGINES, "shared/Siege-engine/power", "120",
+            name="Shared siege"))
+
     def test_profile_names_are_trimmed_case_unique_and_reserve_original(self):
         self.assertEqual("Fast", vehicle_overlays.create_vehicle_profile(
             self.game, "  Fast  "))
@@ -1873,6 +2085,7 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertIn('--paths', content)
         self.assertIn('--hidden-import packed_xml', content)
         self.assertIn('Launcher build dependency is missing', content)
+
 
 
 class FetchedOverlayTest(VehicleOverlayTest):

@@ -420,7 +420,7 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 	'''Interior modules and crew the shell REALLY passed through.
 
 	Returns [(entry_distance, extraName)] sorted front to back, or None when no
-	layout is available. The profile boxes live in their parent component's own
+	layout is available. Interior geometry lives in its parent component's own
 	space, so the segment goes through exactly the two transforms
 	Vehicle.getComponents applies: world -> vehicle -> component, which also
 	accounts for the current turret yaw and gun pitch.
@@ -436,6 +436,9 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 	targets = layout.get('targets') or ()
 	if not targets:
 		return None
+	components = target_mock.getComponents()
+	if not components:
+		return []
 	import Math
 	from gui.mods.offline_lan_0922 import internal_geometry as _IG
 	_dx = float(end_pos.x) - float(start_pos.x)
@@ -449,7 +452,10 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 	_vs = inv.applyPoint(Math.Vector3(start_pos.x, start_pos.y, start_pos.z))
 	_ve = inv.applyPoint(Math.Vector3(end_pos.x, end_pos.y, end_pos.z))
 	local = {}
-	for compDescr, compMatrix in target_mock.getComponents():
+	for compDescr, compMatrix, isAttached in components:
+		if not isAttached:
+			# A detached turret took its interior modules and crew with it.
+			continue
 		name = None
 		for candidate in ('chassis', 'hull', 'turret', 'gun'):
 			if compDescr is getattr(td, candidate, None):
@@ -479,12 +485,8 @@ def _offh_internal_ray_hits(target_mock, td, start_pos, end_pos, covered=()):
 		# the stopping/exit-plate filters compare them.
 		hits.append((float(interval[0]) * _world_length, name))
 	hits.sort()
-	# ONE roll per device, not per box. The profiles model a module as several
-	# boxes - an ammo rack is typically three (hull floor left, hull floor right,
-	# turret ready rack) - and a shell through the fighting compartment crosses
-	# two of them. Scoring both would give that module twice the saving throw WG
-	# gives it. The log showed exactly that: 'ammoBayHealth@0.04,
-	# ammoBayHealth@0.04' from a single strike. Keep the nearest box per device.
+	# Keep the nearest contact per device: disconnected source pieces and
+	# retained reconstructed zones must not multiply the saving throw.
 	seen = set()
 	unique = []
 	for dist, name in hits:
@@ -532,6 +534,9 @@ def _offh_internal_cone_hits(target_mock, td, burst_pos, direction, shell,
 	depth = _offh_he_internal_depth(shell)
 	if depth <= 0.0001:
 		return []
+	components = target_mock.getComponents()
+	if not components:
+		return []
 	try:
 		bx, by, bz = _offh_xyz(burst_pos)
 		dx, dy, dz = _offh_xyz(direction)
@@ -553,7 +558,9 @@ def _offh_internal_cone_hits(target_mock, td, burst_pos, direction, shell,
 	vehicle_burst = inv.applyPoint(world_burst)
 	vehicle_tip = inv.applyPoint(world_tip)
 	contexts = {}
-	for compDescr, compMatrix in target_mock.getComponents():
+	for compDescr, compMatrix, isAttached in components:
+		if not isAttached:
+			continue
 		name = None
 		for candidate in ('chassis', 'hull', 'turret', 'gun'):
 			if compDescr is getattr(td, candidate, None):
@@ -620,8 +627,14 @@ def _offh_internal_cone_hits(target_mock, td, burst_pos, direction, shell,
 
 
 def _device_td(mock):
-	import BigWorld
-	return getattr(mock, 'typeDescriptor', getattr(BigWorld.player(), 'vehicleTypeDescriptor', None))
+	# Server projections already own their descriptor and cannot import BigWorld.
+	# An explicit None also belongs to this vehicle; only a missing attribute
+	# retains the stock player-descriptor fallback.
+	try:
+		return mock.typeDescriptor
+	except AttributeError:
+		import BigWorld
+		return getattr(BigWorld.player(), 'vehicleTypeDescriptor', None)
 
 
 def _crew_roster(td):
@@ -987,20 +1000,16 @@ def _apply_module_damage(target_mock, all_hits, start_pos, end_pos, dmg, _shell,
 			if getattr(_hm0, 'vehicleDamageFactor', 1.0) != 0.0 and float(getattr(_hm0, 'armor', 0.0) or 0.0) > 0.0:
 				if _hd0 < _stop_d:
 					_stop_d = _hd0
-	# Interior devices have no collision geometry in this client: all 1975
-	# collision meshes carry armor_N, gun, both tracks, surveyingDevice and
-	# gunBreech and nothing else. Adopted per-tank profiles provide the only
-	# reliable interior boxes. Without one, fail closed instead of inventing a
-	# compartment hit; native external device geometry still runs below.
+	# PC component materials supply external contacts. Selected Console meshes
+	# (or explicitly retained authored profiles) supply interior contacts. A
+	# missing source must not fabricate a compartment hit.
 	_scored = all_hits
 	if (internal_hits is not None or penetrated is not False) and bool(
 			_MDCFG.get('internal_module_damage', True)):
 		try:
-			# Preferred path: the adopted per-tank profiles give every interior
-			# module and crewman a real box, so the shell either crosses one or
-			# it does not - no zone guess involved. Each crossed box gets its own
-			# saving throw, which is how a round through the engine bay can take
-			# the engine AND a fuel tank.
+			# Query the selected component-local geometry. Multiple reached
+			# pieces of one device produce one saving throw; distinct devices
+			# keep independent rolls.
 			_covered = set()
 			for _h2 in all_hits:
 				_m2 = _h2[2]
@@ -1607,8 +1616,7 @@ def apply_payload(vehicle, payload):
     return tuple(normalized)
 
 
-def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False,
-                repair_factor=None):
+def tick_repair(vehicle, dt, repair_skill=100.0, repair_factor=None):
     """Advance copied 0.8.2 repair law; transport/presentation stay outside."""
     if vehicle is None or dt is None or dt <= 0.0:
         return None
@@ -1632,7 +1640,7 @@ def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False,
                 bool(getattr(vehicle, 'is_on_fire', False))):
             continue
         devices[name] = _device_damage.repair_step_hp(
-            devices[name], name, descriptor, dt, repair_skill, has_big_kit,
+            devices[name], name, descriptor, dt, repair_skill,
             repair_factor)
         was_destroyed = name in destroyed
         if was_destroyed and devices[name] >= cap:
@@ -1762,10 +1770,8 @@ def tick_fire(vehicle, dt, now=None, module_test_mode=False):
         # The interval may complete the final burn tick before the fire-out
         # transition. Only time after this exact boundary is excluded.
         _offh_extinguish(vehicle, False, 'burnt out')
-        # ``_offh_extinguish`` is a copied presentation helper and imports
-        # BigWorld before resolving the descriptor.  The authority simulator is
-        # intentionally engine-free, so complete the same fuel-tank transition
-        # through the pure descriptor seam as part of this public tick contract.
+        # Keep the public fire-tick contract explicit about restoring the
+        # destroyed fuel tank to its exact descriptor regeneration pool.
         _restore_fuel_regen_cap(vehicle)
     after = _state(vehicle)
     return damage, _payload(

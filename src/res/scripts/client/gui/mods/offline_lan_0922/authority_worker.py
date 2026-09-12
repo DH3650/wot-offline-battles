@@ -134,6 +134,41 @@ def _load_battle_runtime():
     return BattleRuntime
 
 
+def _transport_failure_text(kind, message):
+    """Name the transport event that ended a round, not just its shape.
+
+    Report 20260909-223753's visible client logged only
+    ``simulation worker failed: worker transport lost``, 32 ms before the
+    worker faulted.  That text is this fallback: the event carried an empty
+    ``message`` field, so the socket error that actually happened was never
+    recorded anywhere in the report.  Naming the event kind and whatever the
+    payload did carry costs one line and makes the next report answerable.
+    """
+    detail = ''
+    code = ''
+    if isinstance(message, dict):
+        try:
+            detail = str(message.get('message') or '').strip()
+            code = str(message.get('code') or '').strip()
+        except Exception:
+            detail = ''
+            code = ''
+    if detail and code:
+        return '%s (%s, code %s)' % (detail, kind, code)
+    if detail:
+        return '%s (%s)' % (detail, kind)
+    if code:
+        return 'worker transport lost (%s, code %s)' % (kind, code)
+    keys = ''
+    if isinstance(message, dict):
+        try:
+            keys = ','.join(sorted(str(name) for name in message)[:12])
+        except Exception:
+            keys = ''
+    return 'worker transport lost (%s, no message; payload keys: %s)' % (
+        kind, keys or 'none')
+
+
 class AuthorityWorkerLANClient(LANClient):
     """LAN v5 transport whose identity never enters ``players``."""
 
@@ -197,7 +232,8 @@ class AuthorityWorkerLANClient(LANClient):
                                  source_batch_horizon_us=None,
                                  human_ram_armors=None,
                                  edge_sample_time_us=None,
-                                 edge_revision=None):
+                                 edge_revision=None,
+                                 detached_turrets=None):
         """Queue BotRuntime's canonical publication as one frozen wire blob."""
         if not self.is_bot_authority():
             return False
@@ -225,11 +261,14 @@ class AuthorityWorkerLANClient(LANClient):
             return False
         if human_ram_armors is not None:
             message['human_ram_armors'] = human_ram_armors
+        if detached_turrets is not None:
+            self._attach_detached_turret_proposals(message, detached_turrets)
         try:
             coalesce_key = (
                 self.round_id, self.authority_epoch,
                 edge_sample_time_us, edge_revision,
-                _trusted_human_ram_edge(human_ram_armors))
+                _trusted_human_ram_edge(human_ram_armors),
+                message.get('detached_turrets'))
         except Exception:
             return False
         return self._send_preencoded_trusted(
@@ -1142,7 +1181,7 @@ class WorkerSession(object):
                 message.get('message') or 'worker battle failed'))
         elif kind in ('error', 'connection_lost', 'disconnected'):
             self._worker_failure(RuntimeError(
-                message.get('message') or 'worker transport lost'))
+                _transport_failure_text(kind, message)))
         self._write_status()
 
     def _on_batch_drained(self):

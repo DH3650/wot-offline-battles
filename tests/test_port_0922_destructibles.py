@@ -737,6 +737,178 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         destructibles_sensor.xrange = range
         return area, bigworld, math_module, descriptor
 
+    def _authored_tree_identity_fixture(self):
+        area, bigworld, math_module, vehicle = self._scanner_tree_fixture()
+        tree = 'speedtree/test/scanner-oak.spt'
+        fence = 'content/test/fence.model'
+        matrices = (_ItemMatrix(_Vector(50, 0, 50)),
+                    _ItemMatrix(_Vector(55, 0, 50)),
+                    _ItemMatrix(_Vector(60, 0, 50)))
+        signatures = [list(destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)) for matrix in matrices]
+        catalog = _catalog({fence: {
+            'kind': 'fragile', 'boxes': [[-1, -1, -1, 1, 2, 1, None]],
+        }}, [signatures[2] + [fence, 0, 22, 2, 1.0]])
+        catalog['tree_instances'] = [
+            signatures[index] + [tree, 22, index] for index in (0, 1)]
+        destructibles_sensor.set_catalog(catalog)
+        area.g_destructiblesManager.set_chunk_count(22, 3)
+        descriptors = {tree: {'type': 1, 'health': 10, 'mass': 20},
+                       fence: {'type': 3, 'health': 15}}
+        area.g_cache.getDescByFilename = descriptors.get
+        # One tree is omitted; the fence's independent identity stays usable.
+        bigworld.wg_getChunkDestrFilenames.return_value = (tree,)
+        bigworld.wg_getDestructibleEffectCategory.side_effect = (
+            lambda space, chunk, item, module: 1 if item < 2 else 3)
+        bigworld.wg_getDestructibleMatrix.side_effect = (
+            lambda space, chunk, item: matrices[item])
+        bigworld.wg_getDestructibleFilename = mock.Mock(
+            side_effect=AssertionError('unsafe scalar filename query'))
+        return area, bigworld, math_module, vehicle, tree, matrices
+
+    def test_mode_excluded_tree_never_reaches_native_descriptor_or_registry(self):
+        area, bigworld, math_module, vehicle, tree, unused = (
+            self._authored_tree_identity_fixture())
+        # The compiled slot still exists, but its scene tree does not.
+        catalog = destructibles_sensor._destructible_catalog
+        catalog['tree_instances'].pop((22, 1))
+        catalog['excluded_instances'].add((22, 1))
+        category = bigworld.wg_getDestructibleEffectCategory.side_effect
+        matrix = bigworld.wg_getDestructibleMatrix.side_effect
+        def category_guard(space, chunk, item, module):
+            self.assertNotEqual(1, item, 'queried mode-excluded native slot')
+            return category(space, chunk, item, module)
+        def matrix_guard(space, chunk, item):
+            self.assertNotEqual(1, item, 'queried nonexistent scene tree')
+            return matrix(space, chunk, item)
+        bigworld.wg_getDestructibleEffectCategory.side_effect = category_guard
+        bigworld.wg_getDestructibleMatrix.side_effect = matrix_guard
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}):
+            self.assertEqual(('invalid', None),
+                destructibles_compat.inspect_destructible_desc(area.g_cache, 1, 22, 1))
+            self.assertEqual('ready', destructibles_sensor.prewarm_tree_registry(
+                1, _Vector(), 0.0, vehicle, 1.0)['status'])
+            self.assertEqual(('resolved', {'type': 1, 'health': 10, 'mass': 20}),
+                destructibles_compat.inspect_destructible_desc(area.g_cache, 1, 22, 0))
+        self.assertFalse(getattr(destructibles_sensor, 'g_offh_destr_isolated_slots', ()))
+
+    def test_authored_tree_names_recover_compaction_without_blocking_fence(self):
+        area, bigworld, math_module, vehicle, tree, unused = (
+            self._authored_tree_identity_fixture())
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}):
+            result = destructibles_sensor.prewarm_tree_registry(
+                1, _Vector(), 0.0, vehicle, 1.0)
+            fence = destructibles_sensor._stream_baked_shot_instance_1513(
+                1, (22, 2))
+            second_tree = destructibles_compat.inspect_destructible_desc(
+                area.g_cache, 1, 22, 1)
+        self.assertEqual('ready', result['status'])
+        self.assertEqual('fragile', fence['kind'])
+        self.assertEqual('resolved', second_tree[0])
+        self.assertFalse(getattr(
+            destructibles_sensor, 'g_offh_destr_isolated_chunks', ()))
+        self.assertFalse(getattr(
+            destructibles_sensor, 'g_offh_destr_isolated_slots', ()))
+        bigworld.wg_getDestructibleFilename.assert_not_called()
+
+    def test_tree_callback_does_not_wait_for_whole_chunk_name_budget(self):
+        area, bigworld, math_module, unused, tree, matrices = (
+            self._authored_tree_identity_fixture())
+        # Stock effect/animator calls are synchronous even when another chunk
+        # owns the complete incremental name-query allowance.
+        destructibles_sensor.g_offh_destr_item_name_budget = {
+            'focus': (1, 99), 'remaining': 0, 'tick_serial': 1,
+            'focus_last_seen': 1,
+        }
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}):
+            first = destructibles_compat.inspect_destructible_desc(
+                area.g_cache, 1, 22, 1)
+            self.assertEqual('resolved', first[0])
+            self.assertEqual(1, bigworld.wg_getDestructibleMatrix.call_count)
+            matrices[1].translation = _Vector(57, -1, 50)
+            self.assertEqual(first,
+                             destructibles_compat.inspect_destructible_desc(
+                                 area.g_cache, 1, 22, 1))
+            self.assertEqual(1, bigworld.wg_getDestructibleMatrix.call_count)
+            destructibles_sensor._invalidate_chunk_native_names_1513(22)
+            with mock.patch.object(sys, 'stdout', mock.Mock()):
+                self.assertEqual(
+                    ('invalid', None),
+                    destructibles_compat.inspect_destructible_desc(
+                        area.g_cache, 1, 22, 1))
+        self.assertEqual(2, bigworld.wg_getDestructibleMatrix.call_count)
+        bigworld.wg_getDestructibleFilename.assert_not_called()
+
+    def test_authored_tree_rejects_live_type_name_or_transform_conflict(self):
+        for conflict in ('type', 'name', 'matrix'):
+            with self.subTest(conflict=conflict):
+                area, bigworld, math_module, unused, tree, matrices = (
+                    self._authored_tree_identity_fixture())
+                if conflict == 'type':
+                    bigworld.wg_getDestructibleEffectCategory.side_effect = None
+                    bigworld.wg_getDestructibleEffectCategory.return_value = 3
+                elif conflict == 'name':
+                    bigworld.wg_getChunkDestrFilenames.return_value = (
+                        tree, 'speedtree/test/different.spt', '')
+                else:
+                    matrices[1].translation = _Vector(100, 0, 50)
+                with mock.patch.dict(sys.modules, {
+                        'AreaDestructibles': area, 'BigWorld': bigworld,
+                        'Math': math_module}), mock.patch.object(
+                            sys, 'stdout', mock.Mock()):
+                    self.assertEqual(
+                        ('invalid', None),
+                        destructibles_sensor.resolve_native_item_name_1513(
+                            1, 22, 1))
+                self.assertEqual(
+                    {(22, 1)}, destructibles_sensor.g_offh_destr_isolated_slots)
+                self.assertFalse(getattr(
+                    destructibles_sensor, 'g_offh_destr_isolated_chunks', ()))
+                bigworld.wg_getDestructibleFilename.assert_not_called()
+
+    def test_tree_callback_resolves_while_chunk_name_list_is_pending(self):
+        area, bigworld, math_module, unused, tree, matrices = (
+            self._authored_tree_identity_fixture())
+        bigworld.wg_getChunkDestrFilenames.return_value = None
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}):
+            self.assertEqual(
+                ('exact', tree),
+                destructibles_sensor.resolve_native_item_name_1513(1, 22, 1))
+        bigworld.wg_getDestructibleEffectCategory.assert_called_once_with(
+            1, 22, 1, -1)
+
+    def test_chunk_reload_invalidates_before_synchronous_stock_damage(self):
+        area, bigworld, math_module, unused, tree, matrices = (
+            self._authored_tree_identity_fixture())
+        manager = area.g_destructiblesManager
+        observed = []
+
+        def stock_load(owner, chunk_id, count):
+            observed.append((owner, chunk_id, count))
+            self.assertNotIn((22, 1), destructibles_compat._SAFE_DESC_BY_WIRE)
+            return destructibles_compat.inspect_destructible_desc(
+                area.g_cache, 1, chunk_id, 1)
+
+        callback = destructibles_compat._chunk_identity_boundary(area, stock_load)
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}), mock.patch.object(
+                    sys, 'stdout', mock.Mock()):
+            self.assertEqual('resolved',
+                             destructibles_compat.inspect_destructible_desc(
+                                 area.g_cache, 1, 22, 1)[0])
+            matrices[1].translation = _Vector(100, 0, 50)
+            self.assertEqual(('invalid', None), callback(manager, 22, 3))
+        self.assertEqual([(manager, 22, 3)], observed)
+
     def _tree_motion_fixture(self, positions, bbox=None, streamed=True):
         names = tuple(
             'speedtree/test/motion-%d.spt' % index
@@ -1094,6 +1266,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
         sweeps = destructibles_sensor._tree_pose_sweep_boxes_1513(
             start, start_yaw, end, end_yaw, bbox)
+        hulls = tuple(destructibles_sensor._tree_xz_zonotope_hull_1513(sweep)
+                      for sweep in sweeps)
 
         for sample in range(101):
             fraction = sample / 100.0
@@ -1111,9 +1285,105 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     world_z = (position.z - sine * local_x +
                                cosine * local_z)
                     self.assertTrue(any(
-                        destructibles_sensor._point_near_tree_sweep_1513(
-                            world_x, world_z, sweep, 0.0)
-                        for sweep in sweeps))
+                        destructibles_sensor._point_near_tree_hull_1513(
+                            world_x, world_z, hull, 0.0)
+                        for hull in hulls))
+
+    def test_tree_sweep_polygon_is_shared_across_trees_and_chunks_only_per_query(self):
+        positions = tuple(_Vector(-0.5, 0.0, 2.0 + index * 0.05)
+                          for index in range(12))
+        bbox = ((-1.0, -1.0, -3.0), (1.0, 1.0, 3.0), None)
+        (manager, area, bigworld, math_module, descriptor,
+         authority, destroyed, destroy_calls) = self._tree_motion_fixture(
+             positions, bbox=bbox)
+        manager.set_chunk_count(23, len(positions))
+        area.chunkIDFromPosition = lambda point: 22 if point.x < 0.0 else 23
+        bigworld.wg_getDestructibleMatrix.side_effect = (
+            lambda space, chunk, index: _ItemMatrix(_Vector(
+                -0.5 if chunk == 22 else 0.5, 0.0, positions[index].z)))
+        expected = {(chunk, index, None)
+                    for chunk in (22, 23) for index in range(12)}
+
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}), mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority), mock.patch.object(
+                    destructibles_sensor, '_tree_xz_zonotope_hull_1513',
+                    wraps=destructibles_sensor._tree_xz_zonotope_hull_1513
+                    ) as build_hull:
+            # Registration has a per-render-tick name budget. Observe both
+            # chunks becoming ready before measuring the shared query.
+            bigworld.time = lambda: float(tick)
+            for tick in range(8):
+                warmed = destructibles_sensor.prewarm_tree_registry(
+                    1, _Vector(), 0.0, descriptor, 1.0,
+                    priority_chunks=(22, 23))
+                if set(warmed['ready_chunks']) == {22, 23}:
+                    break
+            self.assertEqual({22, 23}, set(warmed['ready_chunks']))
+            build_hull.assert_not_called()
+            first = destructibles_sensor._tree_motion_proposal(
+                1, _Vector(), 0.0, _Vector(0.0, 0.0, 0.2), 0.0,
+                6.0, descriptor, 1.0)
+            self.assertEqual(expected, set(first['token']))
+            self.assertTrue(first['requires_commit'])
+            self.assertEqual(1, build_hull.call_count)
+
+            # The next proposal checks current destruction state even at the
+            # same pose. Geometry and physical verdicts never survive a query.
+            destroyed.update(expected)
+            second = destructibles_sensor._tree_motion_proposal(
+                1, _Vector(), 0.0, _Vector(0.0, 0.0, 0.2), 0.0,
+                6.0, descriptor, 1.1)
+            self.assertEqual(expected, set(second['token']))
+            self.assertFalse(second['requires_commit'])
+            self.assertEqual(2, build_hull.call_count)
+
+            # Turning the long hull away removes those contacts, although
+            # the same trees and sweep index are examined again.
+            turned = destructibles_sensor._tree_motion_proposal(
+                1, _Vector(), math.pi / 2.0,
+                _Vector(0.0, 0.0, 0.2), math.pi / 2.0,
+                6.0, descriptor, 1.2)
+            self.assertEqual('clear', turned['status'])
+            self.assertIsNone(turned['token'])
+            self.assertEqual(3, build_hull.call_count)
+        self.assertEqual([], destroy_calls)
+
+    def test_tree_sweep_without_eligible_candidates_does_not_build_polygon(self):
+        sweep = ((0.0, 0.0, 0.0),
+                 ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
+        bin_key = destructibles_sensor._destructible_bin_key(0.0, 0.0)
+        ineligible = [(1, 0.0, 0.0, 0.0, 2, 'model'),
+                      (2, 0.0, 0.0, 0.0, 1, '')]
+        with mock.patch.object(
+                destructibles_sensor, '_tree_xz_zonotope_hull_1513',
+                side_effect=AssertionError('unused polygon built')):
+            for registry in ({'bins': {}}, {'bins': {bin_key: ineligible}}):
+                hulls = {}
+                self.assertEqual(({}, set()),
+                    destructibles_sensor._tree_candidates_for_sweeps_1513(
+                        22, registry, (sweep,), 1, hulls))
+                self.assertEqual({}, hulls)
+
+    def test_legacy_tree_scanner_reuses_polygon_without_skipping_destruction(self):
+        positions = tuple(_Vector(0.0, 0.0, index * 0.1) for index in range(8))
+        (unused_manager, area, bigworld, math_module, descriptor,
+         authority, unused_destroyed, destroy_calls) = self._tree_motion_fixture(
+             positions)
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area, 'BigWorld': bigworld,
+                'Math': math_module}), mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority), mock.patch.object(
+                    destructibles_sensor, '_tree_xz_zonotope_hull_1513',
+                    wraps=destructibles_sensor._tree_xz_zonotope_hull_1513
+                    ) as build_hull:
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 1.0, descriptor)
+        self.assertEqual(1, build_hull.call_count)
+        self.assertEqual(list(range(8)), sorted(call[2] for call in destroy_calls))
 
     def test_tree_commit_applies_only_requested_subset_and_rejects_foreign(self):
         positions = (_Vector(0.0, 0.0, 4.0),
@@ -5860,8 +6130,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual('falling', instances[(22, 2)]['kind'])
         self.assertEqual(1, len(diagnostic_lines))
         self.assertIn(
-            'chunk=22 slots=3 names=1 named_items=1 names_status=exact '
-            'named=1 blank=2',
+            'chunk=22 slots=3 names=1 named_items=3 names_status=exact '
+            'named=3 blank=0',
                       diagnostic_lines[0])
         self.assertIn('v4_unique=2', diagnostic_lines[0])
         self.assertIn('registered=falling:1,fragile:1,tree:1',
@@ -6505,10 +6775,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             {'filename_identity_conflict'},
             destructibles_sensor.g_offh_destr_isolation_logs)
 
-    def test_partial_alignment_isolates_without_lending_a_descriptor(self):
-        # A chunk whose compaction cannot be reconstructed yields no per-item
-        # names at all.  Even an otherwise aligned type is not admitted from a
-        # partial chunk, because ownership of the remaining name is unknown.
+    def test_partial_alignment_isolates_only_the_unresolved_type(self):
+        # A compacted fragile group is ambiguous, but its missing name cannot
+        # belong to the independently typed and exactly aligned tree group.
         tree = 'speedtree/05_prohorovka/poplar.spt'
         fence = ('content/GatesAndFences/gaf001_WoodFence/normal/lod0/'
                  'gaf001_WoodFence.model')
@@ -6543,15 +6812,23 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                               'BigWorld': bigworld}), \
                 mock.patch.object(sys, 'stdout', mock.Mock()):
             self.assertEqual(
-                ('invalid', None),
+                ('exact', tree),
                 destructibles_sensor.resolve_native_item_name_1513(1, 22, 2))
             self.assertEqual(
                 ('invalid', None),
                 destructibles_sensor.resolve_native_item_name_1513(1, 22, 0))
 
+            destructibles_sensor.g_offh_destr_item_names.clear()
+            self.assertEqual(
+                ('exact', tree),
+                destructibles_sensor.resolve_native_item_name_1513(1, 22, 2))
+
         scalar.assert_not_called()
         self.assertEqual(
-            {22}, destructibles_sensor.g_offh_destr_isolated_chunks)
+            {(22, 0), (22, 1)},
+            destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertFalse(getattr(
+            destructibles_sensor, 'g_offh_destr_isolated_chunks', ()))
         self.assertEqual(
             {'name_alignment'},
             destructibles_sensor.g_offh_destr_isolation_logs)
@@ -10929,6 +11206,67 @@ class NativeItemNameContractTests(unittest.TestCase):
         self.assertEqual(first, after_mutation)
         self.assertEqual(((tree,), 'ready'), after_drop)
         self.assertEqual(2, query.call_count)
+
+
+class SightCollisionFilterTests(unittest.TestCase):
+    """A spotting ray must stop treating a broken skin as cover."""
+
+    def setUp(self):
+        destructibles_authority.reset(1)
+        self.addCleanup(destructibles_authority.reset)
+        # The callback reads the speculative ledger when it runs, not when it
+        # is built, so these globals have to outlive the build.
+        globals_dict = destructibles_sensor.__dict__
+        previous = dict(
+            (name, globals_dict.get(name)) for name in
+            ('g_offh_destr_speculative', 'g_offh_destr_broken_cache'))
+
+        def restore():
+            for name, value in previous.items():
+                if value is None:
+                    globals_dict.pop(name, None)
+                else:
+                    globals_dict[name] = value
+
+        self.addCleanup(restore)
+        globals_dict['g_offh_destr_speculative'] = set()
+        globals_dict['g_offh_destr_broken_cache'] = {}
+
+    def _filter(self, speculative=()):
+        destructibles_sensor.__dict__[
+            'g_offh_destr_speculative'] = set(speculative)
+        with mock.patch.object(
+                destructibles_sensor, '_destructible_catalog', {}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=destructibles_authority), \
+                mock.patch.object(
+                    destructibles_sensor,
+                    '_accepted_tree_collision_keys_1513',
+                    return_value=frozenset()):
+            return destructibles_sensor.sight_collision_filter()
+
+    def test_no_accepted_item_needs_no_filter(self):
+        self.assertIsNone(self._filter())
+
+    def test_an_accepted_item_stops_blocking_but_its_neighbour_does_not(self):
+        destructibles_authority._chunk(7)['keys'].add((3, None))
+
+        reject = self._filter()
+
+        self.assertTrue(callable(reject))
+        # wg_collideSegment reports (matKind, ?, itemIndex, chunkID).
+        self.assertFalse(reject(2, None, 3, 7))
+        self.assertTrue(reject(2, None, 4, 7))
+        self.assertTrue(reject(2, None, 3, 8))
+
+    def test_a_locally_predicted_break_yields_before_the_canonical_event(self):
+        reject = self._filter(speculative=[(7, 3, 2)])
+
+        self.assertTrue(callable(reject))
+        self.assertFalse(reject(2, None, 3, 7))
+        self.assertTrue(reject(2, None, 4, 7))
+
 
 if __name__ == '__main__':
     unittest.main()

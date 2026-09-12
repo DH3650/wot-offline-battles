@@ -126,6 +126,25 @@ simulation to the server: `BattleRuntime` continues to consume the original
 complete update locally. The optional shot yaw/pitch pair remains atomic at the
 projection boundary.
 
+A Bot checkpoint that cannot be encoded now publishes an identity-only
+`[bot_id]` row. The complete manifest roster and unique identities remain
+mandatory. The server retains that actor's last admitted pose and combat ACK;
+other rows advance normally. Frozen launches and ram reports involving that
+actor stay in the worker outbox until its checkpoint becomes encodable. The
+Bot/Bot ram report carries both frozen contact positions so recovery movement
+cannot invalidate an already observed collision. The server checks bounded
+finite coordinates, contact proximity, and immutable retry identity. An actor
+with an unavailable checkpoint holds new fire triggers until recovery, while
+its accepted burst continues; this preserves the burst identity needed to
+admit its frozen launches. If recovery spans the completed reload, the server
+validates the shot debit and reload completion as two ordinary ammunition
+transactions. The worker logs the round, actor and codec reason at a bounded
+cadence. Integration tests cover failure, retained ACK/state, frozen launch
+and contact recovery, and duplicate delivery.
+This contains the `223753` field report's whole-round failure; its discarded
+original codec reason cannot be reconstructed from the report. Windows #1513
+acceptance of the recovery path remains outstanding.
+
 The short 0.0975-second generic planning cache remains a steering and slope
 refresh. A typed exact 3x3 receipt has an independent containment contract and
 may cross that refresh only under its exact origin, yaw, travel sign and
@@ -302,7 +321,7 @@ living ally and cleanup revokes the exposure. Windows #1513 remains required
 to accept the native switch controls, camera continuity and repeated-round
 teardown.
 
-The 0.3.68 destructible boundary is pinned to a shipped schema-v7 destructible
+The destructible boundary is pinned to a schema-v8 destructible
 catalog and schema-v4 foliage catalog baked from all 41 exact #1513 map
 packages; the exact-instance runtime shape starts at schema version 4. A
 checksum-pinned whole-map directory maps
@@ -548,12 +567,25 @@ then both filtered sequences are paired in item order. This is sound only
 under the pinned-client bridge that a descriptor's `type` is the same native
 category returned for that item, and only after every resolvable native item
 has been enumerated. A whole category with zero non-empty names is known to be
-unnamed. A nonzero unequal name/item count is only a partial alignment,
-however, so the complete chunk is isolated; no otherwise aligned category is
-admitted from it. Because a compacted name position has no item identity, an
-unknown or malformed non-empty name descriptor, per-name lookup exception,
-malformed category result, or descriptor/category disagreement also isolates
-the complete chunk. A category-query exception is the native resolver's
+unnamed. A nonzero unequal name/item count is only a partial alignment.
+The schema-v9 catalog also supplies exact WGDE/SpTr tree wires, resource
+names, and quantized initial transforms for every supported map. A compacted
+category can use those authored identities when its surviving names form an
+ordered subsequence; each consumer still verifies the live slot and matrix.
+Standard-battle admission now follows bit `0x1` in every SpTr and BSMI
+visibility mask, after assigning the original WGDE item indices. Mode-excluded
+slots remain explicit in `excluded_instances`, but never enter descriptor
+recovery, native query/animation admission, collision boxes, or standing/fallen
+concealment. Name alignment skips those absent scene objects without shifting
+later native indices. The exact #1513 crash at `0x00ABB0AA` accessed a missing
+tree scene object for Prohorovka `(32639, 31)`, whose SpTr mask is `0x7fff4000`.
+The matched dump's scene registry omitted exactly the trees excluded by bit 0.
+All 41 source maps have been audited against that mask; Windows replay remains
+the acceptance boundary for the repaired native animation lifecycle.
+An unresolved category is isolated only at its own item indices, preserving
+independently aligned types in the same chunk. An unknown or malformed
+non-empty descriptor or malformed category payload that prevents typing the
+compacted sequences still invalidates their shared alignment contract. A category-query exception is the native resolver's
 skipped-item case:
 that exact slot is isolated before any matrix, effect or destruction call,
 while other resolvable slots may finish alignment. Native category `-1` is a
@@ -563,6 +595,18 @@ not reinterpret `-1` as a category mismatch. A registered native effect
 category must match the exact admitted descriptor; `-1` leaves only that
 effect channel unverified, so admission still requires the exact live matrix
 and wire plus the exact native filename when one is present.
+
+Stock `__launchTreeFallEffect` and `_DestructiblesAnimator.showFallTree`
+return immediately when `getDestructibleDesc` yields `None`; they do not wait
+for an incremental chunk-name scan. The safe descriptor adapter therefore
+resolves a catalog tree synchronously from its exact wire, live native tree
+category, and initial matrix. It keeps this identity through native animation
+and invalidates both name and descriptor caches on chunk unload. The XML
+spelling is retained for the case-sensitive Python descriptor dictionary,
+including compiled resource names that differ only by case. The original
+scalar filename wrapper remains unused. All-map resource joins and local
+lifecycle tests establish coverage and guards, not Windows animation or
+contact acceptance; those still require exact-client playtesting.
 
 `wg_getDestructibleFilename` (`0x006b2580`) is deliberately not used as a
 per-item probe. It resolves the same item and returns `Py_None` for an
@@ -790,7 +834,7 @@ list by the item index silently returned a neighbour's resource. The
 exact-instance runtime shape introduced at schema v4 closes that identity gap
 with the whole-map matrix signature, and the per-item name is now recovered
 from the full-width or reconstructed compacted alignment. The coherent shipped
-batches are destructible format v7 and foliage format v4.
+batches are destructible format v8 and foliage format v4.
 
 The stock `BigWorld.entity`/`entities` facade is an AOI surface, not the LAN
 authority registry. Unspotted or dead synthetic vehicles remain private there;
@@ -886,7 +930,7 @@ not inferred from another 0.9.22 build:
 
 | Producer | Exact consumer contract covered |
 | --- | --- |
-| `CMD_SYNC_DATA` / `AccountSyncData` | `rev` and `prevRev`; every initial `Account._update` subscriber receives an explicit cache value instead of depending on a missing-key fallback. |
+| `CMD_SYNC_DATA` / `AccountSyncData` | Complete snapshots carry `rev` and omit `prevRev`; every initial `Account._update` subscriber receives an explicit cache value instead of depending on a missing-key fallback. The exact `AccountSyncData.__onSyncResponse` enables events after first sync, and `Account._update` treats any non-`None` `prevRev` as incremental, replaying all supplied `eliteVehicles`. Only actual pushed deltas carry `prevRev`; research captures its post-command stats before deferred publication so queued commands cannot repeat later unlock/elite events. |
 | `Stats` / `StatsRequester` / lobby controllers | Zeroed money and account scalars; mapping-shaped restrictions, referral data and clan locks; a non-empty `dailyPlayHours`; and full daily/weekly `playLimits`. Zero periods mean exhausted parental-control time in this build. `mayConsumeWalletResources` starts true because false is the native wallet's `SYNCING` state, and `tutorialsCompleted` carries the completed offline bitmask. |
 | `Inventory` / `InventoryRequester` | All item-type indices exist; vehicle `compDescr` and crew maps exist; `repair` is a two-item tuple and `shellsLayout` is a mapping. |
 | `QuestProgress` / personal-mission requesters | `quests`, `tokens`, and `potapovQuests`; both `regular` and `training` contain `slots`, `selected`, and `lastIDs`, while `compDescr` is always present. |
@@ -1125,6 +1169,66 @@ repeat installation and injected protection/cache failures. The native harness
 and package checks do not substitute for repeated battle-to-hangar acceptance
 on the exact Windows game client.
 
+## First-chance exception trail
+
+#1513 installs its own `__try/__except` around the whole main loop at
+`0x00602F00`. Its filter formats the crash text on the faulting stack
+(`"The BigWorld Client has encountered an unhandled exception ..."`), routes
+it through the registered debug-message handlers at `0x00687E80`, then calls
+`_set_abort_behavior` and `abort` at `0x00685D6A`/`0x00685D73`, which is where
+this port's `exit code 3` comes from. Because the engine handles the exception
+itself, nothing reaches second chance: ProcDump's `-e` trigger cannot fire, so
+every collected dump is a `-t` termination dump. Whether it is usable is then
+luck: the 2026-09-08 16:00 worker report kept the main thread and its crash
+text, while the 16:16 report kept only an audio worker thread and no evidence
+at all.
+
+The sidecar therefore records the fault itself. `install_exception_trail`
+snapshots the module table with `CreateToolhelp32Snapshot` while it is still a
+normal Python call — resolving names inside the handler would take the loader
+lock the faulting thread may already hold — then installs a vectored handler
+as first in the chain. Vectored handlers run before any frame-based handler,
+so it observes the exception with the faulting thread's own registers and
+frames intact.
+
+The handler only records. It always returns `EXCEPTION_CONTINUE_SEARCH`, never
+writes to the context, and restores the thread's last-error value, so
+first-chance exceptions used as control flow behave exactly as before. It
+records the fatal status codes unconditionally, and a C++ throw
+(`0xE06D7363`) only when `ExceptionInformation[0]` is the MSVC magic
+`0x19930520` and its ThrowInfo lies inside `WorldOfTanks.exe`, `msvcp140.dll`
+or `vcruntime140.dll`: `SogouPY.ime`, `nvgpucomp32.dll` and `wgc_api.dll` all
+throw and catch their own C++ exceptions while the game runs normally. Each
+record carries the code, faulting address, thread, registers, an EBP frame
+walk resolved to module and RVA, and — only when every byte up to its
+terminator is printable — the `std::exception` message. A shared buffer and a
+try-lock keep the handler off a stack that a stack overflow has already
+exhausted.
+
+The trail retains at most 512 record slots per process. A repeated code and
+address refreshes the last slot, including its latest context and message,
+with a `repeats=` count: different C++ throws can share RaiseException's
+address. Once all slots are used, later faults replace the final slot rather
+than being discarded. The launcher keeps the tail of an oversized trail.
+Arbitrary object and frame reads use `ReadProcessMemory` so a stale address
+can fail the read without raising another access violation in this handler.
+The session header is written before the handler is published, avoiding a
+race over its shared output buffer. This remains best-effort evidence:
+concurrent faults can lose the try-lock, writes can fail, and fast-fail paths
+may bypass vectored handlers entirely.
+
+The trail is diagnostics, so `instance_guard` never fails startup over it: an
+older sidecar without the method, an unconfigured path, and a refusing handler
+all leave the atmosphere guard and the game untouched.
+
+`tests/native_exception_trail.c` runs the production handler in a 32-bit
+Windows process built by `tools/build_native_exception_trail_probe.sh`, and CI
+executes it on `windows-latest`. It asserts the module filter, the ThrowInfo
+gate, rethrow and foreign-magic rejection, the access-violation fields, the
+record limit, and that the handler leaves both the disposition and the
+last-error value unchanged. None of that proves what the recorder writes
+during a real #1513 crash; only a Windows session that produces a report can.
+
 ## Battle-result presentation
 
 The exact #1513 `gui/battle_results/context.pyc` constructor takes
@@ -1224,7 +1328,25 @@ already revealed adds nothing, while an enemy that goes dark and reappears
 credits whoever finds it that time. This replaces a count of every enemy the
 vehicle had ever directly seen, which had no team fence and could never drop.
 Patrol Duty (`scout`) reads the same number, and earned experience moves with
-it.
+it. `scripts/common/battle_results_shared.py` fixes the per-enemy half of that
+rule exactly: `VEH_INTERACTION_DETAILS` declares `('spotted', 'B', 1, 0)`, so a
+detail row cannot carry a second detection of the same vehicle, and the
+in-battle ribbon agrees because `_MultiVehicleRibbon.getCount` is
+`len(self._hits)` keyed by vehicle id.
+
+The same decision owns the in-battle ribbon. The visible client used to raise
+it from a local presentation edge — the enemy's model appearing while this
+client's own line of sight was clear — but that edge is the 565 m entity AOI,
+which an enemy a teammate revealed across the map crosses long after the team
+detected it. The ribbon therefore appeared for detections the results column
+never counted. A client cannot close that gap alone: it knows its own line of
+sight and the team's merged spot lease, never whether its own sighting is what
+revealed the enemy. `_commit_detections` now publishes a `detection` event to
+the human observer it credited, and the client draws the stock `SPOTTED` and
+`TARGET_VISIBILITY` pair from that event alone. `TARGET_VISIBILITY` reaches
+only `TriggersManager.PLAYER_DETECT_ENEMY` in #1513 — `feedback_adaptor` does
+not forward it to `onPlayerFeedbackReceived` — so no damage-log or ribbon
+consumer loses anything by moving with it.
 
 Ammunition belongs to whoever owns the gun, so Fadin's medal takes the shell
 total from the producer rather than inferring it. The visible client puts
@@ -1249,6 +1371,27 @@ tie-break. Bots are ordinary participants and can take one.
 This is static and pure-data coverage. It proves which fields reach the native
 packers with which values; only acceptance on the exact Windows client can show
 the results window rendering those ribbons, counters and tooltips.
+
+### Critical-hit ribbons and shot-result voices
+
+The pinned `Avatar.PlayerAvatar.showShotResults` selects voices independently
+of `onBattleEvents` ribbons. Its `IS_ANY_PIERCING_MASK` includes
+`DEVICE_PIERCED_BY_PROJECTILE` and `DEVICE_PIERCED_BY_EXPLOSION`, but not
+`DEVICE_DAMAGED_*`. Confirmed device/crew damage supplies the piercing bit;
+otherwise a module hit followed by a ricochet selects the ricochet voice.
+External explosions set the positive-damage-factor material bit only when
+they damage vehicle HP, so a module-only explosion selects the no-HP-damage
+voice instead. The exact extracted method was executed under CPython 2.7
+with old/new flags to verify both selections, empty splash and killing shots.
+
+`BATTLE_EVENT_TYPE.packCrits` packs a critical count. The adapter counts device
+damage transitions and crew knockouts, excluding repair, fire-state and
+ammo-rack-death effects. Both outgoing and received critical ribbons use this
+count. Stock `ribbons_aggregator` excludes `CRITS` when the same target has a
+destruction ribbon; the adapter leaves that filtering and voice priority to
+the client. These checks prove RPC input and Python voice selection, not
+audible Chinese voice playback or the original server's hidden module-HP
+notification thresholds.
 
 ### Mastery badges and Marks of Excellence
 
@@ -1277,6 +1420,25 @@ also reads `damageRating` for the badge tooltip.
 `damageRating` crosses the wire as whole percent while the dossier keeps
 hundredths — the same split retail produces, since its dossier updater applies
 `int(results['damageRating'] * 100)` to the unpacked float.
+
+The marks are also drawn in the world, and that path is separate from both
+results and the garage. `vehicle_systems/CompoundAppearance.__createStickers`
+reads `self.__vehicle.publicInfo['marksOnGun']` and passes it to
+`VehicleStickers(typeDescriptor, insigniaRank, outfit)`; the hangar's
+`ClientHangarSpace._VehicleAppearance.__setupEmblems` builds the same object
+from `itemsCache.items.getVehicleDossier(...).getRandomStats().getAchievement(
+MARK_ON_GUN_RECORD).getValue()`, and the carousel card reads the same record
+through `getTotalStats`. This port supplies that field from its account store:
+`PostBattleStore.marks_on_gun`
+returns the row `account_rpc.data.dossiers` already publishes as the garage
+badge, the LAN client carries it in `hello` and `select_vehicle`, and
+`_public_player` republishes it on every roster row — including the lean rows
+that omit the much larger outfit and effective-parameter blocks — so a remote
+human's replica decals the same count. Bots have no account and publish zero.
+The selection is republished immediately before every start request, so a mark
+earned in the previous round reaches the next round's vehicle properties.
+These checks establish the value supplied to the stock sticker constructor;
+the exact Windows client must still verify that the gun decal actually draws.
 
 The rules are the client's own text in `res/text/LC_MESSAGES/achievements.mo`.
 `markOfMasteryContent` gives the mastery classes as more battle XP than 50, 80,
@@ -1364,19 +1526,49 @@ The premium-vehicle bonus sits outside the badge. `premiumVehicleXPFactor`,
 which 200 shipped vehicles carry, is applied to the banked XP and Free XP and
 never to the number the mastery badge ranks: `originalXP` stays the bare battle
 XP the badge reads, while `xp`, `factualXP` and `subtotalXP` carry the bonus.
-The results window learns it the way retail does rather than as an unexplained
-difference - `ValueReplay.addMultipliedValue` records
-`record += round(original * premiumVehicleXPFactor100 / 100)` in the XP and
-Free XP chains, which is exactly the step
-`gui.battle_results.components.details` renders its own `premiumVehicleXP` row
-from, and the chain writes the total back through the connector so the packed
-value and the breakdown agree. Crew training stays on the bare battle XP with
-only `crewXpFactor` applied after the save earnings multiplier. The garage
-settlement owns the final vehicle XP and Free XP bonus once; a durable
-`awarded` receipt is never multiplied again by the results cache. With custom
-save multipliers, ValueReplay starts from the factual total rather than
-resetting it to base XP or labelling the custom amount as a retail premium
-account bonus. Mastery continues to use unscaled battle XP.
+Crew training stays on the bare battle XP with only `crewXpFactor` applied
+after the save earnings multiplier. The garage settlement owns the final
+vehicle XP and Free XP bonus once; a durable `awarded` receipt is never
+multiplied again by the results cache. Mastery continues to use unscaled
+battle XP.
+
+Every row of the two detail tables is a `ValueReplay` record, keyed by the
+name of the value its step applied. `ValueReplay.__iter__` yields
+`(op, (param1, value), (recordName, runningTotal))` and
+`gui.battle_results.reusable.records.ReplayRecords` stores each step under
+`param1`, so the record names are the chain's first parameters and nothing
+else. `MoneyDetailsBlock.__getBaseCredits` reads `originalCredits`,
+`XPDetailsBlock.__getBaseXPs` reads `originalXP` and `originalFreeXP`, the
+boosters rows read `boosterCredits`, `boosterXP` and `boosterFreeXP`, and a
+name no step applied reads as zero. Three consequences are load-bearing for
+this port. A chain must start at `original*`, or the results screen draws the
+battle's own income as zero while the total row stays right.
+`addMultipliedValue(startName, factor)` records its step under `startName`,
+which *replaces* the base record with the bonus rather than adding a row -
+only `__mul__` and `applyFactorToTag`, whose first parameter is the factor,
+write a factor-named record, which is why the premium-vehicle row and
+`_XPReplayRecords`' `xpToShow = xp - premiumVehicleXPFactor100` both read one.
+And a factor step's packed field is therefore the *total* multiplier the chain
+applies, not the descriptor's bonus: `premiumVehicleXPFactor` defaults to
+`DEFAULT_PREMIUM_VEHICLE_XP_FACTOR = 0.0` and is a bonus fraction, so a 0.5
+vehicle packs 150.
+
+This port therefore presents its two account-side coefficients where retail
+keeps them. A premium vehicle's credit income has no retail row - vehicle
+profitability is inside the base credits the server pays - so
+`PREMIUM_VEHICLE_CREDITS_PERCENT` is folded into `originalCredits`. Its
+experience bonus has one, `details/calculations/premiumVehicleXP`, so it is a
+`__mul__` step by `premiumVehicleXPFactor100`; one visible consequence is that
+`xpToShow`, which the summary panel draws, then excludes it exactly as #1513
+computes. Whatever the save's earnings multiplier adds above those is packed
+as `boosterCredits`, `boosterXP` and `boosterFreeXP` and added with one `ADD`
+step, the single #1513 row for an account-owned multiplier on a finished
+battle. `__mul__` and `__add__` both write the running total back through the
+connector, so the packed total, the breakdown and the wallet agree; a sweep
+over 13,680 combinations of battle XP, save percentage and vehicle factor
+confirms the chain lands exactly on the banked amount. An award below the
+battle's own income has no #1513 row that honestly names the reduction, so
+`original*` reports the reduced amount instead.
 
 Kill XP uses victim durability as an offline balance proxy. This does not
 implement an exact tier-difference rule: equal-tier vehicles can have different
@@ -1742,19 +1934,148 @@ and copied bot integrator without feeding a second physics owner.
 `BigWorld.Entity.teleport` remains forbidden; #1513 rejects it for an in-world
 client Vehicle as `Operation is not allowed`.
 
+### Hull autorotation and the sniper hull lock
+
+Every part of retail's hull lock except the cell itself is stock #1513 code the
+port already runs. `AvatarInputHandler.start` seeds `__isAutorotation` from the
+arcade control mode, which prefers nothing, so a round starts autorotating.
+`onControlModeChanged` then asks the new control mode for
+`getPreferredAutorotationMode()`; a mode that returns a boolean saves the
+previous setting, forces its own, and publishes it through
+`PlayerAvatar.enableOwnVehicleAutorotation`, which both invalidates
+`VEHICLE_VIEW_STATE.AUTO_ROTATION` for the lower-left damage-panel indicator
+and sends `VEHICLE_SETTING.AUTOROTATION_ENABLED` down the vehicle mailbox that
+this port answers. Leaving that mode restores the saved setting.
+
+`SniperControlMode.getPreferredAutorotationMode` returns
+`isYawHullAimingAvailable or (chassis.rotationIsAroundCenter and gun
+.turretYawLimits is None)`. Running that exact code object against a stub
+`BigWorld` gives `False` for a limited-traverse gun on either chassis, `True`
+once the vehicle has yaw hull aiming, `True` for a fully rotating turret on a
+centre-pivot chassis, `False` for one on a track-pivot chassis, and `None`
+when the player vehicle is not yet in `BigWorld.entities`. Entering sniper on
+a limited-traverse vehicle therefore forces autorotation off, and
+`enableSwitchAutorotationMode` — `preferred is not False` — makes both the
+`CMD_CM_VEHICLE_SWITCH_AUTOROTATION` key and `PlayerAvatar.moveVehicle`'s
+re-enable no-ops for every vehicle the mode prefers `False` for, which is both
+the limited-traverse case and a fully rotating turret on a track-pivot
+chassis. Only the first of those has an arc to notice it. Outside sniper the
+key toggles the lock and any key-down movement command without
+`_MOVEMENT_FLAGS.BLOCK_TRACKS` turns it back on.
+`SiegeModeControl.handleKeyEvent` consumes that same key first on a siege
+vehicle. The whole package writes `__isAutorotation` in five places, all in
+`AvatarInputHandler`, so nothing else can release the lock while sniper is
+active. The ABI audit pins the signatures, the code names and the control flow
+of all five methods.
+
+Modern retail behaves differently, and the difference is a version boundary,
+not a defect here. Wargaming added both the in-battle `X` toggle for sniper
+hull lock and the game setting for its default state in Update 1.12.1 of April
+2021, describing the behaviour it replaced as "when you enter Sniper mode, the
+hull is automatically locked and you cannot aim outside of the aiming angles",
+which is exactly what this January 2018 build does. Reproducing the 1.12.1
+convenience would be a deliberate product deviation from #1513, not a parity
+fix.
+
+Wargaming's own newcomer guide states the mode rule and no other condition:
+a turretless vehicle's gun "can only move horizontally up to a limit, after
+which the hull has to be turned to move it further", SPGs auto-turn the hull in
+every aiming mode, and tank destroyers do not auto-turn it in Sniper mode. It
+is silent on the throttle, so it neither supports nor refutes a drive-input
+condition.
+
+Only the cell behaviour is ours. The copied local physics reads the stock
+`getAutorotation()` and, when the unclamped mouse target leaves the installed
+`gun.turretYawLimits`, feeds one binary rotation direction into the single pose
+integrator; the descriptor, native gun rotator and copied traverse physics keep
+owning the arc, gun speed and dispersion. A live A/D command,
+`CMD_BLOCK_TRACKS` and any live throttle — including the native R/F cruise
+presets — all suppress it, so the mouse turns the hull only while the player
+issues no movement command at all.
+
+The pinned executable's own flags are what place the composition there.
+`WGGunRotatorImpl` computes the direction in `0x00f5ad40` from elapsed time,
+the desired yaw, the current turret yaw (`+0xcc`), the installed yaw limits
+(`+0x28`/`+0x2c`, valid per `+0x30`) and the turret and vehicle rotation speeds
+(`+0x60`/`+0x68`), clears `autorotationFlags` (`+0xd8`) whenever the clamped
+rotation reaches the desired yaw, and otherwise publishes `5` or `9` —
+`_MOVEMENT_FLAGS.FORWARD` beside one rotation bit, through
+`lea eax, [eax*4 + 5]`, and never a bare rotation bit. Those flags are shaped
+like a whole movement command rather than a rotation contribution: ORing `5`
+into a player's `BACKWARD` yields `FORWARD | BACKWARD`, which the stock
+`PlayerAvatar.moveVehicle` decode resolves as forward. That reading is
+consistent with a cell that applies them while the player issues none, but it
+does not exclude a cell that masks the rotation bits out of them under a live
+drive command, and the `FORWARD` bit alone therefore proves neither rule. What
+it does rule out is the inference this section previously drew: that the
+direction routine reading no drive input means a driving hull follows the
+mouse. It only says where the composition lives.
+
+How the retail cell merges those flags is server Python that no client build
+ships, so the composition remains an inference. Windows play is the evidence
+that selected this one, and it is the rule this port shipped before the
+throttle-independent reading replaced it: a limited-traverse hull that kept
+following the mouse under throttle was reported as wrong, because it steered
+the vehicle off the driver's heading whenever the camera moved. Two gaps stay
+open against a retail cell. The port applies only the rotation half of the
+command, never its `FORWARD` bit, so a parked retail hull may creep forward
+while it aligns where this port pivots, and native track animation sees that
+same bare rotation. A coasting hull under no drive command also autorotates
+here, because this port gates on input intent rather than measured speed.
+Neither difference has been measured on Windows.
+
 LAN pose samples retain the fractional remainder of the nominal 30 Hz
 publication interval. Clearing the entire accumulator quantised a 40 FPS
 render loop to 20 Hz and 45/50/75 FPS to 22.5/25/25 Hz. At most one current
 pose is sent per rendered frame, so recovery from a slow frame never bursts
 stale samples.
 
-The player-visible spotting path derives its 50-metre proximity, two-height
-static LOS and allied observer relay from the retired predecessor. Its
+The player-visible spotting path derives its 50-metre proximity, static LOS
+and allied observer relay from the retired predecessor. Its
 deterministic no-skill memory uses the historical 5--10 second rule's
 guaranteed ten-second
 disappearance bound. Enemy
 compound models and their stock marker/minimap visuals cross one visibility
 boundary, so an unspotted vehicle cannot remain visible in only one UI layer.
+
+The exact #1513 `gui/shared/items_parameters/params.pyc` consumer
+`VehicleParams.__getInvisibilityValues` (source lines 599--610) calls
+`items.utils.getClientInvisibility` and then multiplies both returned values
+by `gun.invisibilityFactorAtShot`. `getClientInvisibility` already includes
+`computeBaseInvisibility`'s paint bonus and the resolved camouflage-net aspect.
+The port keeps that complete-value shot factor and effective-parameters schema
+v1. A published formula that exempts paint or the net is not substituted for
+this directly observed client consumer. This proves the client parameter
+composition, not the unavailable cell-app detection implementation.
+
+The worker and visible client use the same existing worker LOS endpoints and
+end tolerance. Both carry the exact-identity broken-skin filter, so an accepted
+broken fence skin can yield while an unrelated wall or surviving replacement
+surface still blocks. The prepared filter is reused for at most 0.25 seconds;
+round teardown clears it. Target stationary clocks are sampled each visibility
+frame even when an observer-target pair is deferred by the native-ray budget.
+
+Cover within 15 metres of the observer is transparent to that observer,
+following [WG's spotting guidance](https://wargaming.net/support/en/products/wot/article/10222/?redirect_lang=en).
+The guidance is current and does not establish an exact #1513 server contract.
+For static foliage, the distance and its early-rejection radius use the actual
+baked horizontal parallelogram: projected axes can be non-orthogonal, and the
+source box radius need not enclose that footprint. Fallen-tree proximity still
+uses a conservative horizontal-radius approximation. Vegetation coefficients
+remain the existing 0.15 per volume, 0.60 combined limit, 0.95 total concealment
+limit and complete removal of nearby foliage after firing. These are retained
+port settings, not claimed retail constants. [The official 7.5 update notes](https://worldoftanks.com/en/news/general-news/75-update-note/)
+confirm that bush density matters; they do not justify assigning every volume
+the same maximum coefficient. [WG's later Berlin map-development article](https://worldoftanks.eu/en/news/general-news/berlin-map-development/)
+distinguishes dense vegetation at 50 percent from sparse vegetation at 25
+percent; it is not evidence that every #1513 asset should receive 50 percent.
+The exact tree cache also reads a per-resource `density` with values from 0
+to 0.50, separately from falling-tree mass and other physics parameters.
+Its use as the final spotting addend has not been established by the reviewed
+Python consumers, so it is not substituted for that addend here.
+Foliage catalogs remain schema v4. Single-ray
+coverage, per-asset camouflage, native filtering and actual Windows spotting
+behavior remain outside the local contract evidence.
 
 That single boundary was not sufficient. Windows playtesting reported a green
 penetration indicator, ground dust and a visible silhouette for an unspotted
@@ -2014,7 +2335,7 @@ only exact Windows acceptance can prove that the native HULL output is visible
 and that its magnitude feels correct.
 
 Critical-hit calculation follows the same proposal/commit boundary. The
-firing client runs a device law derived from the retired predecessor against an
+hidden worker runs a device law derived from the retired predecessor against an
 explicit detached snapshot of the target descriptor, pose, collision
 components and critical state. That calculation cannot change the live target
 or invoke native kill
@@ -2029,6 +2350,307 @@ accepted revision exactly once.
 Repair reports remain pending until the server acknowledges their proposal
 revision, so a successful socket write or an older snapshot cannot rewind the
 HUD state.
+
+The internal-module model now retains indexed Console collision surfaces in
+component-local metres. It is not the recovered #1513 PC-server model.
+`internal_layout_console.py` supplies the source triangles; the exact PC
+9.22 `collision_client` bounds and installed `models.undamaged` part select the
+registered frame. The #1513 bytecode chain is `shared_readers.readModels` ->
+`_readHull`/`_readTurret` -> `ModelStatesPaths.undamaged`; the direct model
+consumer is `tankStructure.getPartModelsFromDesc`. Destroyed/shared model
+paths cannot select an installed variant. No new native API is introduced.
+Native gun and track contacts retain their existing ownership. Vehicle,
+turret and gun transforms remain the current collision pose's transforms.
+
+HKX decoding uses big-endian words with numerical low-to-high x/y/z fields,
+section-local offset/scale, shared vertices, data fixups and indexed quad
+triangulation. The old bounds-only decoder's bit order could reproduce an
+AABB while moving individual vertices by over one metre. As independent
+resource checks, 310 shared surfaces on IS-7, Type 59, T1 Cunningham, Maus,
+FV215b (183) and M103 match across HKX/BigWorld formats after ignoring
+zero-area triangles. This supports the reviewed Console format, not a claim
+that other Havok platforms or all later vehicle revisions are identical.
+[Smithbox HKX2](https://github.com/vawser/Smithbox/tree/main/src/Havok/HKX2)
+is a format lead; the Console resources supply the validation evidence.
+
+Mesh bounds accelerate queries but never replace occupied geometry. Exact
+edge-connected pieces and their gaps survive baking, ray/starts-inside,
+distance and HE-cone queries. Open/nonmanifold pieces provide surface contacts
+only; no hole repair or invented solid is applied. Source meshes bypass
+physical caps, template shapes, relocation and saved calibration overrides.
+Invalid payloads and unmatched component variants are reported per target;
+an incomplete crew does not replace the remaining decoded interior with an
+archetype. A small per-piece BVH is built lazily with the cached layout.
+
+`BattleRuntime._vehicle_trace` still limits solid-shell travel to ten calibres
+from the first vehicle material. HE uses its separate finite interior cone.
+For non-penetrating HE and nearby explosions, that cone starts at the proved
+structural contact selected by the blast search, not at the outside explosion
+position; visuals and other victims still use the original world burst. If no
+structural surface is reachable, only native device contacts up to the shell's
+stopping point survive. The historical official
+[HE explanation](https://worldoftanks.com/en/news/general-news/high-explosive-damage-explanation/)
+describes internal damage for penetrations and near misses, so both retain the
+explosion path. It does not establish the precise module-damage attenuation
+formula or whether its stated 45-degree cone uses a full or half angle. The
+existing angle, depth, and device roll remain reconstruction boundaries; hull
+HP loss is not evidence for a new proportional module-damage multiplier.
+The critical loop scores each reached device once using `damage[1]`; this
+change does not alter saving throws, ammunition bookkeeping or damage rolls.
+The current device roll is uniform within +/-25%; available client contracts
+do not establish that server-side distribution. The common ammo-bay material
+specifies 0.27 for projectile and explosion hit chances. Deadeye adds three
+percentage points for AP/APCR/HEAT. A successful hit reducing the rack to zero
+destroys the vehicle without a second detonation roll.
+
+The launcher editor writes `damage/devices`, and the mounted-shell snapshot
+and projectile launch preserve a value of 2000. Tests cover AP, APCR, HEAT,
+APHE and HE, player and Bot victims, the 27% saving-throw boundary and duplicate
+contacts with one rack. Even the low 1500 damage roll destroys a reached
+ordinary rack after its saving throw. This proves the numerical path once a
+module contact exists; it does not prove that a retail aiming point intersects
+the selected Console mesh. A missing/invalid profile supplies no internal contact,
+so raising damage cannot fix missing geometry. Run the read-only inventory:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 tools/audit_internal_layouts.py \
+  "$WOT_0922_CLIENT/res/packages/scripts.pkg"
+```
+
+The reproducible source bake contains 650 decoded vehicles out of 680 listed
+definitions. The other 30 comprise 20 with no Console source and 10 with no
+registered usable hull/interior. Eight retain explicitly identified authored
+reconstructions; 22 have no profile. Within decoded entries, missing targets
+remain explicit (including two incomplete crew rosters). The audit covers
+870 available turret configurations; it does not claim completeness for an
+unavailable variant. Aliases retain reviewed archive identity, component or
+content evidence and crew mapping, rather than suffix/name guesses.
+
+Reproduce the bake into temporary output, then compare before replacing the
+tracked catalog. The password file is private and must not enter output:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 tools/bake_internal_layout_console_0922.py \
+  "$WOT_0922_CLIENT" --cache "$MESH_CACHE" --password-file "$PRIVATE_PASSWORD_FILE" \
+  --output "$MESH_OUTPUT/internal_layout_console.py" --report "$MESH_OUTPUT/bake.json"
+PYTHONDONTWRITEBYTECODE=1 python3 tools/audit_internal_layouts.py \
+  "$WOT_0922_CLIENT/res/packages/scripts.pkg" --verify-meshes --cache "$MESH_CACHE" \
+  --bake-report "$MESH_OUTPUT/bake.json" > "$MESH_OUTPUT/audit.json"
+python3 tools/internal_geometry_evidence.py \
+  --scripts-package "$WOT_0922_CLIENT/res/packages/scripts.pkg" --cache "$MESH_CACHE" \
+  --baseline-root "$BASELINE_CHECKOUT" --output "$MESH_OUTPUT/evidence"
+```
+
+Review the checked-in [four-view X-ray](tools/evidence/internal_mesh_0922/is7-runtime-xray.png),
+[roster audit](tools/evidence/internal_mesh_0922/roster-audit.json) and
+[query evidence](tools/evidence/internal_mesh_0922/query-evidence.json).
+The audit's `--compact` option reproduces the review inventory.
+`tools/audit_internal_mesh_formats.py` reproduces the cross-format probes
+with `--cache`, `--password-file` and `--output` arguments.
+
+The evidence renderer requires NumPy/Matplotlib; the bake requires pyzipper.
+Its baseline checkout should be the pre-correction `f436f298` source. It
+exports both revisions through `build_layout`, uses the same PC frames and
+renders top/side/front/oblique views with a source legend. Its front-shoulder
+ray grid records coordinates, angles and 100/130/152 mm finite hull-only
+budgets; tracks/spaced plates may shorten that budget. The old screenshot's
+exact ray was unavailable, so this is a defined geometric experiment, not
+reproduction of that aiming point or a damage probability.
+
+The OCI run used an extracted `scripts.pkg` with pinned entity-definition
+and PYC contracts (`--scripts-package` bake mode). A full #1513 installation
+was unavailable: `inspect_client.py` could not verify it. Resource contracts,
+870 layout snapshots, analytic regression tests and 35,277 BVH-versus-flat
+queries establish source/logic evidence only. The workload uses 7,035 unique
+meshes and 11,759 pieces; standalone Linux timings do not establish Windows
+frame pacing. Native physics, rendering, lifecycle and gameplay feel still
+require acceptance on Chinese HD 0.9.22.0.1 #1513.
+
+Ammo-rack death also has a separate presentation contract. LAN health remains
+zero, but the stock Vehicle, marker feedback and local
+`PlayerAvatar.updateVehicleHealth` receive
+`SPECIAL_VEHICLE_HEALTH.AMMO_BAY_DESTROYED` (-5). The marker consumer preserves
+that special negative value, while it normalizes ordinary negative health to
+zero. The Avatar writes its raw argument back into the Vehicle at local death,
+so passing zero there would erase an earlier correction. A late critical cause
+corrects the marker without repeating the death/kill/postmortem callbacks.
+The ABI audit pins the negative constants and marker consumer; regression
+tests fail against the old zero-only presentation for local, remote and late
+ammo-rack deaths.
+
+Turret detachment uses one worker-authored flight accepted by the LAN server. Every
+half of the presentation is stock. `SPECIAL_VEHICLE_HEALTH.TURRET_DETACHED`
+(-13) is `AMMO_BAY_DESTROYED` (-5) with one further bit cleared, so a
+detached wreck is also ammo-bay destroyed; `vehicle_damage_state` maps -13 to
+the `ammoBayExplosion` state and the `exploded` model chain, and
+`CompoundAppearance.__requestModelsRefresh` drops the turret from the
+assembler once `Vehicle.isTurretDetached` is true. The flying half is the
+stock `DetachedTurret` client entity, whose `__prepareModelAssembler` builds
+`turret.models.exploded` plus `gun.models.exploded`, whose
+`_TurretDetachmentEffects` plays the shipped `turret_flying_*`,
+`turret_touchdown_*` and `flamingOnGround` chains from the turret's
+`turretDetachmentEffects` descriptor, and whose `VehicleStickers` reattach the
+vehicle's own marks. `Vehicle.showAmmoBayEffect` is unchanged: it still only
+forwards mode and fireball volume, and its projected-speed argument is still
+unused.
+
+Three deliberate divergences, each because the retail owner does not exist
+here:
+
+- **The arc is invented.** `DetachedTurret`'s `velocity`,
+  `angularVelocity` and `applyForceToCOM` are cell-side, and the client's
+  `WGTurretFilter` takes network input only -- the pinned executable's
+  `PyWGEntityFilter` table exposes `transferInput` and
+  `transferInputAsVehicle` and no script input at all. `turret_detachment`
+  therefore freezes one ballistic arc per detachment, walked against
+  `wg_collideSegment` to its landing, and the compound is driven from it the
+  same way every LAN remote compound is driven. The impulse is a **product
+  number**. Two shipped values bound it and the chosen speed lands inside
+  them: `_TurretDetachmentEffects._MAX_COLLISION_ENERGY` is 98.1 in
+  `0.5 * v ** 2` units, exactly a 10 m free fall, and `_MIN_COLLISION_SPEED`
+  is 3.5 m/s below which stock plays no impact at all. The reported landing
+  energy itself is exact: `__normalizeEnergy` requires `0.5 * speed ** 2`.
+  Real calibration needs a replay measurement. `wg_collideSegment` reports a
+  point and no surface normal, so a contact reached while the turret is still
+  rising is classified as a wall rather than the ground: the fall continues
+  and the sideways motion stops, which keeps a turret from resting inside a
+  building facade and from reporting a ground material for a vertical
+  surface. That is containment for a missing normal, not an invented
+  restitution coefficient, and it is bounded to three deflections.
+- **The worker freezes the whole flight.** `critical.ammo_rack_death`
+  rides the combat event and `F_AMMO_RACK_DEATH` rides the positional Bot
+  row. The worker derives the impulse from round and actor identity, resolves
+  the launch ring from `chassis.hullPosition + hull.turretPositions[0]` and
+  the admitted terminal pose, then proposes the frozen flight, attitude and
+  spin. The server accepts a record only for a confirmed ammo-rack wreck
+  from the current worker and authority epoch, stamps its creation time and
+  keeps the first record immutable. Snapshots and late joins replay that
+  cumulative ledger; malformed rows do not reject a valid motion checkpoint.
+  Final deaths can still publish their records after the battle result.
+- **Landed turrets are static obstacles.** After the accepted landing time,
+  shells query the separate descriptor turret and gun hit testers in the
+  accepted rest frame. The nearest turret caps scenery queries before they
+  can destroy props beyond it, and also occludes HE blast rays. Historic
+  projectile chords test the landing time at the actual hit fraction.
+  Vehicle translation, rotation, suspension and contact displacement sweep
+  the actual chassis and hull boxes against the separate turret/gun boxes.
+  Navigation receives those two component footprints and invalidates old
+  routes when they land. Initial overlap can retreat through its shallowest
+  contact face instead of trapping a tank that the turret landed on. Final
+  rest height supports every rotated turret/gun corner. There is no substitute
+  geometry when a descriptor or hit tester is missing, and a flight with no
+  ground contact creates no obstacle. This implements static blocking only;
+  the retail cell body can additionally be pushed, roll and damage tanks.
+  The stock visual remains outside local dynamic collision so it cannot
+  compete with these shared queries. `isCollidingWithWorld` remains false
+  to avoid reading the never-fed filter's native velocity for drag effects.
+
+The server admits at most twelve detached turrets per round, matching the
+32-bit client's resident model budget. Every accepted record can be displayed
+when the camera enters range, even if that client never saw the original
+explosion. Preparation waits for the source Vehicle's normal started and
+detached lifecycle, and creation uses the accepted elapsed flight/rest pose
+without local collision queries. A failed asynchronous attempt retains its
+identity until safe native retirement; retries have a bounded cadence and
+never allocate a second unresolved entity for the same actor.
+
+The handshake order is load-bearing. `SynchronousDetachment._onDirectTick`
+runs synchronously inside `createEntity` and, while
+`isTurretDetachmentConfirmationNeeded` is true, calls `transferInputs` ->
+`turret.filter.transferInputAsVehicle(vehicle.filter, ...)` on the vehicle's
+own never-fed `WGVehicleFilter`. The runtime therefore writes -13 and
+pre-sets `_Vehicle__turretDetachmentConfirmed` -- whose only writer in #1513
+is `confirmTurretDetachment`, which is that flag plus a models refresh --
+before calling `onHealthChanged`; the accepted turret is created afterward.
+That collapses retail's two refreshes into the one `onHealthChanged` already performs, so a
+turretless assembler cannot
+lose a background-load race against a turreted one for the same `exploded`
+model state, and it keeps that native call from happening at all. Only
+`Vehicle.__init__` and `confirmTurretDetachment` write that flag in #1513, so
+nothing later in a wreck's life can put its turret back on.
+
+The detachment itself is not presentation and is not optional. `health` is
+ALL_CLIENTS in retail, so every peer -- the hidden worker included -- sees a
+turretless hull, and `Vehicle.getComponents` publishes exactly that as a
+collision fact: it returns `(compDescr, compMatrix, isAttached)` triples with
+`isAttached = not self.isTurretDetached` for the turret and the gun, and
+`Vehicle.__collideSegment` begins its loop with `if not isAttached: continue`.
+This port's own component enumeration is now the same triple, and every
+consumer of it -- armour collision, HE blast probes, damage-sticker encoding
+and the interior-module geometry -- skips an unattached part. Without that,
+an ammo-bay wreck kept a full-armour turret and gun hanging in the air above
+a hull that no longer had either. A missing exploded model or a full accepted
+record budget prevents a new flight proposal, while transient visual creation
+failures remain retryable. None of these conditions restores armour to the
+source wreck.
+
+Live interior probes use the same LAN body and chassis matrices as exterior
+armour queries. Stock `getComponents` includes transforms through the native
+model/filter frame, which the LAN adapter does not drive. Reusing that frame
+after accepting its attachment triples displaced AP rays and HE cones on
+hydraulic vehicles. The live proxy now retains the separate chassis frame;
+historical proxies keep their frozen frame, and missing geometry produces no
+interior hit. Directed local/remote AP and HE tests reproduce the old mismatch.
+
+The synchronous constructor handshake is separate from asynchronous world
+entry. Exact `DetachedTurret.prerequisites` returns a `CompoundAssembler` and
+the vehicle descriptor's resources; `onEnterWorld(prereqs)` installs the
+assembled model. As with client-created Vehicles, a returned id can therefore
+precede `BigWorld.entity(id)`. Presentation retains this pending id until it
+appears, then binds the model at the elapsed point on the frozen arc. Only an
+already observed entity disappearing retires its animation; a reused id never
+authorizes writes to or destruction of a different entity. Closing presentation
+retains pending retirement records, retries them during the existing teardown
+poll, and leaves remaining prerequisite loads to battle-space retirement. It
+never calls `destroyEntity` for an id the engine does not yet own. One `TURRET`
+creation line and one binding line record the vehicle, entity and load delay.
+Regressions reproduce the old first-frame loss with an id that becomes visible
+only after loading. The reported FV4005 match's installed bytecode matched the
+reviewed source, but its logs lacked these lifecycle transitions; this confirms
+a reproducible adapter defect, not native Windows flight acceptance.
+
+A late ammo-bay cause can arrive after the ordinary death edge. It now admits
+one detachment from the wreck's admitted terminal pose, even though the health
+signature is already terminal. The immutable actor record and native
+detached-health flag suppress duplicate throws and repeated wreck refreshes. Detachment
+updates `appearance.damageState` with the special health, crew state and water
+state even if the flying entity cannot be created, then calls
+`Vehicle.confirmTurretDetachment` for its single
+model refresh. Exact #1513 `CompoundAppearance.onVehicleHealthChanged` also
+calls the input-handler death hook and `processVehicleDeath`; the late path
+must not call it or replay `Vehicle.onHealthChanged`, kill credit or death
+feedback. A failed visual creation leaves the wreck detached and retries
+through the presentation owner. The original reported match did not log
+terminal-cause ordering, so this repairs a reproduced ordering gap without
+claiming that match's root cause is established.
+
+The worker's arc uses the same per-column broken-skin filter as motion
+probes, so a turret does not rest on an already destroyed fence skin. The
+worker keeps descriptor collision geometry without loading a visual compound.
+Regressions cover attachment exclusion, canonical replay, final-death delivery,
+late visibility, asynchronous retirement, separate component hit tests,
+continuous motion blocking and human/Bot projectile parity.
+
+The ABI audit pins all of it against `scripts.pkg`: the 22 `DetachedTurret`
+signatures, `Vehicle.confirmTurretDetachment`, both special health constants,
+the three `AMMOBAY_DESTRUCTION_MODE` values and the effect's energy window.
+None of that proves the arc looks right, that the two compounds swap without
+a visible seam, or that the turret rests convincingly -- that is Windows
+acceptance.
+
+WG's [Update 9.0 notes](https://worldoftanks.com/en/content/docs/release_notes/90-update-notes/)
+establish the intended turret-detachment feature. Its later
+[Object 277 explanation](https://worldoftanks.com/en/news/general-news/3-soviet-tanks-get-adjustments/)
+also confirms that changing internal module geometry changes ammo-rack
+exposure; those later vehicle values are not imported into #1513.
+
+The resource inventory and CPython 2.7 bytecode audit can run on an isolated
+`scripts.pkg`. That is only resource/contract evidence. The investigation did
+not have a complete Chinese HD installation passing `inspect_client.py`, all
+vehicle collision assets, a retail server model, or Windows gameplay evidence.
+The repaired marker still needs exact #1513 rendering acceptance; the missing
+layouts remain an explicit product gap, and the detached turret's launch
+impulse remains an uncalibrated product number.
 
 Track damage follows the detailed model Update 6.4 introduced. A track
 material's live `damageKind` selects the shell damage channel:
@@ -2175,6 +2797,62 @@ the next intent can proceed. Messages that cannot establish the current
 identity, round, type or exact sequence still consume nothing. Extra fields
 remain rejected rather than extending the protocol.
 
+`PlayerAvatar.showOwnVehicleHitDirection(hitDirYaw, attackerID, damage, crits,
+isBlocked, isShellHE, damagedID)` is the only producer of the damage
+indicator, and `gui/battle_control/hit_data.pyc` keeps `damage`, `IS_BLOCKED`
+and `IS_HIGH_EXPLOSIVE` as independent fields. In
+`gui/Scaleform/daapi/view/battle/shared/indicators.pyc`,
+`_MarkerData.__getMarkerType` reads `HitData.isBlocked()` before anything
+else. Its blocked branch is numeric: `_ExtendedMarkerVOBuilder` prints
+`str(HitData.getDamage())` as the label and selects
+`DAMAGEINDICATOR.BLOCKED_SMALL`/`BLOCKED_MEDIUM`/`BLOCKED_BIG` from
+`damage / playerVehMaxHP`. Every other zero-damage hit falls through to
+`CRITICAL_DAMAGE`, whose three sizes all map to the single `CRIT` frame and
+whose `_getDamageLabel` is the empty string below two criticals. The exact
+client therefore draws either a blocked marker carrying a real value or an
+unlabelled critical marker; a blocked marker worth `0` is unreachable, so
+`isBlocked` must mean a shell this vehicle's armour stopped rather than
+merely a hit that removed no hit points. `HitData.__buildFlags` sets
+`HP_DAMAGE` from `damage > 0` alone, so once a blocked marker carries a value
+`HitDirectionController.__findHit` matches an earlier marker from the same
+attacker and `HitData.extend` sums the two -- retail's own aggregation, and
+also what makes a blocked hit visible under the `WITHOUT_CRITS` preset that
+`_isValidHit` uses to drop zero-damage criticals. `isShellHE` reaches
+`HitData` but no #1513 view reads it.
+
+The damage log panel's blocked rows and its running total come from one
+number, the `TANKING` battle event, whose totals
+`PersonalEfficiencyController._onPlayerFeedbackReceived` accumulates
+client-side from `Avatar.onBattleEvents`; `_BET.ARMOR` maps the same event to
+the `BATTLE_EVENTS.BLOCKED_DAMAGE` ribbon.
+
+`res/text/LC_MESSAGES/battle_results.mo` states the ledger rule the client
+itself shows. `EfficiencyTooltipData` binds `BATTLE_EFFICIENCY_TYPES.ARMOR` to
+`ArmorItemPacker` (`gui/shared/tooltips/efficiency.pyc`), whose header is
+`common/tooltip/armor/header` (装甲抵挡) and whose description is
+`common/tooltip/armor/description`: "计数: / • 跳弹 / • 未击穿 / HE与HESH炮弹不
+包含在内。" -- the counter takes ricochets and non-penetrations, and HE and
+HESH shells are not included. #1513 has a single `HIGH_EXPLOSIVE` kind for
+both, and `combat_rules.is_he` already reads exactly that kind, so `HEAT`
+(`HOLLOW_CHARGE`) and `APHE` (`ARMOR_PIERCING_HE`) keep their blocked credit
+even though `ingame_gui.mo` abbreviates `ARMOR_PIERCING_HE` and
+`HIGH_EXPLOSIVE` to the same `damageLog/shellType` label, `HE`. The battle
+server owns the ledger but holds no descriptors, so the worker publishes the
+shell fact beside `structural_armor_hit` and the server applies the rule.
+`IS_HIGH_EXPLOSIVE` does reach `HitData`, but no #1513 view reads it, so
+`isBlocked` is the only place the same rule can be expressed on the indicator.
+
+The remaining choice is the blocked value itself, which no reviewed file
+fixes: the cell app that packs retail's `damage` argument and blocked ledger
+is not in the package. This port reports the shell's published
+`shell.damage[0]`, because a shell that never pierced never drew a damage
+roll; a penetration keeps the roll it actually spent. Splash is excluded from
+both surfaces -- its damage falls off with distance before armour absorbs the
+rest -- so an absorbed near miss stays an unlabelled critical marker and
+credits nothing. The separate `potentialDamageReceived` column carries no such
+exclusion in any reviewed text, so it still accumulates every direct hit; that
+asymmetry is the client's rule, not a derived identity.
+
 ## AI, room and round boundaries
 
 Humans take real team slots first. The first waiting 0.9.22 player owns map
@@ -2282,7 +2960,25 @@ operation is forbidden, not unlimited.
   stock averages and best-vehicle labels. Dossier cache schema changes request
   a full refresh even when the old cache's battle watermark is unchanged.
   Previously discarded results cannot reconstruct an unknown historical
-  maximum. The current receipt does not measure mileage, each vehicle's time
+  maximum.
+- `DossierCache` persists those vehicle rows between sessions. It names its
+  `.dat` file `b32encode('%s;%s;%s' % (BigWorld.server(), accountName,
+  accountClassName))` and uses `accountName` for nothing else; `__readCache`
+  restores `__maxChangeTime` as the highest `changeTime` in that file, and
+  `__sendSyncRequest` then asks `CMD_SYNC_DOSSIERS` only for rows newer than
+  it. Nothing else ever lowers that watermark: a version mismatch in
+  `__onSyncComplete` clears the cached rows but leaves it standing. All three
+  key parts are constant offline, so every save slot and both processes would
+  share one file, and a career whose battle ordinal sits below another's
+  watermark would receive no vehicle row at all while its battles kept
+  settling. `compat.pin_dossier_cache` therefore scopes `accountName` by a
+  fixed-width digest of the save slot, process role and complete post-battle
+  account key before any `PlayerAccount` exists. Hashing the complete identity
+  preserves separate career namespaces without letting a valid 64-character
+  slot push the stock base32 cache path beyond Windows `MAX_PATH` under the
+  normal preferences directory. The account dossier is unaffected:
+  `account_rpc/server.py` pushes it in the post-battle diff rather than through
+  this cache. The current receipt does not measure mileage, each vehicle's time
   alive or stunning-vehicle eligibility; these values are not inferred.
 - Selling and rebuying a vehicle preserves its XP, including across restart.
   Elite vehicles with stored XP remain conversion candidates after sale.
@@ -2308,6 +3004,18 @@ operation is forbidden, not unlimited.
 - Incremental Account updates publish current balances, changed inventory,
   crew and XP before command completion; growing unlock/elite sets carry only
   additions, matching `Stats.synchronize` and avoiding repeated notifications.
+- Crew placement checks nation and primary role, while preserving the original
+  training specialization across vehicle transfers and save restoration.
+  Moving a seated crew member records the source seat in `lastCrew` so the
+  stock return-crew action can find them again.
+- In #1513, `ItemsCache.__invalidateData.cbWrapper` invokes `onSyncCompleted`
+  before the adisp completion callback. An exception in that event can strand
+  a waiting generator. Account publication exceptions now return command
+  failure; the cache-refresh fallback also has a ten-second failure deadline.
+  Late callbacks and callbacks from a replaced account cannot report success
+  or refresh the new account's views. Accepted inventory mutations remain
+  saved when presentation fails; the failure does not claim a successful
+  refresh or roll back a potentially published change.
 
 This is a functional offline progression loop, not the proprietary retail
 server economy. Reward coefficients and premium-vehicle credit bonuses remain
@@ -2370,6 +3078,14 @@ The source audit deliberately keeps the following differences visible:
   layout mapped onto the gun's shot order, and the consumables come from the
   mounted slots, so an empty slot carries nothing. Bots keep a synthetic
   loadout by design;
+- `PlayerAvatar.__startVehicleVisual` calls `EquipmentsController.clear(False)`
+  for the own vehicle. Loading snapshots must retain their equipment state
+  without publishing or caching HUD echoes until native client readiness,
+  after that clear. The normal item-transition deduplication then remains
+  necessary to preserve the expanded repair/medical selector. Garage inventory
+  updates publish the room loadout after the asynchronous stock cache refresh;
+  starting a round checks that refresh has finished and queues the current
+  loadout before the start request;
 - the spotting law now applies the situational devices and the vision and
   concealment crew skills for the player and for authority bots. Coated optics
   stay implicit through `miscAttrs['circularVisionRadiusFactor']`, which
@@ -2389,8 +3105,10 @@ The source audit deliberately keeps the following differences visible:
   `Avatar.updateVehicleOptionalDeviceStatus`, and this client ships no cell
   script, so the port uses its own speed threshold with the client's 3.0 second
   delay; the camouflage paint bonus
-  (`invisibilityDeltas['camouflageBonus']`) and `invisibilityDeltas`
-  `firePenalty` are still not applied;
+  (`invisibilityDeltas['camouflageBonus']`) is included in the client's own
+  `computeBaseInvisibility` pair and keeps the exact GUI consumer's shot
+  factor, while `invisibilityDeltas` `firePenalty` and radio-range gating of
+  the team's shared intelligence are still not applied;
 - the server publishes terminal winner/reason/base team plus live frags and the
   human team-killer flag, but not the retired predecessor's complete
   `personal`/`players`/`vehicles` battle-result record;

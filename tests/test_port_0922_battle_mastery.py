@@ -17,6 +17,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src' / 'res' / 'scripts' / 'client'))
+sys.path.insert(0, str(ROOT / 'tools'))
+
+import bake_mastery_thresholds_0922 as mastery_baker
 
 from gui.mods.offline_lan_0922 import battle_mastery, mastery_catalog
 from gui.mods.offline_lan_0922.account_rpc import data, postbattle_store
@@ -63,24 +66,46 @@ class _ReplayConnector(object):
 
 
 class _Replay(object):
+    """The #1513 chain, as far as ``_add_value_replays`` uses it.
+
+    ``ValueReplay`` writes the running total back through the connector on the
+    initial value and on every later step, and ``ReplayRecords`` keys each
+    record by the name of the value that step applied.  Both are the contract
+    the results tables read, so the double reproduces them.
+    """
+
     steps = []
 
     def __init__(self, connector, recordName=None, startRecordName=None):
         self.connector = connector
         self.record_name = recordName
         self.start_name = startRecordName
+        self.chain = ['SET:%s' % startRecordName]
+        self.connector.values[recordName] = self.connector.values[
+            startRecordName]
+        _Replay.steps.append((recordName, 'SET', startRecordName))
 
-    def addMultipliedValue(self, other, coeff):
-        # The stock chain writes the total back through the connector.
-        self.connector.values[self.record_name] = (
-            self.connector.values[other] +
-            int(round(self.connector.values[other] *
-                      self.connector.values[coeff] / 100.0)))
-        _Replay.steps.append((self.record_name, other, coeff))
+    def __mul__(self, other):
+        # ``__opMul`` is ``int(round(value * factor / 100.0))`` under the
+        # embedded CPython 2.7, which rounds a half away from zero.
+        self.connector.values[self.record_name] = int(
+            self.connector.values[self.record_name] *
+            self.connector.values[other] / 100.0 + 0.5)
+        self.chain.append('MUL:%s' % other)
+        _Replay.steps.append((self.record_name, 'MUL', other))
+        return self
+
+    def __add__(self, other):
+        self.connector.values[self.record_name] += self.connector.values[
+            other]
+        self.chain.append('ADD:%s' % other)
+        _Replay.steps.append((self.record_name, 'ADD', other))
         return self
 
     def pack(self):
-        return b'replay'
+        return ('%s=%s' % ('+'.join(self.chain),
+                           self.connector.values[self.record_name])).encode(
+                               'ascii')
 
 
 def _receipt(account_key='account-key-123456', index=1, xp=600, damage=900,
@@ -118,6 +143,33 @@ def _receipt(account_key='account-key-123456', index=1, xp=600, damage=900,
 
 
 class MasteryDecisionTests(unittest.TestCase):
+    def test_baker_keeps_playable_secret_vehicles_but_excludes_helpers(self):
+        roster = {
+            62977: ('ussr', 'R127_T44_100_P', 8,
+                    ['mediumTank', 'secret', 'telecom']),
+            1: ('ussr', 'retired_tank', 8,
+                ['mediumTank', 'secret', 'unrecoverable']),
+            2: ('ussr', 'tank_bootcamp', 2, ['mediumTank', 'secret']),
+            3: ('ussr', 'tank_bot', 8, ['mediumTank', 'secret']),
+            4: ('ussr', 'tank_IGR', 8, ['mediumTank', 'premiumIGR']),
+            5: ('ussr', 'Observer', 1, ['observer', 'secret']),
+            6: ('ussr', 'event_tank', 8, ['mediumTank', 'fallout']),
+        }
+        self.assertEqual({62977, 1}, set(
+            mastery_baker.standard_battle_roster(roster)))
+
+    def test_shipped_secret_variants_resolve_fallback_without_overrides(self):
+        for intcd in (62977, 48897):
+            self.assertEqual((8, 'mediumTank'),
+                             battle_mastery.vehicle_profile(intcd))
+            self.assertNotIn(intcd, mastery_catalog.MARKS_DAMAGE)
+            self.assertEqual(
+                mastery_catalog.MARKS_DAMAGE_FALLBACK[(8, 'mediumTank')],
+                battle_mastery.marks_curve(intcd))
+            self.assertEqual(
+                mastery_catalog.MASTERY_XP_FALLBACK[(8, 'mediumTank')],
+                battle_mastery.mastery_thresholds(intcd))
+
     def test_combined_damage_takes_the_largest_assist_not_the_sum(self):
         # Wargaming's rule: "The maximum damage caused by destroying a track,
         # spotting, or stunning is counted - not the sum of these values."
@@ -316,6 +368,72 @@ class MasteryResultTests(unittest.TestCase):
             record_db_ids={('achievements', 'marksOnGun'): MARKS_DB_ID}))
         return packers.vehicle()
 
+    def test_secret_vehicle_earns_and_persists_marks_and_mastery(self):
+        postbattle_store._vehicle_type_compact_descr = lambda unused: 62977
+        name = 'ussr:R127_T44_100_P'
+        curve = battle_mastery.marks_curve(62977)
+        one_mark = curve[mastery_catalog.MARKS_PERCENTILES.index(65)]
+        ace_xp = battle_mastery.mastery_thresholds(62977)[3]
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'postbattle_state.json')
+            store = postbattle_store.PostBattleStore(path=path)
+            self.assertTrue(store.accept(_receipt(
+                store.account_key, vehicle=name, damage=one_mark)))
+            row = store._progress['vehicles'][name]
+            self.assertEqual(0, row['marksOnGun'])
+            row['movingAvgDamage'] = one_mark - 1
+            crossing = _receipt(store.account_key, index=2, vehicle=name,
+                                damage=one_mark * 3, xp=ace_xp)
+            self.assertTrue(store.accept(crossing))
+            result = self._result(store, crossing)
+            self.assertEqual(1, result['marksOnGun'])
+            self.assertEqual(4, result['markOfMastery'])
+            self.assertGreaterEqual(result['damageRating'], 65)
+            self.assertIn((MARKS_DB_ID, 1), result['dossierPopUps'])
+            restarted = postbattle_store.PostBattleStore(path=path)
+            self.assertEqual(result, self._result(restarted, crossing))
+
+    def test_store_publishes_the_earned_marks_to_the_battle_barrel(self):
+        """The account server owns publicInfo['marksOnGun'].
+
+        ``account_rpc.data.dossiers`` publishes this same row value as the
+        garage badge, so the barrel decal in battle and the garage badge read
+        one number rather than two independently derived ones.
+        """
+        curve = mastery_catalog.MARKS_DAMAGE[TYPE_59]
+        one_mark = curve[mastery_catalog.MARKS_PERCENTILES.index(65)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'postbattle_state.json')
+            store = postbattle_store.PostBattleStore(path=path)
+            self.assertEqual(0, store.marks_on_gun('china:Ch01_Type59'))
+            self.assertTrue(store.accept(_receipt(
+                store.account_key, damage=one_mark)))
+            self.assertEqual(0, store.marks_on_gun('china:Ch01_Type59'))
+
+            store._progress['vehicles']['china:Ch01_Type59'][
+                'movingAvgDamage'] = one_mark - 1
+            self.assertTrue(store.accept(_receipt(
+                store.account_key, index=2, damage=one_mark * 3)))
+
+            self.assertEqual(1, store.marks_on_gun('china:Ch01_Type59'))
+            self.assertEqual(
+                1, postbattle_store.PostBattleStore(
+                    path=path).marks_on_gun('china:Ch01_Type59'))
+
+    def test_store_reports_no_marks_for_an_unknown_or_damaged_row(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = postbattle_store.PostBattleStore(
+                path=str(Path(folder) / 'postbattle_state.json'))
+
+            self.assertEqual(0, store.marks_on_gun('ussr:R11_MS-1'))
+            store._progress['vehicles']['ussr:R11_MS-1'] = 'not a row'
+            self.assertEqual(0, store.marks_on_gun('ussr:R11_MS-1'))
+            store._progress['vehicles']['ussr:R11_MS-1'] = {
+                'marksOnGun': 'three'}
+            self.assertEqual(0, store.marks_on_gun('ussr:R11_MS-1'))
+            store._progress['vehicles']['ussr:R11_MS-1'] = {'marksOnGun': 40}
+            self.assertEqual(3, store.marks_on_gun('ussr:R11_MS-1'))
+
     def test_results_carry_the_badge_fields_and_the_new_mark_popup(self):
         curve = mastery_catalog.MARKS_DAMAGE[TYPE_59]
         one_mark = curve[mastery_catalog.MARKS_PERCENTILES.index(65)]
@@ -399,13 +517,18 @@ class MasteryResultTests(unittest.TestCase):
             bonus = int(round((third_class - 1) * 0.5))
             self.assertEqual(third_class - 1 + bonus, vehicle['xp'])
             self.assertEqual(bonus, vehicle['premiumVehicleXP'])
-            self.assertEqual(50, vehicle['premiumVehicleXPFactor100'])
-            # The #1513 breakdown renders that bonus from the chain step.
-            self.assertIn(('xp', 'originalXP', 'premiumVehicleXPFactor100'),
+            # #1513's premium-vehicle row reads a record named by the factor,
+            # which only a factor step writes, so the packed field is the
+            # total multiplier the chain applies.
+            self.assertEqual(150, vehicle['premiumVehicleXPFactor100'])
+            self.assertIn(('xp', 'SET', 'originalXP'), _Replay.steps)
+            self.assertIn(('xp', 'MUL', 'premiumVehicleXPFactor100'),
                           _Replay.steps)
-            self.assertIn(
-                ('freeXP', 'originalFreeXP', 'premiumVehicleXPFactor100'),
-                _Replay.steps)
+            self.assertIn(('freeXP', 'MUL', 'premiumVehicleXPFactor100'),
+                          _Replay.steps)
+            # Nothing multiplied this save, so there is no boosters row.
+            self.assertEqual(0, vehicle['boosterXP'])
+            self.assertNotIn(('xp', 'ADD', 'boosterXP'), _Replay.steps)
             message = store.service_message_data(receipt['arena_unique_id'])
             self.assertEqual(vehicle['xp'], message['xp'])
             # The account banks the bonus even though the badge ignored it.

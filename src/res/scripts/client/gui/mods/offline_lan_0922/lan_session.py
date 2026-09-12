@@ -21,6 +21,9 @@ POSTBATTLE_RETRY_DELAY = 0.10
 # The server returns an abandoned round to its waiting room five seconds after
 # the last participant leaves.  Rejoin if that roster never arrives.
 ROUND_END_TIMEOUT = 12.0
+# ``dossiers2.custom.records`` stores the vehicle marksOnGun record as a 'B'
+# capped at three.  Kept here so this module still loads its LAN client lazily.
+MAX_MARKS_ON_GUN = 3
 VEHICLE_SELECTION_WARNING = (
     'Select a valid vehicle in the garage, then click Battle! again.')
 
@@ -49,6 +52,15 @@ def _show_status(message):
 def _load_client():
     from gui.mods.offline_lan_0922.lan_client import LANClient
     return LANClient
+
+
+def _garage_inventory_refresh_pending():
+    try:
+        import BigWorld
+    except ImportError:
+        return False
+    server = getattr(BigWorld.player(), 'fakeServer', None)
+    return bool(getattr(server, 'inventory_refresh_pending', False))
 
 
 def _start_adisp_request(request_results, context, completed):
@@ -544,6 +556,7 @@ class LANSession(object):
                                  port_config.preferred_team(self._config))
         if self._postbattle_store is not None:
             client.account_key = self._postbattle_store.account_key
+        client.marks_on_gun = self._selected_vehicle_marks(vehicle)
         client.outfits = self._outfit_provider()
         try:
             client.vehicle_compact_descr = self._vehicle_compact_provider()
@@ -558,6 +571,27 @@ class LANSession(object):
                     'failed: %s\n' % error)
                 raise _VehicleSelectionError()
         return client
+
+    def _selected_vehicle_marks(self, vehicle):
+        """Return the gun marks this account holds on the selected vehicle.
+
+        The post-battle store is the account's own producer of the number
+        ``account_rpc.data.dossiers`` publishes to the garage, so the barrel
+        decal in battle and the badge in the garage read one value.  A session
+        without a store (a test seam, an embedder) carries no marks rather
+        than inventing them.
+        """
+        store = self._postbattle_store
+        reader = None if store is None else getattr(store, 'marks_on_gun', None)
+        if not callable(reader):
+            return 0
+        try:
+            return max(0, min(int(reader(vehicle)), MAX_MARKS_ON_GUN))
+        except Exception as error:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] the gun mark count is unavailable: '
+                '%s\n' % error)
+            return 0
 
     def _publish_postbattle_results(self):
         """Let the stock service request and cache each durable pending row."""
@@ -815,6 +849,8 @@ class LANSession(object):
 
     def _publish_selected_vehicle(self):
         """Send the current garage tank so the next round uses it."""
+        if _garage_inventory_refresh_pending():
+            return False
         client = self.client
         select = getattr(client, 'select_vehicle', None)
         if client is None or not callable(select):
@@ -832,17 +868,27 @@ class LANSession(object):
             return False
         if not vehicle or max_health < 1:
             return False
+        marks_on_gun = self._selected_vehicle_marks(vehicle)
         try:
             if effective_params is None:
                 return bool(select(
                     vehicle, max_health, outfits, vehicle_compact_descr))
             return bool(select(
                 vehicle, max_health, outfits, vehicle_compact_descr,
-                effective_params))
-        except TypeError:
-            # Test doubles and the first protocol-v5 client accepted only the
-            # original vehicle and max-health arguments.
-            return bool(select(vehicle, max_health))
+                effective_params, marks_on_gun))
+        except Exception as error:
+            # A failed modern projection/send must never fall back to a
+            # vehicle-only request that reuses the previous loadout.
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] vehicle selection could not be '
+                'published: %s\n' % error)
+            return False
+
+    def on_inventory_refreshed(self):
+        """Publish a completed fitting/resupply without another room click."""
+        if self._stopped or self.state != 'waiting' or self._start_requested:
+            return False
+        return self._publish_selected_vehicle()
 
     def _return_to_join_after_vehicle_selection_error(self):
         self.client = None
@@ -1977,14 +2023,25 @@ class LANSession(object):
                 self._endpoint_value())
             self._close_picker_after_event()
             return True
-        accepted = bool(self.client.request_start(
-            map_name, self._round_seconds))
+        accepted = self._send_start_request(map_name)
         if accepted:
             self._start_requested = True
             self._pending_map = None
             self.state = 'awaiting_battle_start'
             self._close_picker_after_event()
         return accepted
+
+    def _send_start_request(self, map_name):
+        if _garage_inventory_refresh_pending():
+            self._status_notifier(tr(
+                'Vehicle supplies are updating. Try starting again in a moment.'))
+            return False
+        # select_vehicle and start share the transport's ordered send queue.
+        # Never start with an older loadout after a failed garage projection.
+        if not self._publish_selected_vehicle():
+            self._status_notifier(tr(VEHICLE_SELECTION_WARNING))
+            return False
+        return bool(self.client.request_start(map_name, self._round_seconds))
 
     def _stop_active_round(self):
         try:
@@ -2082,8 +2139,7 @@ class LANSession(object):
                         tr('The LAN server does not offer the selected map.'))
                     self._sync_waiting_surface(previous_host_player_id)
                     return
-                if self.client.request_start(pending_map,
-                                             self._round_seconds):
+                if self._send_start_request(pending_map):
                     self._start_requested = True
                     self.state = 'awaiting_battle_start'
                     self._close_picker()

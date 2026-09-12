@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+import hashlib
 import sys
 import traceback
 
@@ -19,6 +20,7 @@ _OFFLINE_INIT_COMPLETE = '_offlineLANInitComplete'
 _OFFLINE_PLAYER_READY = '_offlineLANPlayerReady'
 _OFFLINE_RETIRE_PENDING = '_offlineLANRetirePending'
 _account_settings_pinned = False
+_dossier_cache_pinned = False
 # AccountSettings.DEFAULT_VALUES keys whose sections this port adopts once.
 _SETTINGS_KEYS = ('settings', 'filters', 'counters', 'notifications')
 
@@ -91,6 +93,82 @@ def _account_settings_module():
     # so resolve the module the way the interpreter recorded it.
     import account_helpers.AccountSettings  # noqa: F401
     return sys.modules['account_helpers.AccountSettings']
+
+
+def _dossier_cache_module():
+    # account_helpers/__init__ shadows the submodule name with the class,
+    # so resolve the module the way the interpreter recorded it.
+    import account_helpers.DossierCache  # noqa: F401
+    return sys.modules['account_helpers.DossierCache']
+
+
+def _dossier_cache_career(career_provider):
+    """Return this process's career id, or ``''`` when it cannot be read.
+
+    An exception here would reach ``PlayerAccount.__init__`` and leave the
+    player with no account at all, which is far worse than a shared cache
+    file, so an unreadable career falls back to the stock name.
+    """
+    try:
+        return str(career_provider() or '')
+    except Exception as error:
+        print('[Offline LAN 0.9.22] the dossier cache career is unavailable: '
+              '%s' % error)
+        return ''
+
+
+def _career_scoped_account(account_name, career):
+    """Return a bounded cache namespace for the complete offline career."""
+    if not career:
+        return account_name
+    # #1513 base32-expands the name beneath the preferences directory. A
+    # valid 64-character slot already exceeds Windows MAX_PATH when copied
+    # into the account name, so hash the complete identity into 128 bits.
+    suffix = hashlib.sha256(career.encode('utf-8')).hexdigest()[:32]
+    return '%s#%s' % (account_name, suffix)
+
+
+def pin_dossier_cache(career_provider, dossier_cache=None):
+    """Give each offline career its own #1513 vehicle dossier cache file.
+
+    ``DossierCache.__init__`` names its ``.dat`` file
+    ``b32encode('%s;%s;%s' % (BigWorld.server(), accountName,
+    accountClassName))`` and uses ``accountName`` for nothing else.  All three
+    are constant offline, so every save slot -- and the hidden worker running
+    beside the visible client -- share one file.  ``__readCache`` restores
+    ``__maxChangeTime`` as the highest ``changeTime`` in that file and
+    ``__sendSyncRequest`` then asks only for rows newer than it, so a career
+    whose battle count sits below another career's watermark receives no
+    vehicle dossier row at all: its garage mastery badges, Marks of Excellence
+    and per-vehicle records freeze while battles keep settling normally.
+    Nothing resets that watermark except building the cache from a file.
+
+    Scoping the name restores the one thing retail relies on, one cache file
+    per account, and stops two processes writing the same pickle.  Like the
+    interface-settings pin this must outlive every connect and disconnect:
+    ``Account.PlayerAccount.__init__`` builds the cache itself, before any
+    account hook of ours can run.
+    """
+    global _dossier_cache_pinned
+    if _dossier_cache_pinned:
+        return False
+    if dossier_cache is None:
+        dossier_cache = _dossier_cache_module()
+    cache_type = dossier_cache.DossierCache
+    original_init = cache_type.__init__
+
+    def scoped_init(self, accountName, accountClassName):
+        original_init(
+            self,
+            _career_scoped_account(
+                accountName, _dossier_cache_career(career_provider)),
+            accountClassName)
+
+    cache_type.__init__ = scoped_init
+    _dossier_cache_pinned = True
+    print('[Offline LAN 0.9.22] vehicle dossier cache scoped to career %r'
+          % _dossier_cache_career(career_provider))
+    return True
 
 
 def _account_sections(settings_type):
@@ -1622,7 +1700,11 @@ class OfflineCompatibility(object):
         def undrawn_lan_remote(entity):
             """Whether one entity is a LAN remote the client must not draw."""
             read = compatibility._original_vehicle_getattribute
-            if read is None:
+            if (read is None or vehicle_type is None or
+                    not isinstance(entity, vehicle_type)):
+                # A detached turret is a client-created DetachedTurret, not a
+                # Vehicle: its ``__getattribute__`` was never replaced, so the
+                # captured Vehicle reader neither applies to it nor is needed.
                 read = getattr
             try:
                 if not bool(read(entity, '_offlineNativeRemote')):
@@ -1677,42 +1759,67 @@ class OfflineCompatibility(object):
             return compatibility._original_projectile_segment_may_hit(
                 entity, startPoint, endPoint)
 
+        vehicle_overlay_names = frozenset((
+            'health', 'isCrewActive', 'position', 'yaw', 'matrix'))
+        vehicle_special_names = vehicle_overlay_names.union((
+            'filter', 'cell', 'show', 'guiSessionProvider'))
+
         def vehicle_getattribute(vehicle, name):
+            # Stock callbacks also read ordinary Vehicle attributes through
+            # this hook. Only the names below need offline state or callers.
+            if (name not in vehicle_special_names or
+                    not compatibility._battle_active):
+                return compatibility._original_vehicle_getattribute(
+                    vehicle, name)
+            if name in vehicle_overlay_names:
+                overlay = compatibility._vehicle_property_overlays.get(
+                    id(vehicle))
+                if overlay is not None and name in overlay:
+                    if name == 'position':
+                        caller_code = None
+                        try:
+                            caller_code = sys._getframe(1).f_code
+                        except (AttributeError, ValueError):
+                            pass
+                        if (caller_code is
+                                compatibility._gun_rotator_predict_locked_target_code):
+                            try:
+                                native_remote = bool(
+                                    compatibility._original_vehicle_getattribute(
+                                        vehicle, '_offlineNativeRemote'))
+                            except AttributeError:
+                                native_remote = False
+                            if native_remote:
+                                return runtime.math.Matrix(
+                                    overlay['matrix']).translation
+                    return overlay[name]
+                return compatibility._original_vehicle_getattribute(
+                    vehicle, name)
+            if name == 'cell':
+                try:
+                    return compatibility._original_vehicle_getattribute(
+                        vehicle, 'fakeCell')
+                except AttributeError:
+                    player = runtime.bigworld.player()
+                    if isinstance(player, avatar_type):
+                        try:
+                            return compatibility._original_avatar_getattribute(
+                                player, 'fakeServer')
+                        except AttributeError:
+                            pass
+                return compatibility._original_vehicle_getattribute(
+                    vehicle, name)
             caller_code = None
-            locked_target_code = \
-                compatibility._gun_rotator_predict_locked_target_code
-            if (compatibility._vehicle_starting_visual is not None or
-                    compatibility._vehicle_starting_wg_physics is not None or
-                    compatibility._vehicle_syncing_gun_angles is not None or
-                    compatibility._avatar_syncing_aux_physics is not None or
-                    compatibility._avatar_entering_vehicle is not None or
-                    name in ('filter', 'position')):
+            if (name == 'filter' or
+                    compatibility._vehicle_starting_visual is vehicle):
                 try:
                     caller_code = sys._getframe(1).f_code
                 except (AttributeError, ValueError):
                     pass
-            if (compatibility._battle_active and
-                    name in ('health', 'isCrewActive',
-                             'position', 'yaw', 'matrix')):
-                overlay = compatibility._vehicle_property_overlays.get(
-                    id(vehicle))
-                if overlay is not None and name in overlay:
-                    if (name == 'position' and
-                            caller_code is locked_target_code):
-                        try:
-                            native_remote = bool(
-                                compatibility._original_vehicle_getattribute(
-                                    vehicle, '_offlineNativeRemote'))
-                        except AttributeError:
-                            native_remote = False
-                        if native_remote:
-                            return runtime.math.Matrix(
-                                overlay['matrix']).translation
-                    return overlay[name]
             direct_start_visual = (
                 compatibility._vehicle_starting_visual is vehicle and
                 caller_code is compatibility._vehicle_start_visual_code)
-            if (direct_start_visual and compatibility._battle_active and
+            if (direct_start_visual and
                     name in ('show', 'guiSessionProvider')):
                 try:
                     marker_visible = bool(
@@ -1740,6 +1847,9 @@ class OfflineCompatibility(object):
                         compatibility._original_vehicle_getattribute(
                             vehicle, name)
                     return _OfflineInitialVehicleVisualProvider(provider)
+            if name != 'filter':
+                return compatibility._original_vehicle_getattribute(
+                    vehicle, name)
             direct_start_filter = (
                 compatibility._vehicle_starting_wg_physics is vehicle and
                 caller_code is compatibility._vehicle_start_wg_physics_code)
@@ -1775,8 +1885,7 @@ class OfflineCompatibility(object):
                 caller_code is
                 compatibility._projectile_segment_may_hit_code and
                 overlay is not None and overlay.get('_pose_active'))
-            if (name == 'filter' and compatibility._battle_active and
-                    direct_visible_collision):
+            if direct_visible_collision:
                 try:
                     native_remote = bool(
                         compatibility._original_vehicle_getattribute(
@@ -1797,11 +1906,10 @@ class OfflineCompatibility(object):
                         velocity = runtime.math.Vector3(0.0, 0.0, 0.0)
                     collision_filter.update(visible_position, velocity)
                     return collision_filter
-            if (name == 'filter' and compatibility._battle_active and
-                    (direct_start_filter or direct_gun_sync or
-                     direct_avatar_aux_sync or direct_avatar_pose_init or
-                     direct_fixed_turret_pose or direct_camera_motion or
-                     direct_crashed_track_pose)):
+            if (direct_start_filter or direct_gun_sync or
+                    direct_avatar_aux_sync or direct_avatar_pose_init or
+                    direct_fixed_turret_pose or direct_camera_motion or
+                    direct_crashed_track_pose):
                 vehicle_filter = (
                     compatibility._original_vehicle_getattribute(
                         vehicle, name))
@@ -1815,18 +1923,6 @@ class OfflineCompatibility(object):
                                 if direct_camera_motion else None)
                 return _OfflineVehicleFilterSyncProxy(
                     vehicle_filter, pose_matrix, velocity, acceleration)
-            if name == 'cell' and compatibility._battle_active:
-                try:
-                    return compatibility._original_vehicle_getattribute(
-                        vehicle, 'fakeCell')
-                except AttributeError:
-                    player = runtime.bigworld.player()
-                    if isinstance(player, avatar_type):
-                        try:
-                            return compatibility._original_avatar_getattribute(
-                                player, 'fakeServer')
-                        except AttributeError:
-                            pass
             return compatibility._original_vehicle_getattribute(vehicle, name)
 
         def vehicle_setattr(vehicle, name, value):

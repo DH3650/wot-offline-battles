@@ -11,8 +11,10 @@ sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import device_damage
+from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import internal_hit_layouts
 from gui.mods.offline_lan_0922 import internal_layout_profiles
+from gui.mods.offline_lan_0922 import player_critical_mechanics
 from gui.mods.offline_lan_0922 import track_damage
 
 
@@ -136,7 +138,7 @@ def _layout_descriptor(name, crew_roles):
         defaults.update(values)
         return _Strict1513Component(**defaults)
 
-    return _Strict1513Component(
+    descriptor = _Strict1513Component(
         type=types.SimpleNamespace(name=name, crewRoles=crew_roles),
         chassis=component('chassis'),
         hull=component('hull'),
@@ -145,6 +147,27 @@ def _layout_descriptor(name, crew_roles):
         engine=component('engine', weight=120.0),
         fuelTank=component('fuelTank', weight=40.0),
         radio=component('radio', weight=15.0))
+
+    # Geometry consumers need the matching component model/frame. Arbitrary
+    # shared bboxes cannot stand in for an installed #1513 component now that
+    # decoded meshes are correctly kept in metres instead of fitted to it.
+    table = internal_hit_layouts._layout_console
+    record = getattr(table, 'CONSOLE_LAYOUTS_0922', {}).get(
+        internal_hit_layouts._profile_key(name))
+    if record is not None and getattr(table, 'MESH_SCHEMA', None) == 1:
+        geometries = ([z[3] for z in record[4]] +
+                      [z[2] for alternatives in record[5] for z in alternatives or ()])
+        selected = {}
+        for geometry in sorted(geometries, key=lambda g: g['part']):
+            parent = geometry['part'].split('_')[0]
+            if parent in selected:
+                continue
+            selected[parent] = geometry
+            value = getattr(descriptor, parent)
+            value.models = types.SimpleNamespace(undamaged=(
+                'vehicles/example/normal/lod0/' + geometry['part'] + '.model'))
+            value.hitTester.bbox = tuple(geometry['reference_bounds']) + (None,)
+    return descriptor
 
 
 class CriticalDamageTests(unittest.TestCase):
@@ -158,6 +181,49 @@ class CriticalDamageTests(unittest.TestCase):
         self.bigworld.player = lambda: self.player
         self.bigworld.time = lambda: 12.0
         self.math = types.ModuleType('Math')
+
+    def test_owned_descriptor_is_read_once_without_native_player_lookup(self):
+        descriptor = _descriptor()
+        for value in (descriptor, None):
+            with self.subTest(descriptor=value):
+                class Vehicle(object):
+                    reads = 0
+
+                    @property
+                    def typeDescriptor(self):
+                        self.reads += 1
+                        return value
+
+                vehicle = Vehicle()
+                with mock.patch.dict(sys.modules, {'BigWorld': None}):
+                    self.assertIs(value, critical_damage._device_td(vehicle))
+                self.assertEqual(1, vehicle.reads)
+
+    def test_missing_descriptor_keeps_native_player_fallback(self):
+        native_player = mock.Mock(return_value=self.player)
+        with mock.patch.dict(sys.modules, {'BigWorld': self.bigworld}), \
+                mock.patch.object(self.bigworld, 'player', native_player):
+            self.assertIs(self.player.vehicleTypeDescriptor,
+                          critical_damage._device_td(object()))
+        native_player.assert_called_once_with()
+
+    def test_medkit_preserves_surviving_casualty_combined_roles_without_native(self):
+        descriptor = _descriptor()
+        descriptor.type.crewRoles = (
+            ('commander', 'radioman'), ('driver',), ('loader', 'gunner'))
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=descriptor, health=500,
+            devices_hp={}, _destroyed_devices=set(),
+            _crew_ko={'commander', 'loader1'}, is_on_fire=False)
+
+        with mock.patch.dict(sys.modules, {'BigWorld': None}):
+            payload = critical_damage.restore_crew(vehicle, 'commander')
+
+        self.assertEqual(['loader1'], payload['crew_ko'])
+        self.assertEqual(frozenset(('loader', 'gunner')), vehicle._crew_impaired)
+        self.assertEqual(
+            [{'kind': 'crew', 'name': 'commander', 'state': 'normal',
+              'cause': 'repair'}], payload['events'])
 
     def test_native_1513_components_never_call_forbidden_legacy_get(self):
         descriptor = _strict_1513_descriptor()
@@ -321,14 +387,21 @@ class CriticalDamageTests(unittest.TestCase):
             'ussr:R38_KV-220_beta': ('ussr', 'kv220action'),
             'ussr:R67_M3_LL': ('ussr', 'm3stuartll'),
         }
+        # Decoded geometry now resolves ahead of the retained archetypes, so
+        # this asserts on the authored-plus-alias table itself: that is what
+        # the suffix-guess guard is about, and it is unchanged.
         for vehicle_name, profile_key in expected.items():
             with self.subTest(vehicle=vehicle_name):
-                actual_key, profile = internal_hit_layouts._compiled_profile(
-                    vehicle_name)
+                actual_key, profile = internal_hit_layouts._profile_for_key(
+                    internal_hit_layouts._profile_key(vehicle_name))
                 self.assertEqual(profile_key, actual_key)
                 self.assertIs(
                     internal_layout_profiles.PROFILES[profile_key], profile)
 
+        # These reused an old display name and must never pick the legacy
+        # interior up through the authored or alias table.  Whether they end
+        # up with decoded geometry is a separate question, answered by the
+        # decoded-interior tests.
         for vehicle_name in (
                 'germany:G102_Pz_III',
                 'germany:G101_StuG_III',
@@ -338,8 +411,8 @@ class CriticalDamageTests(unittest.TestCase):
                 'usa:A91_T71',
                 'ussr:R999_MS-1'):
             with self.subTest(unmapped=vehicle_name):
-                unused_key, profile = internal_hit_layouts._compiled_profile(
-                    vehicle_name)
+                unused_key, profile = internal_hit_layouts._profile_for_key(
+                    internal_hit_layouts._profile_key(vehicle_name))
                 self.assertIsNone(profile)
 
     def test_internal_layout_0922_crew_drift_bindings(self):
@@ -389,7 +462,15 @@ class CriticalDamageTests(unittest.TestCase):
                      target['crew_index'], target['zone_id'])
                     for target in layout['targets']
                     if target['kind'] == 'crew')
-                self.assertEqual(expected, actual)
+                unused_key, profile = internal_hit_layouts._compiled_profile(
+                    vehicle_name)
+                zones = internal_hit_layouts._profile_record(
+                    profile)['crew_zones']
+                self.assertEqual(
+                    tuple(row[:3] + ((zones[row[2]][0][1] if
+                        profile[0].startswith('decoded_collision_surfaces') else
+                        zones[row[2]][1]),) for row in expected if zones[row[2]] is not None),
+                    actual)
 
     def test_layout_prewarm_waits_for_complete_native_bounds(self):
         descriptor = _layout_descriptor(
@@ -547,7 +628,7 @@ class CriticalDamageTests(unittest.TestCase):
         descriptor = _descriptor()
         target = types.SimpleNamespace(
             matrix=object(), getComponents=lambda: (
-                (descriptor.hull, _IdentityMatrix(None)),))
+                (descriptor.hull, _IdentityMatrix(None), True),))
         layout = {'valid': True, 'targets': (
             {'parent': 'hull', 'entity': 'engine'},
             {'parent': 'hull', 'entity': 'fuelTank'})}
@@ -597,7 +678,7 @@ class CriticalDamageTests(unittest.TestCase):
         descriptor = _descriptor()
         target = types.SimpleNamespace(
             matrix=object(), getComponents=lambda: (
-                (descriptor.hull, _IdentityMatrix(None)),))
+                (descriptor.hull, _IdentityMatrix(None), True),))
 
         def sphere(entity, center):
             return {
@@ -634,7 +715,7 @@ class CriticalDamageTests(unittest.TestCase):
         descriptor = _descriptor()
         target = types.SimpleNamespace(
             matrix=object(), getComponents=lambda: (
-                (descriptor.hull, _TranslateXMatrix(-10.0)),))
+                (descriptor.hull, _TranslateXMatrix(-10.0), True),))
         layout = {'valid': True, 'targets': ({
             'parent': 'hull', 'entity': 'engine',
             'primitives': ({
@@ -659,7 +740,7 @@ class CriticalDamageTests(unittest.TestCase):
         descriptor = _descriptor()
         target = types.SimpleNamespace(
             matrix=object(), getComponents=lambda: (
-                (descriptor.hull, _IdentityMatrix(None)),))
+                (descriptor.hull, _IdentityMatrix(None), True),))
 
         def box(entity, minimum, maximum):
             center = tuple((minimum[index] + maximum[index]) * 0.5
@@ -1049,6 +1130,50 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertTrue(payload['ammo_rack_death'])
         self.assertEqual('ammo_rack', payload['events'][-1]['kind'])
 
+    def test_2000_module_damage_detonates_a_reached_rack_after_one_saving_throw(self):
+        kinds = ('ARMOR_PIERCING', 'ARMOR_PIERCING_CR', 'HOLLOW_CHARGE',
+                 'ARMOR_PIERCING_HE', 'HIGH_EXPLOSIVE')
+        for kind in kinds:
+            for target_id in (1, 999):
+                for chance_roll in (0.269, 0.270):
+                    with self.subTest(kind=kind, target=target_id,
+                                      chance_roll=chance_roll):
+                        vehicle = types.SimpleNamespace(
+                            id=target_id, health=500,
+                            typeDescriptor=_descriptor(),
+                            position=object(), matrix=object(),
+                            getComponents=lambda: ())
+                        shell = {'kind': kind, 'damage': (100.0, 2000.0)}
+                        # These are reached module contacts. Native and
+                        # reconstructed multi-box contacts must not add rolls.
+                        mat = _Material('ammoBayHealth', chance=0.27)
+                        hits = ((1.0, 1.0, mat, None), (1.2, 1.0, mat, None))
+                        with mock.patch.dict(sys.modules, {
+                                'BigWorld': self.bigworld, 'Math': self.math}), \
+                                mock.patch('random.uniform',
+                                           side_effect=lambda low, high: low), \
+                                mock.patch('random.random',
+                                           return_value=chance_roll) as roll, \
+                                mock.patch.object(critical_damage,
+                                    '_offh_internal_cone_hits', return_value=()):
+                            if kind == 'HIGH_EXPLOSIVE':
+                                damage, payload, delta = critical_damage.propose_explosion(
+                                    vehicle, hits, object(), object(), 100, shell,
+                                    attacker_id=2, with_delta=True)
+                            else:
+                                damage, payload, delta = critical_damage.propose_direct(
+                                    vehicle, hits, object(), object(), 100, shell,
+                                    attacker_id=2, penetrated=True, with_delta=True)
+                        roll.assert_called_once()
+                        if chance_roll < 0.27:
+                            self.assertEqual(510, damage)
+                            self.assertTrue(payload['ammo_rack_death'])
+                            self.assertEqual(100.0, delta['devices'][0]['hp_loss'])
+                        else:
+                            self.assertEqual(100, damage)
+                            self.assertFalse((payload or {}).get('ammo_rack_death'))
+                            self.assertEqual([], delta['devices'])
+
     def test_proposal_records_module_operation_before_stale_hp_clamp(self):
         vehicle = types.SimpleNamespace(
             id=1, health=500, typeDescriptor=_descriptor(),
@@ -1323,7 +1448,8 @@ class CriticalDamageTests(unittest.TestCase):
             _crew_ko=set(), is_on_fire=False)
 
         payload = critical_damage.tick_repair(
-            vehicle, 10.0, repair_skill=0.0)
+            vehicle, device_damage.BASE_TRACK_REPAIR_SECONDS,
+            repair_skill=0.0)
 
         self.assertEqual(50.0, vehicle.devices_hp['leftTrackHealth'])
         self.assertNotIn('leftTrackHealth', vehicle._destroyed_devices)
@@ -1357,7 +1483,8 @@ class CriticalDamageTests(unittest.TestCase):
             position=object(), matrix=object(), getComponents=lambda: ())
 
         payload = critical_damage.tick_repair(
-            vehicle, 10.0, repair_skill=0.0)
+            vehicle, device_damage.BASE_TRACK_REPAIR_SECONDS,
+            repair_skill=0.0)
         shadow = critical_damage._CriticalProposalVehicle(vehicle)
 
         self.assertEqual(80.0, vehicle.devices_hp['leftTrackHealth'])
@@ -1429,7 +1556,8 @@ class CriticalDamageTests(unittest.TestCase):
         shell = {'damage': (100.0, 120.0)}
 
         repaired = critical_damage.tick_repair(
-            vehicle, 10.0, repair_skill=0.0)
+            vehicle, device_damage.BASE_TRACK_REPAIR_SECONDS,
+            repair_skill=0.0)
         with mock.patch.dict(
                 sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
                 mock.patch('random.uniform', return_value=120.0), \
@@ -1938,6 +2066,208 @@ class CrewInjuryLawTests(unittest.TestCase):
         for stat in ('reload', 'aim_time', 'dispersion', 'turret_speed',
                      'mobility', 'vision', 'signal'):
             self.assertEqual(1.0, device_damage.crew_stat_factor((), stat))
+
+
+class _RepairDescriptor(object):
+    """Only the descriptor surface the repair law reads."""
+
+    def __init__(self, repair_speed_factor=1.0):
+        self.engine = {'maxHealth': 170, 'maxRegenHealth': 130}
+        self.chassis = {'maxHealth': 260, 'maxRegenHealth': 130}
+        self.miscAttrs = {'repairSpeedFactor': repair_speed_factor}
+
+
+def _kit_contract(name, tags, repair_all=True, bonus=0.10):
+    """One projected #1513 kit contract, as the item cache would give it."""
+    return equipment_mechanics.project_equipment(types.SimpleNamespace(
+        name=name, id=(11, 23), compactDescr=423, tags=tags,
+        reuseCount=0, cooldownSeconds=90.0, repairAll=repair_all,
+        bonusValue=bonus))
+
+
+def _repair_player(hp, state, destroyed=()):
+    """One server-owned participant with a single damaged engine."""
+    return types.SimpleNamespace(
+        player_id=7, health=500, max_health=500, x=0.0, y=0.0, z=0.0,
+        alive=True, combat_fire_timer=0.0, equipment_states=(),
+        critical={
+            'devices': [{'name': 'engineHealth', 'hp': float(hp),
+                         'max_hp': 170.0, 'state': state}],
+            'destroyed': list(destroyed), 'crew_ko': [], 'fire': False},
+        effective_params={
+            'critical': {'devices': [
+                {'name': 'engineHealth', 'max_hp': 170.0,
+                 'regen_hp': 130.0}]},
+            'loadout': {'repair_factor': device_damage.CREW_FACTOR_BASE,
+                        'has_big_kit': False}})
+
+
+class ServerConsumableDescriptorTests(unittest.TestCase):
+
+    def test_medkit_server_projection_preserves_other_injuries_without_native(self):
+        for crew_ko, repair_all, expected in (
+                (['commander'], False, []),
+                (['commander', 'driver'], False, ['driver']),
+                (['commander', 'loader1', 'loader2'], False,
+                 ['loader1', 'loader2']),
+                (['commander', 'driver'], True, [])):
+            with self.subTest(crew_ko=crew_ko, repair_all=repair_all):
+                player = _repair_player(170.0, 'normal')
+                player.critical['crew_ko'] = list(crew_ko)
+                player.effective_params['critical']['crew_roster'] = list(crew_ko)
+                effect = {'action': 'restore_crew', 'repairAll': repair_all,
+                          'selected': None if repair_all else 'commander'}
+
+                with mock.patch.dict(sys.modules, {'BigWorld': None}):
+                    payload = player_critical_mechanics.apply_equipment(
+                        player, effect, 10.0)
+
+                self.assertEqual(expected, payload['crew_ko'])
+                self.assertEqual(crew_ko, player.critical['crew_ko'])
+                self.assertEqual(player.critical['devices'], payload['devices'])
+                self.assertEqual(
+                    [{'kind': 'crew', 'name': name, 'state': 'normal',
+                      'cause': 'repair'}
+                     for name in sorted(set(crew_ko) - set(expected))],
+                    payload['events'])
+
+    def test_server_extinguisher_restores_exact_fuel_regen_pool_without_native(self):
+        player = _repair_player(170.0, 'normal')
+        player.effective_params['critical']['devices'].append({
+            'name': 'fuelTankHealth', 'max_hp': 160.0, 'regen_hp': 120.0})
+        player.critical['devices'].append({
+            'name': 'fuelTankHealth', 'hp': 0.0,
+            'max_hp': 160.0, 'state': 'destroyed'})
+        player.critical.update(
+            fire=True, destroyed=['fuelTankHealth'], crew_ko=['commander'])
+
+        with mock.patch.dict(sys.modules, {'BigWorld': None}):
+            payload = player_critical_mechanics.apply_equipment(
+                player, {'action': 'extinguish_fire'}, 10.0)
+
+        self.assertFalse(payload['fire'])
+        self.assertEqual([], payload['destroyed'])
+        self.assertEqual(['commander'], payload['crew_ko'])
+        self.assertEqual(
+            {'name': 'fuelTankHealth', 'hp': 120.0,
+             'max_hp': 160.0, 'state': 'critical'}, payload['devices'][1])
+        self.assertEqual(
+            [{'kind': 'device', 'name': 'fuelTankHealth',
+              'old_state': 'destroyed', 'state': 'critical', 'cause': 'repair'},
+             {'kind': 'fire', 'state': False, 'cause': 'repair'}],
+            payload['events'])
+        self.assertTrue(player.critical['fire'])
+        self.assertEqual(0.0, player.critical['devices'][1]['hp'])
+
+
+class ModuleRepairSpeedTests(unittest.TestCase):
+    """The one repair law shared by the player, the local track CAS and bots."""
+
+    def test_untrained_default_crew_takes_the_documented_base_time(self):
+        descriptor = _RepairDescriptor()
+        # #1513 gives a crew with no Repair skill factors['repairSpeed'] 0.57,
+        # and that crew is exactly what the base constants describe.
+        self.assertEqual(12.0, device_damage.BASE_TRACK_REPAIR_SECONDS)
+        self.assertAlmostEqual(
+            device_damage.BASE_TRACK_REPAIR_SECONDS,
+            device_damage.repair_seconds(
+                'leftTrackHealth', descriptor,
+                repair_factor=device_damage.CREW_FACTOR_BASE))
+        self.assertAlmostEqual(
+            device_damage.BASE_MODULE_REPAIR_SECONDS,
+            device_damage.repair_seconds(
+                'engineHealth', descriptor,
+                repair_factor=device_damage.CREW_FACTOR_BASE))
+
+    def test_full_repair_skill_divides_by_the_client_curve(self):
+        descriptor = _RepairDescriptor()
+        # 0.57 + 0.43 * 1.0 = 1.0, so a fully trained crew is 1/0.57 faster,
+        # not the flat 2x this port used before.
+        self.assertAlmostEqual(
+            device_damage.BASE_TRACK_REPAIR_SECONDS *
+            device_damage.CREW_FACTOR_BASE,
+            device_damage.repair_seconds(
+                'leftTrackHealth', descriptor, repair_factor=1.0))
+        self.assertAlmostEqual(
+            1.0 / device_damage.CREW_FACTOR_BASE,
+            device_damage.crew_repair_factor(100.0))
+
+    def test_percentage_and_client_factor_paths_agree(self):
+        descriptor = _RepairDescriptor()
+        for percentage in (0.0, 50.0, 100.0):
+            factor = device_damage.crew_repair_speed(percentage)
+            self.assertAlmostEqual(
+                device_damage.repair_seconds(
+                    'engineHealth', descriptor,
+                    repair_skill_pct=percentage),
+                device_damage.repair_seconds(
+                    'engineHealth', descriptor, repair_factor=factor))
+
+    def test_only_an_unused_large_repair_kit_speeds_the_repair(self):
+        descriptor = _RepairDescriptor()
+        contract = _kit_contract('largeRepairkit', ('repairkit',))
+        kit = equipment_mechanics.EquipmentState(contract)
+
+        unused = equipment_mechanics.passive_effects([kit])
+        kit.activate(0.0, {'destroyed': ['engineHealth'],
+                           'devices': [{'name': 'engineHealth',
+                                        'state': 'destroyed'}]})
+        spent = equipment_mechanics.passive_effects([kit])
+
+        self.assertEqual(0, kit.uses_left)
+        self.assertAlmostEqual(0.10, unused['repairkitBonusValue'])
+        self.assertEqual(0.0, spent['repairkitBonusValue'])
+        # Wargaming publishes the kit's 10% as an un-used bonus, and #1513
+        # gives Repairkit no factor hook, so it lives on the live ledger.
+        self.assertAlmostEqual(
+            device_damage.BASE_MODULE_REPAIR_SECONDS / 1.10,
+            device_damage.repair_seconds(
+                'engineHealth', descriptor,
+                repair_factor=device_damage.CREW_FACTOR_BASE *
+                (1.0 + unused['repairkitBonusValue'])))
+        self.assertAlmostEqual(
+            device_damage.BASE_MODULE_REPAIR_SECONDS,
+            device_damage.repair_seconds(
+                'engineHealth', descriptor,
+                repair_factor=device_damage.CREW_FACTOR_BASE *
+                (1.0 + spent['repairkitBonusValue'])))
+
+    def test_toolbox_uses_the_exact_descriptor_factor(self):
+        # A StaticFactorDevice writes miscAttrs/repairSpeedFactor; the law only
+        # divides by whatever the descriptor carries.
+        self.assertAlmostEqual(
+            device_damage.BASE_TRACK_REPAIR_SECONDS / 1.25,
+            device_damage.repair_seconds(
+                'leftTrackHealth', _RepairDescriptor(1.25),
+                repair_factor=device_damage.CREW_FACTOR_BASE))
+
+    def test_player_repairs_a_destroyed_engine_at_the_bot_rate(self):
+        player = _repair_player(0.0, 'destroyed', destroyed=('engineHealth',))
+        bot = types.SimpleNamespace(
+            typeDescriptor=_RepairDescriptor(), health=500,
+            devices_hp={'engineHealth': 0.0},
+            _destroyed_devices=set(['engineHealth']),
+            _critical_devices=set(), _crew_ko=set(), is_on_fire=False)
+
+        player_payload = player_critical_mechanics.advance_critical(
+            player, 5.0, 5.0)
+        critical_damage.tick_repair(
+            bot, 5.0, repair_factor=device_damage.CREW_FACTOR_BASE)
+
+        self.assertAlmostEqual(
+            bot.devices_hp['engineHealth'],
+            player_payload['devices'][0]['hp'])
+        self.assertAlmostEqual(
+            130.0 * 5.0 / device_damage.BASE_MODULE_REPAIR_SECONDS,
+            bot.devices_hp['engineHealth'])
+
+    def test_player_yellow_module_does_not_auto_repair(self):
+        player = _repair_player(40.0, 'critical')
+
+        payload = player_critical_mechanics.advance_critical(
+            player, 100.0, 100.0)
+
+        self.assertIsNone(payload)
 
 
 if __name__ == '__main__':

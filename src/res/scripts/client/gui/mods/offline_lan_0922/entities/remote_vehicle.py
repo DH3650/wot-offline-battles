@@ -1416,20 +1416,57 @@ def _component_aim_angles(descriptor, turret_yaw, gun_pitch):
     return float(turret_yaw), float(gun_pitch)
 
 
+def _write_changed_pose(matrix, position, rotation, previous):
+    """Write changed components of one persistent presentation matrix.
+
+    A rotation setter can reset translation, so every rotation write restores
+    XYZ as well. Publish the cache only after both native writes succeed, and
+    fence it by matrix identity so a replacement provider starts uncached.
+    Motion timestamps and velocity samples remain owned by the caller.
+    """
+    xyz = (float(position.x), float(position.y), float(position.z))
+    same_matrix = previous is not None and previous[0] is matrix
+    rotated = not same_matrix or previous[2] != rotation
+    if rotated:
+        matrix.setRotateYPR(rotation)
+    if rotated or previous[1] != xyz:
+        matrix.translation = position
+    return matrix, xyz, rotation
+
+
+def turret_is_attached(vehicle):
+    """Return #1513's own ``getComponents`` attachment bit for turret and gun.
+
+    Exact ``Vehicle.getComponents`` publishes ``not self.isTurretDetached``
+    for the turret and the gun, and ``Vehicle.__collideSegment`` skips every
+    component whose bit is false.  An ammo-bay detachment therefore removes
+    both hit testers from the wreck; without that the empty turret ring keeps
+    stopping shells above a turretless hull.
+    """
+    return not bool(getattr(vehicle, 'isTurretDetached', False))
+
+
 def _pose_components(vehicle, math_module):
-    """Build descriptor-local hit-test transforms below the body pose."""
+    """Build descriptor-local hit-test transforms below the body pose.
+
+    Each entry is exact #1513's ``(compDescr, compMatrix, isAttached)``
+    triple.  Unattached components keep their slot so every positional
+    consumer -- ``DamageFromShotDecoder``'s component index above all --
+    still agrees with stock, exactly as retail's own ``getComponents`` does.
+    """
     descriptor = vehicle.typeDescriptor
+    turret_attached = turret_is_attached(vehicle)
     result = []
     identity = math_module.Matrix()
     identity.setIdentity()
-    result.append((descriptor.chassis, identity))
+    result.append((descriptor.chassis, identity, True))
 
     hull_offset = _component_value(
         descriptor.chassis, 'hullPosition',
         math_module.Vector3(0.0, 0.0, 0.0))
     hull = math_module.Matrix()
     hull.setTranslate(-hull_offset)
-    result.append((descriptor.hull, hull))
+    result.append((descriptor.hull, hull, True))
 
     turret_positions = _component_value(
         descriptor.hull, 'turretPositions', ())
@@ -1441,7 +1478,7 @@ def _pose_components(vehicle, math_module):
     turret_yaw = math_module.Matrix(vehicle.appearance.turretMatrix).yaw
     rotation.setRotateY(-turret_yaw)
     turret.postMultiply(rotation)
-    result.append((descriptor.turret, turret))
+    result.append((descriptor.turret, turret, turret_attached))
 
     gun_offset = _component_value(
         descriptor.turret, 'gunPosition',
@@ -1453,7 +1490,7 @@ def _pose_components(vehicle, math_module):
     rotation.setRotateX(-gun_pitch)
     gun.postMultiply(rotation)
     gun.preMultiply(turret)
-    result.append((descriptor.gun, gun))
+    result.append((descriptor.gun, gun, turret_attached))
     return result
 
 
@@ -1556,9 +1593,13 @@ def vehicle_blast_probe_points_at_matrix(vehicle, vehicle_matrix, burst,
     result = []
     seen = set()
     radius_squared = radius * radius
-    for component_index, pair in enumerate(components):
+    for component_index, entry in enumerate(components):
         try:
-            component, component_matrix = pair
+            component, component_matrix, is_attached = entry
+            if not is_attached:
+                # A detached turret is no longer part of this hull, so it
+                # neither presents a blast surface nor shields one.
+                continue
             tester = _component_value(component, 'hitTester')
             local_hit_test = getattr(tester, 'localHitTest', None)
             bounds = _blast_bbox_bounds(_component_value(tester, 'bbox'))
@@ -1668,10 +1709,15 @@ def encode_damage_sticker(vehicle, vehicle_matrix, start_point, end_point,
         return None
     try:
         components = _pose_components(vehicle, math_module)
-        for component_index, pair in enumerate(components):
-            component, component_matrix = pair
+        for component_index, entry in enumerate(components):
+            component, component_matrix, is_attached = entry
             if _component_value(component, 'itemTypeName') != component_name:
                 continue
+            if not is_attached:
+                # #1513 draws the mark on the compound that carries the
+                # component.  A detached turret is a separate entity, so the
+                # wreck must not be handed a decal for a part it no longer has.
+                return None
             tester = _component_value(component, 'hitTester')
             bbox = _component_value(tester, 'bbox')
             if bbox is None:
@@ -1742,9 +1788,13 @@ def _collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
         chassis_start = world_to_chassis.applyPoint(start_point)
         chassis_end = world_to_chassis.applyPoint(end_point)
     hits = []
-    for component_index, pair in enumerate(_pose_components(
+    for component_index, entry in enumerate(_pose_components(
             vehicle, math_module)):
-        component, component_matrix = pair
+        component, component_matrix, is_attached = entry
+        if not is_attached:
+            # Exact #1513 ``Vehicle.__collideSegment`` skips an unattached
+            # component before it ever reaches the hit tester.
+            continue
         tester = _component_value(component, 'hitTester')
         local_hit_test = getattr(tester, 'localHitTest', None)
         if not callable(local_hit_test):
@@ -1821,6 +1871,71 @@ def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
     return _collide_vehicle_at_matrix(
         vehicle, vehicle_matrix, start_point, end_point, math_module, False,
         chassis_matrix=chassis_matrix)
+
+
+def _point_xyz(value):
+    """Read one native or test point without assuming a single accessor."""
+    if hasattr(value, 'x'):
+        return (float(value.x), float(value.y), float(value.z))
+    return (float(value[0]), float(value[1]), float(value[2]))
+
+
+def vehicle_target_bounds_at_matrix(vehicle, vehicle_matrix, math_module,
+                                    chassis_matrix=None):
+    """Compose a world AABB over the attached descriptor hit-test boxes.
+
+    #1513 Vehicle.onEnterWorld enables targetFullBounds. The public BigWorld
+    2.0.1 picker uses an embodiment bounding box, which motivates this local
+    full-envelope rule. Descriptor boxes are an approximation of the visual
+    compound's bounds; neither their equality nor the shipped native picker
+    rule has been established on #1513. Missing geometry contributes no box.
+    """
+    try:
+        components = _pose_components(vehicle, math_module)
+        lower = None
+        upper = None
+        for component_index, entry in enumerate(components):
+            component, component_matrix, is_attached = entry
+            if not is_attached:
+                # A detached turret is a separate picker candidate with its own
+                # landed pose.  This hull must not target the part it threw.
+                continue
+            tester = _component_value(component, 'hitTester')
+            bounds = _blast_bbox_bounds(_component_value(tester, 'bbox'))
+            if bounds is None:
+                continue
+            root_matrix = (chassis_matrix if component_index == 0 and
+                           chassis_matrix is not None else vehicle_matrix)
+            component_to_root = math_module.Matrix(component_matrix)
+            component_to_root.invert()
+            to_world = math_module.Matrix(root_matrix)
+            to_world.preMultiply(component_to_root)
+            for index in range(8):
+                corner = to_world.applyPoint(math_module.Vector3(
+                    bounds[index & 1][0],
+                    bounds[(index >> 1) & 1][1],
+                    bounds[(index >> 2) & 1][2]))
+                point = _point_xyz(corner)
+                if lower is None:
+                    lower = list(point)
+                    upper = list(point)
+                    continue
+                for axis in range(3):
+                    if point[axis] < lower[axis]:
+                        lower[axis] = point[axis]
+                    elif point[axis] > upper[axis]:
+                        upper[axis] = point[axis]
+        if lower is None:
+            return None
+        return tuple(lower), tuple(upper)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError,
+            OverflowError):
+        # Stock ``CompoundAppearance.__onModelsRefresh`` detaches before it
+        # relinks, so a wreck can be between compounds for one frame. The
+        # local query skips this candidate; the next pass reads the rebound
+        # turret and gun matrices. A temporarily unavailable native provider
+        # must not disable all outline presentation for the rest of the round.
+        return None
 
 
 class RemoteVehicle(object):
@@ -1910,8 +2025,12 @@ class RemoteVehicle(object):
         self._update_matrix()
 
     def _update_matrix(self):
-        self.matrix.setRotateYPR((self.yaw, self.pitch, self.roll))
-        self.matrix.translation = self.position
+        previous = getattr(self, '_matrix_pose', None)
+        # Native setters can fail after changing part of the transform.
+        self._matrix_pose = None
+        self._matrix_pose = _write_changed_pose(
+            self.matrix, self.position, (self.yaw, self.pitch, self.roll),
+            previous)
 
     def attach_visual(self, entity, entity_id, model):
         self.bw_entity = entity
@@ -2189,7 +2308,7 @@ class RemoteVehicle(object):
         animation = self._animation
         if animation is None:
             self._render_pose = target
-            self._write_pose(self._key_to, target)
+            # _new_animation seeds both keys when they acquire a consumer.
             return False
         current = self._mirror_pose(now)
         if relax_time <= 0.0 or current is None:
@@ -2359,6 +2478,19 @@ class RemoteVehicle(object):
 
     def getAutorotation(self):
         return False
+
+    @property
+    def isTurretDetached(self):
+        """Mirror #1513's own property for a synthetic remote.
+
+        Stock reads ``IS_TURRET_DETACHED(health)`` and the private
+        confirmation flag, and ``Vehicle.confirmTurretDetachment`` refuses to
+        set that flag for any other health.  The runtime writes the pair
+        together, so the flag alone carries the same fact here without this
+        module having to import battle constants.
+        """
+        return bool(getattr(
+            self, '_Vehicle__turretDetachmentConfirmed', False))
 
     def getComponents(self):
         return _pose_components(self, self._math)

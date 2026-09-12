@@ -1200,13 +1200,34 @@ class DetectionTests(unittest.TestCase):
         state, unused_player = self._battle()
         state.bot_states[2]['team'] = 1
         state.player_spotted = {1: frozenset({('bot', 1)})}
+        state._replace_team_lit({1: {('bot', 1): float('inf')}})
         state._commit_detections()
+        # The spot lease runs out, so the enemy is dark for the whole team.
         state.player_spotted = {1: frozenset()}
+        state._replace_team_lit({})
         state._commit_detections()
         state.bot_spotted = {2: frozenset({('bot', 1)})}
+        state._replace_team_lit({1: {('bot', 1): float('inf')}})
         state._commit_detections()
         self.assertEqual(1, state._statistics_row('player', 1)['spotted'])
         self.assertEqual(1, state._statistics_row('bot', 2)['spotted'])
+
+    def test_a_live_lease_is_not_a_second_detection(self):
+        state, unused_player = self._battle()
+        state.bot_states[2]['team'] = 1
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+        state._replace_team_lit({1: {('bot', 1): float('inf')}})
+        state._commit_detections()
+        # A blocked line of sight, or a visibility probe the worker budgeted
+        # out, leaves the team lit by the lease alone.
+        state.player_spotted = {1: frozenset()}
+        state._replace_team_lit({1: {('bot', 1): float('inf')}})
+        state._commit_detections()
+        state.bot_spotted = {2: frozenset({('bot', 1)})}
+        state._replace_team_lit({1: {('bot', 1): float('inf')}})
+        state._commit_detections()
+        self.assertEqual(1, state._statistics_row('player', 1)['spotted'])
+        self.assertEqual(0, state._statistics_row('bot', 2)['spotted'])
 
     def test_a_teammate_is_never_a_detection(self):
         state, unused_player = self._battle()
@@ -1214,6 +1235,225 @@ class DetectionTests(unittest.TestCase):
         state.player_spotted = {1: frozenset({('bot', 1)})}
         state._commit_detections()
         self.assertEqual(0, state._statistics_row('player', 1)['spotted'])
+
+    @staticmethod
+    def _detections(state):
+        return [event for event in state.pending_events
+                if event.get('kind') == 'detection']
+
+    def test_a_credited_detection_reaches_its_human_observer(self):
+        state, unused_player = self._battle()
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+        state._commit_detections()
+
+        # #1513 draws the in-battle ribbon from the detection the results
+        # column counts, so the server publishes the one it credited.
+        self.assertEqual([{
+            'kind': 'detection',
+            'observer_kind': 'player', 'observer_id': 1,
+            'target_kind': 'bot', 'target_id': 1,
+        }], self._detections(state))
+
+        # The same enemy is counted once, so it is published once.
+        state._commit_detections()
+        self.assertEqual(1, len(self._detections(state)))
+
+    def test_a_detection_by_a_bot_publishes_nothing(self):
+        state, unused_player = self._battle()
+        state.bot_states[2]['team'] = 1
+        state.bot_spotted = {2: frozenset({('bot', 1)})}
+        state._commit_detections()
+
+        self.assertEqual(1, state._statistics_row('bot', 2)['spotted'])
+        self.assertEqual([], self._detections(state))
+
+    def test_full_roster_detections_preserve_the_whole_tick_on_the_wire(self):
+        state, unused_player = self._battle()
+        state.bot_states = {}
+        state.bot_manifest = []
+        state.players = {
+            index: Player(index, _NullSocket(), ('127.0.0.1', index),
+                          team=1 if index <= 15 else 2)
+            for index in range(1, 31)}
+        state.player_spotted = {
+            index: {('player', target_id)
+                    for target_id, target in state.players.items()
+                    if target.team != observer.team}
+            for index, observer in state.players.items()}
+        state._commit_detections()
+        self.assertEqual(450, len(self._detections(state)))
+        # A co-occurring existing event must survive the detection burst too.
+        state.pending_events.append({
+            'kind': 'assist', 'category': 'radio', 'damage': 75,
+            'assister_kind': 'player', 'assister_id': 1,
+            'target_kind': 'player', 'target_id': 16})
+        expected = list(state.pending_events)
+        delivered = {index: [] for index in state.players}
+        for index, endpoint in state.players.items():
+            endpoint.offer_reliable = (
+                lambda message, index=index:
+                delivered[index].append(message) or True)
+            endpoint.offer_snapshot = endpoint.offer_reliable
+
+        state.tick_once(1.0 / 30.0)
+
+        for messages in delivered.values():
+            event_messages = [message for message in messages
+                              if message['type'] == 'events']
+            # Exercise the actual consumer limit instead of restating it.
+            received = []
+            client = lan_client_module.LANClient(
+                '127.0.0.1', 28782, 'Observer', 'ussr:R11_MS-1',
+                on_event=lambda kind, message: received.extend(
+                    message['events']) if kind == 'events' else None)
+            client.round_id = state.round_id
+            client.phase = 'battle'
+            for message in event_messages:
+                client._handle_message(message)
+            self.assertEqual(
+                ['%d:%d:%d' % (state.round_id, state.tick, index)
+                 for index in range(len(expected))],
+                [event['event_id'] for event in received])
+            self.assertEqual(expected, [
+                {key: value for key, value in event.items()
+                 if key != 'event_id'} for event in received])
+            snapshot_index = next(
+                index for index, message in enumerate(messages)
+                if message['type'] == 'snapshot')
+            self.assertTrue(all(
+                message['type'] == 'events'
+                for message in messages[:snapshot_index]))
+            self.assertEqual(len(event_messages), snapshot_index)
+
+    def test_seeing_an_enemy_the_team_already_lit_publishes_nothing(self):
+        state, unused_player = self._battle()
+        state.bot_states[2]['team'] = 1
+        state.bot_spotted = {2: frozenset({('bot', 1)})}
+        state._replace_team_lit({1: {('bot', 1): float('inf')}})
+        state._commit_detections()
+
+        # The human now sees the enemy its teammate revealed.  Retail counts
+        # no detection for it, so no ribbon may be drawn either.
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+        state._replace_team_lit({1: {('bot', 1): float('inf')}})
+        state._commit_detections()
+
+        self.assertEqual(0, state._statistics_row('player', 1)['spotted'])
+        self.assertEqual([], self._detections(state))
+
+
+class SpottingAssistTests(unittest.TestCase):
+    """A spotting assist needs a blind shooter, and is shared by spotters."""
+
+    @staticmethod
+    def _battle():
+        state, player = DetectionTests._battle()
+        # Bots 2 and 3 fight alongside the human player.
+        for bot_id in (2, 3):
+            state.bot_states[bot_id]['team'] = 1
+        return state, player
+
+    def test_a_shooter_that_sees_its_own_target_earns_nobody_an_assist(self):
+        state, unused_player = self._battle()
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+        state.bot_spotted = {2: frozenset({('bot', 1)})}
+
+        state._record_damage(('player', 1), ('bot', 1), 240, {})
+
+        self.assertEqual(
+            0, state._statistics_row('bot', 2)['damage_assisted_radio'])
+        self.assertEqual([], [event for event in state.pending_events
+                              if event['kind'] == 'assist'])
+
+    def test_a_bot_shooter_that_sees_its_own_target_earns_nobody_an_assist(
+            self):
+        state, unused_player = self._battle()
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+        state.bot_spotted = {2: frozenset({('bot', 1)})}
+
+        state._record_damage(('bot', 2), ('bot', 1), 240, {})
+
+        self.assertEqual(
+            0, state._statistics_row('player', 1)['damage_assisted_radio'])
+        self.assertEqual([], [event for event in state.pending_events
+                              if event['kind'] == 'assist'])
+
+    def test_a_dead_shooters_in_flight_hit_credits_the_live_spotter(self):
+        for attacker in (('player', 1), ('bot', 3)):
+            with self.subTest(attacker=attacker):
+                state, player = self._battle()
+                target = ('bot', 1)
+                state.bot_spotted = {2: frozenset({target})}
+                # Death arrives before the next observation batch clears
+                # the shooter's old direct-vision set.
+                if attacker[0] == 'player':
+                    player.alive = False
+                    state.player_spotted = {1: frozenset({target})}
+                else:
+                    state.bot_states[3]['alive'] = False
+                    state.bot_spotted[3] = frozenset({target})
+
+                state._record_damage(attacker, target, 240, {})
+
+                self.assertEqual(240, state._statistics_row(
+                    'bot', 2)['damage_assisted_radio'])
+                self.assertEqual(240, state._statistics_interaction(
+                    ('bot', 2), target)['assist_radio'])
+                self.assertEqual([240], [
+                    event['damage'] for event in state.pending_events
+                    if event['kind'] == 'assist'])
+
+    def test_a_disconnected_shooters_old_sight_does_not_block_an_assist(self):
+        state, player = self._battle()
+        target = ('bot', 1)
+        state.player_spotted = {1: frozenset({target})}
+        state.bot_spotted = {2: frozenset({target})}
+        player.connected = False
+
+        state._record_damage(('player', 1), target, 240, {})
+
+        self.assertEqual(240, state._statistics_row(
+            'bot', 2)['damage_assisted_radio'])
+
+    def test_a_blind_shooter_splits_the_assist_between_the_spotters(self):
+        state, unused_player = self._battle()
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+        state.bot_spotted = {2: frozenset({('bot', 1)})}
+
+        state._record_damage(('bot', 3), ('bot', 1), 241, {})
+
+        self.assertEqual(
+            121, state._statistics_row('player', 1)['damage_assisted_radio'])
+        self.assertEqual(
+            120, state._statistics_row('bot', 2)['damage_assisted_radio'])
+        self.assertEqual(
+            [(('player', 1), 121), (('bot', 2), 120)],
+            [((event['assister_kind'], event['assister_id']),
+              event['damage'])
+             for event in state.pending_events
+             if event['kind'] == 'assist'])
+
+    def test_one_spotter_still_earns_the_whole_damage(self):
+        state, unused_player = self._battle()
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+
+        state._record_damage(('bot', 3), ('bot', 1), 241, {})
+
+        self.assertEqual(
+            241, state._statistics_row('player', 1)['damage_assisted_radio'])
+
+    def test_a_track_assist_is_never_divided(self):
+        state, unused_player = self._battle()
+        state.player_spotted = {1: frozenset({('bot', 1)})}
+        state.bot_spotted = {2: frozenset({('bot', 1)})}
+        state.track_immobilisers[('bot', 1)] = ('player', 1)
+
+        state._record_damage(('bot', 3), ('bot', 1), 241, {
+            'destroyed': ['leftTrackHealth']})
+
+        row = state._statistics_row('player', 1)
+        self.assertEqual(241, row['damage_assisted_track'])
+        self.assertEqual(121, row['damage_assisted_radio'])
 
 
 class LuckyDevilTests(unittest.TestCase):
@@ -1350,15 +1590,46 @@ class _ReplayConnector(object):
 
 
 class _Replay(object):
+    """The #1513 chain, as far as ``_add_value_replays`` uses it.
+
+    ``ValueReplay`` writes the running total back through the connector on the
+    initial value and on every later step, and ``ReplayRecords`` keys each
+    record by the name of the value that step applied.  Both are the contract
+    the results tables read, so the double reproduces them.
+    """
+
+    steps = []
+
     def __init__(self, connector, recordName=None, startRecordName=None):
         self.connector = connector
         self.record_name = recordName
         self.start_name = startRecordName
+        self.chain = ['SET:%s' % startRecordName]
+        self.connector.values[recordName] = self.connector.values[
+            startRecordName]
+        _Replay.steps.append((recordName, 'SET', startRecordName))
+
+    def __mul__(self, other):
+        # ``__opMul`` is ``int(round(value * factor / 100.0))`` under the
+        # embedded CPython 2.7, which rounds a half away from zero.
+        self.connector.values[self.record_name] = int(
+            self.connector.values[self.record_name] *
+            self.connector.values[other] / 100.0 + 0.5)
+        self.chain.append('MUL:%s' % other)
+        _Replay.steps.append((self.record_name, 'MUL', other))
+        return self
+
+    def __add__(self, other):
+        self.connector.values[self.record_name] += self.connector.values[
+            other]
+        self.chain.append('ADD:%s' % other)
+        _Replay.steps.append((self.record_name, 'ADD', other))
+        return self
 
     def pack(self):
-        return ('SET:%s:%s' % (
-            self.record_name, self.connector.values[self.start_name]
-        )).encode('ascii')
+        return ('%s=%s' % ('+'.join(self.chain),
+                           self.connector.values[self.record_name])).encode(
+                               'ascii')
 
 
 if __name__ == '__main__':

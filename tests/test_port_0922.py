@@ -1,8 +1,10 @@
+import base64
 import importlib.util
 import contextlib
 import hashlib
 import io
 import json
+import ntpath
 import os
 from pathlib import Path
 import gc
@@ -347,7 +349,7 @@ class PortSourceTests(unittest.TestCase):
         build_script = (PORT_ROOT / 'build_for_client.sh').read_text(
             encoding='utf-8')
 
-        self.assertEqual('0.7.0', packager.MOD_VERSION)
+        self.assertEqual('0.7.7', packager.MOD_VERSION)
         self.assertEqual(packager.MOD_VERSION, package.PORT_VERSION)
         self.assertEqual(packager.MOD_VERSION, meta_version)
         self.assertIn(
@@ -472,7 +474,7 @@ class PortSourceTests(unittest.TestCase):
                 config_path.parent / packager.BUILD_IDENTITY_FILENAME
             ).read_text(encoding='utf-8'))
             self.assertEqual(1, identity['schema'])
-            self.assertEqual('0.7.0', identity['semanticVersion'])
+            self.assertEqual('0.7.7', identity['semanticVersion'])
             self.assertRegex(
                 identity['buildIdentity'],
                 r'^local-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$')
@@ -708,6 +710,81 @@ class PortConfigTests(unittest.TestCase):
             self.assertLess(len(compact_text), len(readable_text))
             self.assertEqual(value, json.loads(compact_text))
             self.assertEqual(value, json.loads(readable_text))
+
+    def test_a_state_file_keeps_the_last_few_copies_of_itself(self):
+        """The only thing that makes an overwritten save recoverable.
+
+        One rotation per session is enough to survive the write that
+        destroyed a career, and the copies keep the ``.json`` extension so a
+        player can copy one back by hand with no tooling at all.
+        """
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'garage_state.json')
+            for generation in range(1, 5):
+                config_module.write_json(path, {'generation': generation})
+                config_module.rotate_state_backup(path)
+
+            first = str(Path(directory) / 'garage_state.backup1.json')
+            second = str(Path(directory) / 'garage_state.backup2.json')
+            third = str(Path(directory) / 'garage_state.backup3.json')
+            self.assertEqual(
+                {'generation': 4}, json.loads(Path(first).read_text()))
+            self.assertEqual(
+                {'generation': 3}, json.loads(Path(second).read_text()))
+            self.assertEqual(
+                {'generation': 2}, json.loads(Path(third).read_text()))
+            self.assertFalse(
+                (Path(directory) / 'garage_state.backup4.json').exists())
+
+    def test_rotating_a_state_file_that_does_not_exist_is_not_an_error(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'garage_state.json')
+
+            self.assertFalse(config_module.rotate_state_backup(path))
+            self.assertEqual([], sorted(os.listdir(directory)))
+
+    def test_a_refused_state_file_is_copied_aside_rather_than_moved(self):
+        """This client carries on without the file, so it must stay put.
+
+        Moving it would turn a save this build refused into a save the next
+        build cannot find either.
+        """
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'garage_state.json')
+            config_module.write_json(path, {'career': True})
+
+            kept = config_module.quarantine_state_file(
+                path, config_module.QUARANTINE_REJECTED)
+
+            self.assertTrue(os.path.isfile(path))
+            self.assertEqual(
+                {'career': True}, json.loads(Path(kept).read_text()))
+            self.assertTrue(
+                os.path.basename(kept).startswith('garage_state.rejected-'))
+            self.assertTrue(kept.endswith('.json'))
+
+    def test_quarantined_copies_are_capped_and_drop_the_oldest(self):
+        config_module = _load_port_source('config')
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'garage_state.json')
+            config_module.write_json(path, {'career': True})
+
+            for unused in range(4):
+                kept = config_module.quarantine_state_file(
+                    path, config_module.QUARANTINE_REJECTED, copies=2)
+
+            surviving = sorted(
+                name for name in os.listdir(directory)
+                if '.rejected-' in name)
+            self.assertEqual(2, len(surviving))
+            self.assertIn(os.path.basename(kept), surviving)
+            self.assertEqual(
+                {'career': True},
+                json.loads(
+                    (Path(directory) / surviving[0]).read_text()))
 
     def test_waiting_room_choices_round_trip_in_player_owned_state(self):
         config_module = _load_port_source('config')
@@ -5507,6 +5584,109 @@ class OfflineCompatibilityTests(unittest.TestCase):
             original,
             settings_type.__dict__['_AccountSettings__readUserSection'])
 
+    @staticmethod
+    def _fake_dossier_cache():
+        built = []
+
+        class DossierCache(object):
+            def __init__(self, accountName, accountClassName):
+                built.append((accountName, accountClassName))
+
+        module = types.ModuleType('account_helpers.DossierCache')
+        module.DossierCache = DossierCache
+        return module, built
+
+    def test_each_career_owns_its_vehicle_dossier_cache_file(self):
+        # #1513 names the cache file after (server, accountName, class) and
+        # restores its maxChangeTime watermark from it, so a shared name lets
+        # one save slot's battle count hide every row of another's.
+        compatibility_module = _load_port_source('compat')
+        module, built = self._fake_dossier_cache()
+        career = ['alpha.player.1111', 'beta.player.2222']
+
+        self.assertTrue(compatibility_module.pin_dossier_cache(
+            lambda: career[0], module))
+
+        module.DossierCache('offline_account', 'PlayerAccount')
+        career[0] = career[1]
+        module.DossierCache('offline_account', 'PlayerAccount')
+
+        self.assertNotEqual(built[0][0], built[1][0])
+        self.assertTrue(all(account.startswith('offline_account#')
+                            and class_name == 'PlayerAccount'
+                            for account, class_name in built))
+
+    def test_longest_save_slot_fits_the_native_windows_dossier_path(self):
+        compatibility_module = _load_port_source('compat')
+        config_module = _load_port_source('config')
+        slot = 's' * 64
+        self.assertTrue(config_module.valid_save_slot(slot))
+        module, built = self._fake_dossier_cache()
+        self.assertTrue(compatibility_module.pin_dossier_cache(
+            lambda: '%s.player.%s' % (slot, 'a' * 16), module))
+
+        module.DossierCache('offline_account', 'PlayerAccount')
+
+        # Exact #1513 DossierCache.__init__ base32-encodes this tuple below
+        # the preferences directory. Raw slot names exceed MAX_PATH even
+        # with the ordinary profile path and an empty server name.
+        account_name, class_name = built[0]
+        for server in ('', compatibility_module.OFFLINE_SERVER_ADDRESS):
+            with self.subTest(server=server):
+                filename = base64.b32encode(('%s;%s;%s' % (
+                    server, account_name, class_name)).encode('ascii'))
+                cache_path = ntpath.join(
+                    r'C:\Users\peng\AppData\Roaming\Wargaming.net\WorldOfTanks',
+                    'dossier_cache', filename.decode('ascii') + '.dat')
+                self.assertLess(len(cache_path), 260)
+
+    def test_dossier_scope_is_stable_and_uses_the_entire_career(self):
+        compatibility_module = _load_port_source('compat')
+        career = '%s.player.%s' % ('s' * 64, 'a' * 64)
+        first = compatibility_module._career_scoped_account(
+            'offline_account', career)
+        restarted_module = _load_port_source('compat')
+
+        self.assertEqual(first, restarted_module._career_scoped_account(
+            'offline_account', career))
+        self.assertNotEqual(first, restarted_module._career_scoped_account(
+            'offline_account', career[:-1] + 'b'))
+        self.assertNotEqual(first, restarted_module._career_scoped_account(
+            'offline_account', career.replace('.player.', '.worker.')))
+
+    def test_the_dossier_cache_scope_is_installed_exactly_once(self):
+        compatibility_module = _load_port_source('compat')
+        module, built = self._fake_dossier_cache()
+
+        self.assertTrue(compatibility_module.pin_dossier_cache(
+            lambda: 'alpha.player.1111', module))
+        self.assertFalse(compatibility_module.pin_dossier_cache(
+            lambda: 'beta.player.2222', module))
+
+        module.DossierCache('offline_account', 'PlayerAccount')
+
+        # A second wrapper would scope the already scoped name again.
+        self.assertEqual(1, len(built))
+        self.assertEqual('PlayerAccount', built[0][1])
+        self.assertEqual(compatibility_module._career_scoped_account(
+            'offline_account', 'alpha.player.1111'), built[0][0])
+
+    def test_an_unreadable_career_keeps_the_stock_dossier_cache_name(self):
+        # This runs inside PlayerAccount.__init__: raising here would leave
+        # the player with no account at all.
+        compatibility_module = _load_port_source('compat')
+        module, built = self._fake_dossier_cache()
+
+        def unavailable():
+            raise RuntimeError('the save slot is unreadable')
+
+        self.assertTrue(
+            compatibility_module.pin_dossier_cache(unavailable, module))
+
+        module.DossierCache('offline_account', 'PlayerAccount')
+
+        self.assertEqual([('offline_account', 'PlayerAccount')], built)
+
     def test_fini_does_not_overwrite_later_third_party_wrappers(self):
         compatibility_module = _load_port_source('compat')
         runtime, _ = self._runtime()
@@ -6560,6 +6740,7 @@ class BootstrapContractTests(unittest.TestCase):
                         account_context={'selected_vehicle': {
                             'id': 1, 'compDescr': 12345},
                             'garage_store': None,
+                            'on_inventory_refreshed': module._on_inventory_refreshed,
                             'account_state': account_state})],
                     lobby_entry.mock_calls)
                 bigworld.run_next()
@@ -6685,6 +6866,7 @@ class BootstrapContractTests(unittest.TestCase):
             account_context={'selected_vehicle': {
                 'id': 1, 'compDescr': 12345},
                 'garage_store': None,
+                'on_inventory_refreshed': module._on_inventory_refreshed,
                 'account_state': account_state})
         self.assertEqual([expected_connect, expected_connect],
                          compatibility.connect.call_args_list)

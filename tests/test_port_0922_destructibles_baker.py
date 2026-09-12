@@ -27,6 +27,7 @@ def load_baker():
     return module
 
 
+SYNTH_TREE = 'speedtree/Test/Oak.spt'
 SYNTH_FRAGILE = 'content/Test/Fragile/normal/lod0/Fragile.model'
 SYNTH_SHED = 'content/Test/Shed/normal/lod0/Shed.model'
 SYNTH_POLE = 'content/Test/Pole/normal/lod0/Pole.model'
@@ -48,7 +49,8 @@ class _FakeStrings:
 class _FakeBSMI:
     def __init__(self, model_ids, transforms):
         self._ids = list(model_ids)
-        self._data = {'transforms': [tuple(row) for row in transforms]}
+        self._data = {'transforms': [tuple(row) for row in transforms],
+                      'visibility_masks': [0xffffffff] * len(transforms)}
 
     def model_ids(self):
         return list(self._ids)
@@ -67,11 +69,13 @@ def _synthetic_scene():
     """One SpeedTree item, one empty item, one fragile, one two-module shed
     and one falling pole across two WGDE chunks."""
     descriptors = {
+        SYNTH_TREE: {'kind': 'tree', 'modules': ()},
         SYNTH_FRAGILE: {'kind': 'fragile', 'modules': ()},
         SYNTH_SHED: {'kind': 'structure', 'modules': ('mod_a', 'mod_b')},
         SYNTH_POLE: {'kind': 'falling', 'modules': ()},
     }
     strings = _FakeStrings({
+        4: SYNTH_TREE,
         1: 'content/Test/Fragile/normal/lod0/Fragile.primitives',
         2: 'content/Test/Shed/normal/lod0/Shed.primitives',
         3: 'content/Test/Pole/normal/lod0/Pole.primitives',
@@ -125,7 +129,7 @@ def _synthetic_scene():
         'BSMI': _FakeBSMI([0, 1, 2, 3], transforms),
         'BSMO': _FakeSection(bsmo),
         'WGDE': _FakeSection(wgde),
-        'SpTr': _FakeSection({'speedtree_list': [{'transform': [0.0] * 16}]}),
+        'SpTr': _FakeSection({'speedtree_list': [{'transform': _transform(0, 0, 0), 'spt_fnv': 4, 'visibility_mask': 0xffffffff}]}),
     }
     return sections, descriptors
 
@@ -138,7 +142,7 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
     def test_contract_is_pinned_to_client_1513(self):
         self.assertEqual('offline-lan-0922-destructible-catalog',
                          self.baker.FORMAT_NAME)
-        self.assertEqual(7, self.baker.FORMAT_VERSION)
+        self.assertEqual(9, self.baker.FORMAT_VERSION)
         self.assertEqual(
             'offline-lan-0922-destructible-catalog-manifest',
             self.baker.MANIFEST_FORMAT)
@@ -259,6 +263,10 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
         self.assertEqual([200, 1], by_file[SYNTH_POLE][14:16])
         self.assertEqual(1.0, by_file[SYNTH_FRAGILE][16])
         self.assertEqual(1.0, by_file[SYNTH_SHED][16])
+        self.assertEqual(
+            [list(self.baker._locator_signature(_transform(0, 0, 0))) +
+             [SYNTH_TREE, 100, 0]], data['tree_instances'])
+        self.assertEqual(1, data['census']['tree_instances'])
 
         compiled = types.SimpleNamespace(sections=sections)
         unused_rows, unused_wire_rows, speedtree_wires = \
@@ -604,12 +612,12 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
         # (world Y differs only 7.6e-06) and safely shares the same box index.
         self.assertEqual(535, fragile_locator_instance_count)
         self.assertEqual(103, falling_locator_instance_count)
-        self.assertEqual(61625, manifest['census']['instance_signatures'])
+        self.assertEqual(61539, manifest['census']['instance_signatures'])
         self.assertEqual(5754,
                          manifest['census']['falling_instance_signatures'])
-        self.assertEqual(52853,
+        self.assertEqual(52828,
                          manifest['census']['fragile_instance_signatures'])
-        self.assertEqual(3018,
+        self.assertEqual(2957,
                          manifest['census']['structure_instance_signatures'])
         self.assertEqual(11,
                          manifest['census'][
@@ -999,6 +1007,69 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = value
+
+    def test_tree_identity_uses_descriptor_spelling_and_rejects_shared_wire(self):
+        sections, descriptors = _synthetic_scene()
+        sections['BWST']._table[4] = SYNTH_TREE.upper()
+        result = self._bake_synthetic(sections, descriptors)
+        self.assertEqual(SYNTH_TREE, result['tree_instances'][0][12])
+        sections['WGDE']._data['2'] = [
+            (0, 1), (2, 1), (2, 1), (2, 3), (4, 4)]
+        with self.assertRaisesRegex(ValueError, 'SpeedTree wire is shared'):
+            self._bake_synthetic(sections, descriptors)
+
+    def test_visibility_filter_preserves_native_indices_and_removes_model_boxes(self):
+        sections, descriptors = _synthetic_scene()
+        sections['SpTr']._data['speedtree_list'][0]['visibility_mask'] = 0x7fff4000
+        sections['BSMI']._data['visibility_masks'][0] = 2
+        data = self._bake_synthetic(sections, descriptors)
+        self.assertEqual([], data['tree_instances'])
+        self.assertEqual([[100, 0, 0x7fff4000], [100, 1, 2]],
+                         data['excluded_instances'])
+        self.assertNotIn(SYNTH_FRAGILE, data['resources'])
+        self.assertEqual({(200, 0), (200, 1)},
+                         {tuple(row[14:16]) for row in data['instances']})
+
+    def test_visibility_filter_rejects_partially_visible_structure(self):
+        sections, descriptors = _synthetic_scene()
+        sections['BSMI']._data['visibility_masks'][1] = 2
+        with self.assertRaisesRegex(ValueError, 'mixes active and excluded'):
+            self._bake_synthetic(sections, descriptors)
+
+    def test_crashing_prohorovka_tree_is_absent_in_standard_battle(self):
+        data = json.loads((DATA_ROOT / '05_prohorovka.json').read_text())
+        self.assertIn([32639, 31, 0x7fff4000], data['excluded_instances'])
+        self.assertNotIn((32639, 31),
+                         {tuple(row[13:15]) for row in data['tree_instances']})
+
+    def test_all_map_tree_identities_are_typed_disjoint_and_runtime_loadable(self):
+        sys.path.insert(0, str(CLIENT_SCRIPTS))
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+        totals = 0
+        try:
+            for map_name in self.baker.SUPPORTED_MAPS:
+                with self.subTest(map=map_name):
+                    data = json.loads((DATA_ROOT / (map_name + '.json')).read_text())
+                    model_wires = {tuple(row[14:16]) for row in data['instances']}
+                    tree_wires = {tuple(row[13:15]) for row in data['tree_instances']}
+                    self.assertEqual(len(tree_wires), len(data['tree_instances']))
+                    self.assertFalse(model_wires & tree_wires)
+                    excluded = {tuple(row[:2]) for row in data['excluded_instances']}
+                    self.assertFalse(excluded & (model_wires | tree_wires))
+                    self.assertTrue(all(not row[2] & 1 for row in data['excluded_instances']))
+                    self.assertEqual(len(tree_wires), data['census']['tree_instances'])
+                    destructibles_sensor.set_catalog(data)
+                    prepared = destructibles_sensor._destructible_catalog
+                    self.assertEqual(tree_wires, set(prepared['tree_instances']))
+                    # Every foliage tree must use the same exact native identity.
+                    foliage = json.loads((ROOT / 'foliage' / (map_name + '.json')).read_text())
+                    self.assertTrue({tuple(row[:2]) for row in foliage['fallen_trees']}
+                                    <= tree_wires)
+                    totals += len(tree_wires)
+        finally:
+            destructibles_sensor.set_catalog(None)
+        self.assertEqual(totals, json.loads(
+            (DATA_ROOT / 'manifest.json').read_text())['census']['tree_instances'])
 
 
 if __name__ == '__main__':

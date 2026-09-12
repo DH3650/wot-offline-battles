@@ -308,6 +308,14 @@ class GarageState(object):
                                 if value < 0)
         if len(values) % 2:
             raise GarageError('shells must be descriptor/count pairs')
+        if not values:
+            # A rack with no rows at all is a garage this port cannot
+            # publish: data._validate_selected_vehicle requires the flat pair
+            # list and the shell inventory to name what the vehicle carries,
+            # even when every count is zero.  Refusing the command keeps the
+            # live garage writable instead of producing a save the next start
+            # cannot read.
+            raise GarageError('a shell layout must name at least one round')
         record = self._record(vehicle_inventory_id, touch=False)
         # data._validate_selected_vehicle requires the shell inventory and the
         # flat pair list to agree, so both move together.
@@ -696,7 +704,10 @@ class GarageState(object):
                 for compact_descr, count in _layout_pairs(
                         shells_layout, preserve_currency=True):
                     flat.extend((compact_descr, count))
-                self.equip_shells(vehicle_inventory_id, flat)
+                # An empty layout in a combined request names no round to
+                # set, which is not the same as emptying the rack.
+                if flat:
+                    self.equip_shells(vehicle_inventory_id, flat)
             if (equipments_layout is not None and
                     _int(equipment_type) == EQUIPMENT_TYPE_REGULAR):
                 pairs = _layout_pairs(
@@ -1944,11 +1955,15 @@ class GarageState(object):
         if source is None:
             del barracks[tankman_inventory_id]
         elif source is record:
-            crew[crew.index(tankman_inventory_id)] = None
+            source_slot = crew.index(tankman_inventory_id)
+            self._remember_last_crew(record, [source_slot])
+            crew[source_slot] = None
             rows.pop(tankman_inventory_id, None)
         else:
             source_crew = list(source.get('crew') or ())
-            source_crew[source_crew.index(tankman_inventory_id)] = None
+            source_slot = source_crew.index(tankman_inventory_id)
+            self._remember_last_crew(source, [source_slot])
+            source_crew[source_slot] = None
             source['crew'] = source_crew
             source['tankmen'].pop(tankman_inventory_id, None)
             self._touched.add(_int(source.get('id', 0)))
@@ -2104,15 +2119,6 @@ class GarageState(object):
                 'vehicle type %d is not researched' % compact_descr)
         nation_id, vehicle_type_id, unused_roles = self._vehicle_type_crew(
             compact_descr)
-        seat = self._seated_record(tankman_id)
-        if seat is not None:
-            seated_type = _int(seat.get('vehicleTypeCompactDescr', 0))
-            if seated_type != compact_descr:
-                # A seated crew member has to match their vehicle's nation,
-                # type and role or the next restore rejects the whole garage.
-                raise GarageError(
-                    'unload this crew member before retraining them for '
-                    'another vehicle')
         tankmen = self._tankmen_module()
         try:
             descriptor = tankmen.TankmanDescr(rows[tankman_id])
@@ -2430,12 +2436,11 @@ class GarageState(object):
             raise GarageError('the client refused the vehicle crew: %s' % error)
 
     def _check_tankman_fits(self, record, roles, slot, compact_descr):
-        """Refuse a seat this crew member cannot hold without retraining.
+        """Refuse a seat with a different nation or primary role.
 
-        The restore boundary requires every seated crew member to match their
-        vehicle's nation, type and role, so a mismatch would make the whole
-        save unrestorable.  Retraining is how a crew member changes vehicle;
-        a seat is not.
+        Nation and primary role must match. Training specialization is kept
+        unchanged when moving between vehicles; the client computes its
+        proficiency effects from the original descriptor.
         """
         tankmen = self._tankmen_module()
         vehicles = self._vehicles_module()
@@ -2447,10 +2452,6 @@ class GarageState(object):
             raise GarageError('the client refused the crew member: %s' % error)
         if _int(descriptor.nationID) != _int(nation_id):
             raise GarageError('this crew member serves another nation')
-        if _int(descriptor.vehicleTypeID) != _int(vehicle_type_id):
-            raise GarageError(
-                'this crew member is trained for another vehicle: retrain '
-                'them first')
         if descriptor.role != roles[slot][0]:
             raise GarageError(
                 'this crew member is a %s and seat %d is for a %s'

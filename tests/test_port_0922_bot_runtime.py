@@ -8,6 +8,7 @@ import random
 import sys
 import types
 import unittest
+from unittest import mock
 
 import bot_state_rows
 
@@ -56,6 +57,48 @@ def _graph(map_name='01_karelia', waypoint_count=2):
             '2': ({'id': 'safe-2', 'waypoints': reverse},),
         },
         'bake': {'max_grade': 0.30},
+    }
+
+
+def _flat_open_graph():
+    """A flat, fully linked 31x31 graph for pure contact-physics fixtures."""
+    graph = _graph()
+    width = 31
+    directions = ((-1, -1), (0, -1), (1, -1), (-1, 0),
+                  (1, 0), (-1, 1), (0, 1), (1, 1))
+    links = []
+    for z in range(width):
+        for x in range(width):
+            links.append(sum(
+                1 << index for index, (dx, dz) in enumerate(directions)
+                if 0 <= x + dx < width and 0 <= z + dz < width))
+    graph.update({
+        'origin': (-60.0, -60.0), 'bounds': (-62.0, -62.0, 62.0, 62.0),
+        'width': width, 'height': width,
+        'heights_mm': [0] * (width * width),
+        'links': links, 'hazards': [0] * (width * width),
+    })
+    return graph
+
+
+def _plain_attribute_factors(unused_descriptor, crew=None, crew_level=None):
+    """The #1513 default-crew factor set every Bot fixture needs."""
+    level = (100.0 if crew_level is None else
+             max(50.0, min(100.0, float(crew_level))))
+    factor = 0.57 + 0.0043 * level
+    return {
+        'turret/rotationSpeed': factor,
+        'gun/rotationSpeed': factor,
+        'gun/reloadTime': 1.0 / factor,
+        'gun/aimingTime': 1.0 / factor,
+        'shotDispersion': (1.0 / factor,),
+        'repairSpeed': 0.57,
+        'vehicle/rotationSpeed': 1.0,
+        'engine/power': 1.0,
+        'chassis/terrainResistance': (1.0, 1.0, 1.0),
+        'radio/distance': 1.0,
+        'circularVisionRadius': 1.0,
+        'camouflage': 0.57,
     }
 
 
@@ -1383,11 +1426,174 @@ class ServerBotObservationRelayTests(unittest.TestCase):
         self.assertEqual(frozenset((('bot', 11),)),
                          server.player_spotted[1])
         self.assertEqual(1, server._statistics_row('player', 1)['spotted'])
+        # The observer's own client draws the #1513 spotting ribbon from this
+        # event, so one detection is published exactly once, to the observer
+        # the ledger credited.
+        self.assertEqual([{
+            'kind': 'detection',
+            'observer_kind': 'player', 'observer_id': 1,
+            'target_kind': 'bot', 'target_id': 11,
+        }], [event for event in server.pending_events
+             if event.get('kind') == 'detection'])
 
         server._record_damage(('player', 2), ('bot', 11), 75, {})
         self.assertEqual(
             75, server._statistics_row(
                 'player', 1)['damage_assisted_radio'])
+
+    def test_a_live_lease_keeps_a_teammate_from_re_detecting(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._human_message(server.round_id, (1,))), dict)
+
+        # The worker still lights the enemy for the team while no observer
+        # currently holds it: a blocked line of sight, or a visibility probe
+        # the frame budget deferred.
+        lease_only = self._human_message(server.round_id, ())
+        lease_only['contacts'][0]['fresh'] = False
+        server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, lease_only)
+        self.assertEqual({('bot', 11)}, set(server.team_lit_targets[1]))
+        self.assertEqual(frozenset(), server.player_spotted[1])
+
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._human_message(server.round_id, (2,))), dict)
+
+        self.assertEqual(1, server._statistics_row('player', 1)['spotted'])
+        self.assertEqual(0, server._statistics_row('player', 2)['spotted'])
+
+    def test_an_expired_lease_credits_the_next_observer(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._human_message(server.round_id, (1,))), dict)
+
+        self.assertTrue(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._human_message(server.round_id, (), visible=False)))
+        self.assertEqual({}, server.team_lit_targets[1])
+
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._human_message(server.round_id, (2,))), dict)
+
+        self.assertEqual(1, server._statistics_row('player', 1)['spotted'])
+        self.assertEqual(1, server._statistics_row('player', 2)['spotted'])
+
+    def test_a_lease_expiring_between_batches_credits_the_next_observer(self):
+        from unittest.mock import patch
+
+        for observer_kind in ('player', 'bot'):
+            with self.subTest(observer_kind=observer_kind):
+                server, _, _ = self._server()
+                if observer_kind == 'player':
+                    initial = self._human_message(server.round_id, (1,))
+                    renewed = self._human_message(server.round_id, (2,))
+                    observer_id, target = 1, ('bot', 11)
+                else:
+                    server.bot_manifest.append(dict(
+                        server.bot_manifest[0], id=12))
+                    server.bot_states[12] = dict(
+                        server.bot_states[11], id=12)
+                    initial = self._message(server.round_id)
+                    renewed = copy.deepcopy(initial)
+                    renewed['contacts'][0]['visible_by_bot_ids'] = [12]
+                    observer_id, target = 11, ('player', 2)
+                with patch('lan_battle_server.time.monotonic',
+                           return_value=100.0):
+                    self.assertIsInstance(server.update_bot_observation(
+                        SIMULATION_WORKER_AUTHORITY_ID, initial), dict)
+                remembered = copy.deepcopy(initial)
+                remembered['contacts'][0].update({
+                    'fresh': False, 'time_left': 0.1,
+                    'visible_by_bot_ids': [],
+                    'visible_by_player_ids': []})
+                with patch('lan_battle_server.time.monotonic',
+                           return_value=109.9):
+                    self.assertIsInstance(server.update_bot_observation(
+                        SIMULATION_WORKER_AUTHORITY_ID, remembered), dict)
+                # No explicit hidden sample arrives before another observer
+                # renews this target after its previous lease has expired.
+                with patch('lan_battle_server.time.monotonic',
+                           return_value=110.2):
+                    self.assertIsInstance(server.update_bot_observation(
+                        SIMULATION_WORKER_AUTHORITY_ID, renewed), dict)
+                next_id = 2 if observer_kind == 'player' else 12
+                self.assertEqual(1, server._statistics_row(
+                    observer_kind, observer_id)['spotted'])
+                self.assertEqual(1, server._statistics_row(
+                    observer_kind, next_id)['spotted'])
+                self.assertEqual({target}, server.ever_spotted_targets)
+
+    def test_a_dead_last_observer_does_not_cancel_the_team_lease(self):
+        for observer_kind in ('player', 'bot'):
+            with self.subTest(observer_kind=observer_kind):
+                server, _, _ = self._server()
+                if observer_kind == 'player':
+                    initial = self._human_message(server.round_id, (1,))
+                    renewed = self._human_message(server.round_id, (2,))
+                    observer_id, team, target = 1, 1, ('bot', 11)
+                else:
+                    server.bot_manifest.append(dict(
+                        server.bot_manifest[0], id=12))
+                    server.bot_states[12] = dict(
+                        server.bot_states[11], id=12)
+                    initial = self._message(server.round_id)
+                    initial['contacts'][0]['shootable_by_bot_ids'] = [12]
+                    initial['contacts'][0]['threatened_bot_ids'] = [12]
+                    renewed = copy.deepcopy(initial)
+                    renewed['contacts'][0]['visible_by_bot_ids'] = [12]
+                    observer_id, team, target = 11, 2, ('player', 2)
+                self.assertIsInstance(server.update_bot_observation(
+                    SIMULATION_WORKER_AUTHORITY_ID, initial), dict)
+                if observer_kind == 'player':
+                    server.players[observer_id].alive = False
+                else:
+                    server.bot_states[observer_id]['alive'] = False
+                relay = server.update_bot_observation(
+                    SIMULATION_WORKER_AUTHORITY_ID, initial)
+                self.assertIsInstance(relay, dict)
+                contact = relay['contacts'][0]
+                self.assertTrue(contact['visible'])
+                self.assertFalse(contact['fresh'])
+                self.assertEqual(10.0, contact['time_left'])
+                self.assertEqual([], contact['visible_by_bot_ids'])
+                self.assertEqual([], contact['visible_by_player_ids'])
+                self.assertEqual([], contact['shootable_by_bot_ids'])
+                self.assertEqual([], contact.get('threatened_bot_ids', []))
+                self.assertEqual({target}, set(server.team_lit_targets[team]))
+                self.assertIsInstance(server.update_bot_observation(
+                    SIMULATION_WORKER_AUTHORITY_ID, renewed), dict)
+                next_id = 2 if observer_kind == 'player' else 12
+                self.assertEqual(1, server._statistics_row(
+                    observer_kind, observer_id)['spotted'])
+                self.assertEqual(0, server._statistics_row(
+                    observer_kind, next_id)['spotted'])
+
+    def test_a_malformed_retired_observer_batch_preserves_spot_state(self):
+        server, _, _ = self._server()
+        initial = self._human_message(server.round_id, (1,))
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, initial), dict)
+        server.players[1].alive = False
+        before = copy.deepcopy((server.player_spotted, server.bot_spotted,
+                                server.team_lit_targets,
+                                server.team_visible_targets,
+                                server.bot_planner._contacts))
+        malformed = self._human_message(server.round_id, (2,))
+        invalid = copy.deepcopy(initial['contacts'][0])
+        invalid['fresh'] = False
+        malformed['contacts'].append(invalid)
+
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, malformed))
+
+        self.assertEqual(before, (
+            server.player_spotted, server.bot_spotted,
+            server.team_lit_targets, server.team_visible_targets,
+            server.bot_planner._contacts))
 
     def test_worker_human_spot_rejects_forged_observers(self):
         server, unused_authority_socket, unused_guest_socket = self._server()
@@ -4307,6 +4513,47 @@ class BotRuntimeTests(unittest.TestCase):
         # One centre column on flat ground, five only at the fall transition.
         self.assertEqual(5, len(calls))
 
+    def test_fast_bot_checks_track_support_before_following_a_trench_floor(self):
+        self.runtime.battle_start(self.start)
+        state = self.runtime.states[11]
+        state.update(x=0.0, y=10.0, z=0.0, yaw=0.0, speed=12.0,
+                     last_drive_pitch=0.5, grounded_once=True,
+                     airborne=False, vertical_speed=0.0)
+        probe, calls = self._trench_probe(
+            8.46, {(1.5, 0.0): 10.0, (-1.5, 0.0): 10.0})
+        self.runtime._physics_ground_probe = probe
+        # The forward corridor's downhill grade expands the follow envelope
+        # beyond this 1.54 m trench; it is not proof of a continuous surface.
+        self.assertGreater(self.module.vehicle_physics.ground_follow_gap(
+            state['speed'], state['last_drive_pitch'], 0.15), 1.54)
+
+        self.assertFalse(self.runtime._update_vertical_motion(state, 0.15))
+
+        self.assertAlmostEqual(10.0, state['y'])
+        self.assertFalse(state['airborne'])
+        self.assertEqual(5, len(calls))
+
+    def test_fast_bot_follow_gap_still_accepts_an_unbridged_drop(self):
+        for single_rim in (False, True):
+            with self.subTest(single_rim=single_rim):
+                self.runtime.battle_start(self.start)
+                state = self.runtime.states[11]
+                state.update(x=0.0, y=10.0, z=0.0, yaw=0.0, speed=12.0,
+                             last_drive_pitch=0.5, grounded_once=True,
+                             airborne=False, vertical_speed=0.0)
+                calls = []
+                def probe(x, z, hint):
+                    calls.append((x, z))
+                    if single_rim and z < -3.0:
+                        return 10.0
+                    return 8.46 - z * 0.2
+                self.runtime._physics_ground_probe = probe
+
+                self.assertFalse(self.runtime._update_vertical_motion(state, 0.15))
+
+                self.assertAlmostEqual(8.46, state['y'])
+                self.assertEqual(5, len(calls))
+
     def test_bot_bridges_a_slot_running_along_its_hull(self):
         self.runtime.battle_start(self.start)
         state = self.runtime.states[11]
@@ -4441,6 +4688,25 @@ class BotRuntimeTests(unittest.TestCase):
             'suspension_roll_velocity': 0.0,
         })
         return runtime, state, calls
+
+    def test_bot_drive_uses_contacted_plane_instead_of_corridor_grade(self):
+        runtime, state, unused_calls = self._full_suspension_case(
+            lambda x, z: 0.0)
+        self.assertFalse(runtime._update_vertical_motion(state, 0.04))
+        self.assertIn('_suspension_ground_plane', state)
+        command = self._stationary_command()
+        command.update(throttle=1.0, movement_intent=True,
+                       move_position=(0.0, 0.0, 10.0),
+                       combat_mode='advance', recovery_mode='drive')
+        runtime.adapter.decide = lambda *unused: dict(command)
+        runtime.direction_probe = lambda *unused: {
+            'clear': True, 'collision': False, 'slope': 0.375}
+        state['speed'] = 4.0
+
+        runtime.update(0.1, 1.1)
+
+        self.assertAlmostEqual(0.0, state['last_drive_pitch'])
+        self.assertGreater(state['speed'], 4.0)
 
     def test_ten_spring_bot_samples_22_contacts_once_per_outer_tick(self):
         runtime, state, calls = self._suspension_case(
@@ -7694,6 +7960,62 @@ class BotRuntimeTests(unittest.TestCase):
                 self.assertEqual(remembered['position'],
                                  lookup[25]['position'])
 
+    def test_deferred_target_motion_restarts_bot_and_human_camouflage_nets(self):
+        probes = []
+        runtime = self.module.BotRuntime(
+            1, visibility_probe=lambda source, target, fired=False: (
+                probes.append((target['kind'], target['id'])) or True))
+        source = {
+            'id': 11, 'team': 1, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'speed': 0.0,
+            'view_range': 445.0,
+        }
+        bot = {
+            'id': 25, 'kind': 'bot', 'team': 2, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 400.0, 'speed': 0.0,
+        }
+        # Use the same numeric id so both authority namespaces must reset.
+        human = dict(bot, kind='human')
+        runtime.states = {11: source, 25: bot}
+        profile = _effective_params_snapshot()['spotting']
+        profile.update(
+            has_camouflage_net=True, camouflage_net_delay=3.0,
+            invisibility_moving=(0.0, 1.0),
+            invisibility_still=(0.2, 1.0))
+        profile_calls = []
+
+        def spotting_profile(*unused):
+            profile_calls.append(True)
+            return (0.05, 0.05), 0.1, profile
+
+        runtime._spotting_profile = spotting_profile
+
+        def sample(now, speed, budget):
+            bot['speed'] = human['speed'] = speed
+            runtime._begin_visibility_frame()
+            runtime._visibility_frame['budget'] = budget
+            runtime._prepare_visibility_frame([human], now, False)
+            values = [runtime._visible(source, target, now, {})
+                      for target in (bot, human)]
+            runtime._finish_visibility_frame()
+            return values
+
+        budget = self.module.MAX_VISIBILITY_PROBES_PER_FRAME
+        self.assertEqual([True, True], sample(1.0, 0.0, budget))
+        self.assertEqual([False, False], sample(4.1, 0.0, budget))
+        profiles_before_deferral = len(profile_calls)
+        probes_before_deferral = len(probes)
+
+        # Both pairs are denied before camouflage projection while the live
+        # targets move and stop. The frame sampler must still reset the clock.
+        self.assertEqual([False, False], sample(5.0, 10.0, 0))
+        self.assertEqual([False, False], sample(6.0, 0.0, 0))
+        self.assertEqual(profiles_before_deferral,
+                         len(profile_calls))
+        self.assertEqual(probes_before_deferral, len(probes))
+        self.assertEqual([True, True], sample(6.1, 0.0, budget))
+        self.assertEqual([False, False], sample(9.1, 0.0, budget))
+
     def test_worker_visibility_diagnostics_measure_queue_debt_and_reset(self):
         command = self._stationary_command()
         roster = [
@@ -7788,6 +8110,101 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([state['id'] for state in internal], calls)
         self.assertEqual(
             [original(state) for state in internal], publication['rows'])
+
+    def test_one_unencodable_bot_row_does_not_end_the_round(self):
+        """A row the wire layout rejects is that Bot's problem, not the round's.
+
+        A field report (`wot-error-report-20260909-223753`) lost a live round
+        three minutes in because one `BotStateCodecError` became a
+        `RuntimeError` out of `_update_once`: the server ended the round as a
+        `worker_disconnected` draw and the player went back to the garage,
+        while the worker itself was healthy enough to rejoin six seconds
+        later.  The server requires a full-roster batch, so the contained
+        publication carries an identity-only row that retains the last
+        accepted server checkpoint without acknowledging new combat state.
+        """
+        runtime = self._roster_runtime()
+        codec = self.module.bot_state_codec
+        original = codec.encode_row
+        rejected = 12
+        runtime.update(.04, 1.0)
+
+        def reject_one(state):
+            if int(state['id']) == rejected:
+                raise codec.BotStateCodecError(
+                    'bot state column is not finite')
+            return original(state)
+
+        stream = io.StringIO()
+        saved = self.module.sys.stdout
+        codec.encode_row = reject_one
+        self.module.sys.stdout = stream
+        try:
+            publication = runtime.update(.04, 1.04)[0]
+            # A second frame proves the drop is reported once, not per frame.
+            runtime.update(.04, 1.08)
+        finally:
+            codec.encode_row = original
+            self.module.sys.stdout = saved
+
+        self.assertEqual('bot_state', publication['type'])
+        rows = dict((row[0], row) for row in publication['rows'])
+        self.assertEqual(
+            sorted(state['id'] for state in runtime._ordered_states()),
+            sorted(rows))
+        self.assertEqual([rejected], rows[rejected])
+        report = stream.getvalue()
+        self.assertEqual(1, report.count('[BOT STATE] projection unavailable'))
+        self.assertIn('bot=%d' % rejected, report)
+        self.assertIn('bot state column is not finite', report)
+
+    def test_a_bot_that_never_encoded_keeps_other_rows_publishing(self):
+        """A short batch is rejected whole, which would freeze every Bot."""
+        runtime = self._roster_runtime()
+        codec = self.module.bot_state_codec
+        original = codec.encode_row
+
+        def reject_one(state):
+            if int(state['id']) == 12:
+                raise codec.BotStateCodecError('unknown critical device')
+            return original(state)
+
+        stream = io.StringIO()
+        saved = self.module.sys.stdout
+        codec.encode_row = reject_one
+        self.module.sys.stdout = stream
+        try:
+            outgoing = runtime.update(.04, 1.0)
+        finally:
+            codec.encode_row = original
+            self.module.sys.stdout = saved
+
+        publication = next(message for message in outgoing
+                           if message.get('type') == 'bot_state')
+        rows = dict((row[0], row) for row in publication['rows'])
+        self.assertEqual([12], rows[12])
+        self.assertEqual(4, len(rows))
+        self.assertTrue(all(len(row) > 1 for bot_id, row in rows.items()
+                            if bot_id != 12))
+        self.assertIn('projection unavailable', stream.getvalue())
+
+    def _roster_runtime(self):
+        roster = [
+            {'id': 11 + index, 'team': 1 if index < 2 else 2,
+             'slot': index if index < 2 else index - 2,
+             'name': 'Projection-%02d' % index}
+            for index in range(4)
+        ]
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(dict(self.start, bots=roster))
+        return runtime
 
     def test_contact_resolution_uses_the_banked_global_simulation_step(self):
         runtime = self.module.BotRuntime(
@@ -12088,6 +12505,31 @@ class BotRuntimeTests(unittest.TestCase):
             restored.states[11]['equipment_states'][2][
                 'cooldownTimeLeft'])
 
+    def test_bot_repair_speed_takes_the_large_kit_bonus_once(self):
+        from gui.mods.offline_lan_0922 import device_damage
+        descriptor = _critical_descriptor()
+        contracts = _bot_equipment_contracts(self.module)
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *args, **kwargs: _Adapter(*args),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            bot_equipment_resolver=lambda: contracts)
+        runtime.battle_start(self.start)
+
+        factor = runtime._bot_repair_factor(11, descriptor)
+
+        # #1513 keeps the large repair kit's bonusValue out of every crew
+        # factor, so the Bot folds that 10% in itself, exactly once, on top of
+        # the default crew's untrained 0.57.
+        self.assertAlmostEqual(device_damage.CREW_FACTOR_BASE * 1.10, factor)
+        self.assertAlmostEqual(
+            device_damage.BASE_TRACK_REPAIR_SECONDS / 1.10,
+            device_damage.repair_seconds(
+                'leftTrackHealth', descriptor, repair_factor=factor))
+
     def test_destroyed_bot_track_repairs_to_regen_cap(self):
         descriptor = _critical_descriptor()
         runtime = self.module.BotRuntime(
@@ -12107,13 +12549,16 @@ class BotRuntimeTests(unittest.TestCase):
                 critical=broken, revision=1, base_revision=1)]})
 
         # A bot carries #1513's default crew, which has no repair skill, so
-        # factors['repairSpeed'] is 0.57 and the track takes 10 / (2 * 0.57)
-        # seconds rather than the five a fully trained crew would need.
+        # factors['repairSpeed'] is 0.57 and the track takes exactly the
+        # untrained BASE_TRACK_REPAIR_SECONDS, not the 0.57x of it a fully
+        # trained crew would need.
+        from gui.mods.offline_lan_0922 import device_damage
+        ticks = int(round(device_damage.BASE_TRACK_REPAIR_SECONDS / .20))
         outgoing = None
-        for index in range(25):
+        for index in range(ticks // 2):
             outgoing = bot_state_rows.bots(runtime.update(.20, 1.0 + index * .20)[0])[0]
         self.assertLess(outgoing['critical']['devices'][0]['hp'], 130.0)
-        for index in range(25, 45):
+        for index in range(ticks // 2, ticks):
             outgoing = bot_state_rows.bots(runtime.update(.20, 1.0 + index * .20)[0])[0]
 
         device = outgoing['critical']['devices'][0]
@@ -13027,6 +13472,175 @@ class BotRuntimeTests(unittest.TestCase):
             'recovery_mode': 'arrived', 'movement_intent': False,
         }
 
+    def test_landed_turret_blocks_stationary_bot_turn_until_pose_is_clear(self):
+        command = self._stationary_command()
+        command.update(turn=1.0, target_yaw=1.0)
+        clear = mock.Mock(return_value=False)
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused: _FixedAdapter(command),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            turret_motion_probe=clear)
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0, grounded_once=True)
+        runtime.update(0.04, 1.0)
+        self.assertEqual(0.0, state['yaw'])
+        self.assertEqual(0.0, runtime._turn_speeds[11])
+        before, after, descriptor = next(
+            call.args for call in clear.call_args_list
+            if call.args[1]['yaw'] > call.args[0]['yaw'])
+        self.assertGreater(after['yaw'], before['yaw'])
+        self.assertIs(runtime._descriptors[11], descriptor)
+        clear.return_value = True
+        runtime.update(0.04, 1.04)
+        self.assertGreater(state['yaw'], 0.0)
+
+    def test_landed_turret_blocks_bot_residual_push_with_real_descriptor(self):
+        clear = mock.Mock(return_value=False)
+        self.runtime._turret_motion_probe = clear
+        self.runtime.battle_start(self.start)
+        state = self.runtime.states[11]
+        state.update(x=1.0, y=2.0, z=3.0, yaw=0.4, pitch=0.2, roll=-0.1,
+                     speed=0.0, push_x=2.0, push_z=-1.0)
+        response = {'delta_velocity': (0.0, 0.0), 'correction': (0.0, 0.0)}
+        self.runtime._apply_tank_contact_response(state, response, 0.1)
+        self.assertEqual((1.0, 2.0, 3.0), (state['x'], state['y'], state['z']))
+        self.assertEqual((0.0, 0.0), (state['push_x'], state['push_z']))
+        before, after, descriptor = clear.call_args.args
+        self.assertAlmostEqual(1.2, after['x'])
+        self.assertAlmostEqual(2.9, after['z'])
+        self.assertEqual((0.4, 0.2, -0.1), (before['yaw'], before['pitch'], before['roll']))
+        self.assertIs(self.runtime._descriptors[11], descriptor)
+        clear.return_value = True
+        self.runtime._apply_tank_contact_response(
+            state, {'delta_velocity': (0.0, 0.0), 'correction': (-0.1, 0.0)}, 0.1)
+        self.assertAlmostEqual(0.9, state['x'])
+
+    def test_landed_turret_footprints_update_navigation_and_retire_shortcuts(self):
+        self.runtime.battle_start(self.start)
+        navigator = self.runtime.navigator
+        grid = navigator.grid
+        start, goal = (0.0, 0.0, 0.0), (8.0, 0.0, 0.0)
+        hulls = []
+        self.runtime._turret_hulls_provider = lambda: tuple(hulls)
+        self.runtime._publish_static_hulls(())
+        self.assertTrue(grid.dry_segment_clear(start, goal, 1.0))
+        hulls.extend(((-45, 4.0, 0.0, 0.0, 2.0, 1.5),
+                      (-46, 4.0, 4.0, 0.0, 2.0, 0.3)))
+        self.runtime._publish_static_hulls(())
+        revision = grid.static_hull_revision
+        self.assertFalse(grid.dry_segment_clear(start, goal, 1.0))
+        self.assertTrue(grid.path_crosses_static_hull((start, goal)))
+        self.assertEqual(2, len(grid._static_hull_key))
+        self.runtime._publish_static_hulls(())
+        self.assertEqual(revision, grid.static_hull_revision)
+        hulls[:] = []
+        self.runtime._publish_static_hulls(())
+        self.assertTrue(grid.dry_segment_clear(start, goal, 1.0))
+
+    def test_landed_turret_rejects_vertical_pose_before_bot_landing_damage(self):
+        self.runtime.battle_start(self.start)
+        state = self.runtime.states[11]
+        state.update(x=0.0, y=0.5, z=0.0, yaw=0.0, pitch=0.1, roll=-0.2,
+                     speed=0.0, grounded_once=True, airborne=True,
+                     vertical_speed=-15.0)
+        clear = mock.Mock(return_value=False)
+        self.runtime._turret_motion_probe = clear
+        self.runtime._suspension_params_for = mock.Mock(return_value=None)
+        self.runtime._terrain_support = mock.Mock(return_value=(0.0, 0.0))
+        self.runtime._apply_bot_fall_damage = mock.Mock(return_value=25)
+        before = self.runtime._snapshot_bot_suspension_state(state)
+
+        self.assertTrue(self.runtime._update_vertical_motion(state, 0.1))
+
+        self.assertEqual(0.5, state['y'])
+        self.assertEqual(before, self.runtime._snapshot_bot_suspension_state(state))
+        self.runtime._apply_bot_fall_damage.assert_not_called()
+        self.assertEqual(0.0, clear.call_args.args[1]['y'])
+        self.assertIsNone(self.runtime._turret_pending_landing_impacts)
+        clear.return_value = True
+
+        self.assertFalse(self.runtime._update_vertical_motion(state, 0.1))
+
+        self.assertEqual(0.0, state['y'])
+        self.assertFalse(state['airborne'])
+        self.runtime._apply_bot_fall_damage.assert_called_once()
+
+    def test_landed_turret_rejects_suspension_and_late_slope_attitude(self):
+        self.runtime.battle_start(self.start)
+        state = self.runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, pitch=0.1, roll=-0.2,
+                     terrain_pitch=0.1, speed=0.0, grounded_once=True,
+                     _spring_ground_memory=[1.0])
+        clear = mock.Mock(return_value=False)
+        self.runtime._turret_motion_probe = clear
+
+        def integrate(current, *unused):
+            current.update(y=0.3, pitch=0.4, roll=-0.5,
+                           terrain_pitch=0.4, _spring_ground_memory=[2.0])
+            return False
+
+        self.runtime._integrate_vertical_motion = integrate
+        before = self.runtime._snapshot_bot_suspension_state(state)
+        self.assertTrue(self.runtime._update_vertical_motion(state, 0.04))
+        self.assertEqual(0.0, state['y'])
+        self.assertEqual(before, self.runtime._snapshot_bot_suspension_state(state))
+        self.assertEqual((0.3, 0.4, -0.5), tuple(
+            clear.call_args.args[1][key] for key in ('y', 'pitch', 'roll')))
+        self.assertEqual((0.1, 0.4), tuple(
+            pose['chassis']['pitch'] for pose in clear.call_args.args[:2]))
+        self.runtime._suspension_params[11] = None
+        state.pop('pose_sample', None)
+        with mock.patch.object(self.module, 'slope_pose', return_value=(0.3, -0.4)):
+            self.assertFalse(self.runtime._update_slope_pose(state))
+            self.assertEqual((0.1, -0.2), (state['pitch'], state['roll']))
+            self.assertEqual((0.1, 0.3), tuple(
+                pose['chassis']['pitch'] for pose in clear.call_args.args[:2]))
+            clear.return_value = True
+            self.assertTrue(self.runtime._update_slope_pose(state))
+        self.assertEqual((0.3, -0.4), (state['pitch'], state['roll']))
+
+    def test_landed_turret_blocks_hydraulic_hull_aiming_pose(self):
+        state = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                 'pitch': 0.3, 'terrain_pitch': 0.1,
+                 'suspension_pitch': 0.2, 'roll': -0.1}
+        descriptor = _combat_descriptor()
+        clear = mock.Mock(return_value=False)
+        self.assertEqual(0.2, self.runtime._update_hydraulic_suspension(
+            state, descriptor, 0.0, 0.0, 0.1, clear))
+        self.assertEqual((0.3, 0.2), (state['pitch'], state['suspension_pitch']))
+        before, after, used = clear.call_args.args
+        self.assertEqual((0.3, 0.1), (before['pitch'], after['pitch']))
+        self.assertEqual((0.1, 0.1),
+                         (before['chassis']['pitch'], after['chassis']['pitch']))
+        self.assertIs(descriptor, used)
+        clear.return_value = True
+        self.assertEqual(0.0, self.runtime._update_hydraulic_suspension(
+            state, descriptor, 0.0, 0.0, 0.1, clear))
+        self.assertEqual((0.1, 0.0), (state['pitch'], state['suspension_pitch']))
+
+    def test_landed_turret_bot_pose_keeps_chassis_separate_from_hydraulic_hull(self):
+        state = {'id': 11, 'x': 1.0, 'y': 2.0, 'z': 3.0, 'yaw': 0.4,
+                 'pitch': 0.3, 'suspension_pitch': 0.2, 'roll': -0.1}
+        clear = mock.Mock(return_value=True)
+        self.runtime._turret_motion_probe = clear
+        self.assertTrue(self.runtime._turret_pose_is_clear(
+            state, (4.0, 5.0, 6.0), 0.7, (7.0, 8.0, 9.0), 0.8))
+        before, after, unused_descriptor = clear.call_args.args
+        self.assertEqual((0.3, 0.3), (before['pitch'], after['pitch']))
+        self.assertAlmostEqual(0.1, before['chassis']['pitch'])
+        self.assertAlmostEqual(0.1, after['chassis']['pitch'])
+        for pose, expected in ((before, (4.0, 5.0, 6.0, 0.7)),
+                               (after, (7.0, 8.0, 9.0, 0.8))):
+            self.assertEqual(expected, tuple(pose[key] for key in ('x', 'y', 'z', 'yaw')))
+            self.assertEqual(expected, tuple(pose['chassis'][key]
+                                            for key in ('x', 'y', 'z', 'yaw')))
+            self.assertEqual(-0.1, pose['chassis']['roll'])
+
     def test_tank_separation_is_probed_at_the_distance_it_moves(self):
         """Static geometry beyond the hull must not veto a small unjam.
 
@@ -13702,9 +14316,10 @@ class BotRuntimeTests(unittest.TestCase):
             self.assertFalse(runtime._ram_contacts)
             # Broad phase uses each mounted hull's size, including a wreck;
             # it must never assume that all tanks fit a default-size circle.
+            # The wreck resolves too: a live neighbour in reach can shove it.
             peer.update(alive=False, collision_shape=(20.0, 3.5, -0.8, 2.0))
             runtime._resolve_tank_contacts([], 1.1, 0.1)
-            self.assertEqual([(11, (12,))], calls)
+            self.assertEqual([(11, (12,)), (12, (11,))], calls)
         finally:
             self.module.tank_collision.resolve_tank = original
 
@@ -14753,6 +15368,37 @@ class BotRuntimeTests(unittest.TestCase):
         # impossible middle ray and leaves the remaining order unchanged.
         self.assertEqual([2, 4], probes)
         self.assertEqual(2, runtime.probe_totals()[0])
+
+    def test_visibility_upper_bound_keeps_native_aspect_pairs(self):
+        for additive, multiplier, distance, visible in (
+                (0.1, 0.25, 380.0, True),
+                (0.1, 1.0, 280.0, False)):
+            with self.subTest(additive=additive, multiplier=multiplier):
+                probes = []
+                runtime = self.module.BotRuntime(
+                    1, descriptor_resolver=lambda unused: _combat_descriptor(),
+                    visibility_probe=lambda source, target, fired=False: (
+                        probes.append(target['network_id']) or True))
+                source = {
+                    'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+                    'view_range': 445.0,
+                }
+                target = _admit_player({
+                    'id': self.module.HUMAN_TARGET_ID_BASE + 2,
+                    'kind': 'human', 'network_id': 2,
+                    'vehicle': 'ussr:R11_MS-1',
+                    'position': (0.0, 0.0, distance),
+                    'speed': 0.0, 'fire_seq': 0,
+                }, base_moving=0.4, base_still=0.4)
+                dynamic = target['effective_params']['crew']['dynamic_spotting']
+                for row in dynamic['states'].values():
+                    row['invisibility_moving'] = [additive, multiplier]
+                    row['invisibility_still'] = [additive, multiplier]
+
+                # The 0.25 multiplier permits the first ray. The additive
+                # term makes the second pair impossible even with clear LOS.
+                self.assertEqual(visible, runtime._visible(source, target, 1.0))
+                self.assertEqual([2] if visible else [], probes)
 
     def test_visibility_upper_bound_retains_24_fps_cache_and_shot_refresh(self):
         descriptor = _combat_descriptor()
@@ -19397,6 +20043,313 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(busiest[0][1], 1)
         # Reading the report clears the window's counters.
         self.assertEqual((), runtime.load_report()['busiest'])
+
+
+class ShovedWreckTests(unittest.TestCase):
+    """A destroyed hull is a body on tracks, not a piece of world geometry."""
+
+    def setUp(self):
+        self._modules = dict((key, value) for key, value in sys.modules.items()
+                             if key == 'gui' or key.startswith('gui.'))
+        self.module = _load()
+        self._native_attribute_factors = self.module.loadout.attribute_factors
+        self.module.loadout.attribute_factors = _plain_attribute_factors
+        self.start = {
+            'round_id': 5, 'map': '01_karelia', 'bot_authority_id': 1,
+            'bot_skill_mode': 'brutal',
+            'bots': [{'id': 11, 'team': 2, 'slot': 0, 'name': 'Wreck'},
+                     {'id': 12, 'team': 1, 'slot': 0, 'name': 'Driver'}]}
+
+    def tearDown(self):
+        self.module.loadout.attribute_factors = self._native_attribute_factors
+        for key in list(sys.modules):
+            if key == 'gui' or key.startswith('gui.'):
+                sys.modules.pop(key, None)
+        sys.modules.update(self._modules)
+
+    def _runtime(self, ground=0.0, clear=True):
+        probe = (lambda *unused, **kwargs: {
+            'clear': clear, 'collision': not clear,
+            'water': False, 'slope': 0.0})
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                {'throttle': 0.0, 'turn': 0.0, 'fire_allowed': False}),
+            direction_probe=probe,
+            ground_probe=lambda *unused: ground,
+            physics_ground_probe=lambda *unused: ground,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        return runtime
+
+    def _wreck(self, runtime):
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0, alive=False,
+                     health=0, half_length=3.5, half_width=1.7,
+                     grounded_once=True, push_x=0.0, push_z=0.0)
+        return state
+
+    def test_a_shove_moves_the_wreck_and_re_settles_it_on_the_ground(self):
+        runtime = self._runtime(ground=0.0)
+        state = self._wreck(runtime)
+
+        moved = runtime._apply_wreck_contact_response(
+            state, {'delta_velocity': (0.0, 2.0),
+                    'correction': (0.0, 0.05)}, 0.1)
+
+        self.assertTrue(moved)
+        self.assertGreater(state['z'], 0.0)
+        self.assertEqual(0.0, state['y'])
+
+    def test_a_wreck_is_never_shoved_through_static_geometry(self):
+        runtime = self._runtime(ground=0.0, clear=False)
+        state = self._wreck(runtime)
+
+        moved = runtime._apply_wreck_contact_response(
+            state, {'delta_velocity': (0.0, 2.0),
+                    'correction': (0.0, 0.05)}, 0.1)
+
+        self.assertFalse(moved)
+        self.assertEqual(0.0, state['z'])
+        self.assertEqual(0.0, state['push_z'])
+
+    def test_a_wreck_settle_cannot_move_down_into_a_landed_turret(self):
+        runtime = self._runtime(ground=-0.3)
+        state = self._wreck(runtime)
+        state.update(pitch=0.2, terrain_pitch=0.15,
+                     suspension_pitch=0.05, roll=0.1)
+        probes = []
+
+        def clear(before, after, descriptor):
+            probes.append((before, after))
+            return after['y'] >= before['y']
+
+        runtime._turret_motion_probe = clear
+        moved = runtime._apply_wreck_contact_response(
+            state, {'delta_velocity': (0.0, 2.0),
+                    'correction': (0.0, 0.05)}, 0.1)
+
+        self.assertFalse(moved)
+        self.assertEqual((0.0, 0.0, 0.0), (state['x'], state['y'], state['z']))
+        self.assertEqual((0.0, 0.0), (state['push_x'], state['push_z']))
+        self.assertTrue(any(after['y'] < before['y'] for before, after in probes))
+        self.assertEqual(0.15, probes[-1][1]['chassis']['pitch'])
+
+    def test_a_slide_off_a_cliff_lip_is_undone_instead_of_dropping(self):
+        runtime = self._runtime(ground=-40.0)
+        state = self._wreck(runtime)
+
+        moved = runtime._apply_wreck_contact_response(
+            state, {'delta_velocity': (0.0, 2.0),
+                    'correction': (0.0, 0.05)}, 0.1)
+
+        self.assertFalse(moved)
+        self.assertEqual(0.0, state['z'])
+        self.assertEqual(0.0, state['y'])
+        self.assertEqual(0.0, state['push_z'])
+
+    def test_a_wreck_keeps_no_engine_and_bleeds_at_the_parked_hold(self):
+        runtime = self._runtime(ground=0.0)
+        state = self._wreck(runtime)
+        state['push_z'] = 2.0
+
+        runtime._apply_wreck_contact_response(
+            state, {'delta_velocity': (0.0, 0.0),
+                    'correction': (0.0, 0.0)}, 0.1)
+
+        params = runtime._physics_params_for(11)
+        expected = 2.0 - self.module.vehicle_physics.contact_push_decel(
+            params, False)[0] * 0.1
+        self.assertAlmostEqual(expected, state['push_z'])
+        self.assertEqual(0.0, state['speed'])
+
+    def test_a_settled_wreck_stops_moving_entirely(self):
+        runtime = self._runtime(ground=0.0)
+        state = self._wreck(runtime)
+        state['push_z'] = 0.4
+
+        for unused_tick in range(60):
+            runtime._apply_wreck_contact_response(
+                state, {'delta_velocity': (0.0, 0.0),
+                        'correction': (0.0, 0.0)}, 1.0 / 30.0)
+
+        self.assertEqual(0.0, state['push_z'])
+        settled = state['z']
+        runtime._apply_wreck_contact_response(
+            state, {'delta_velocity': (0.0, 0.0),
+                    'correction': (0.0, 0.0)}, 1.0 / 30.0)
+        self.assertEqual(settled, state['z'])
+
+    def test_a_wreck_never_publishes_a_ram_report(self):
+        runtime = self._runtime(ground=0.0)
+        wreck = self._wreck(runtime)
+        wreck.update(x=0.0, z=0.0, team=1)
+        driver = runtime.states[12]
+        driver.update(x=0.0, y=0.0, z=5.0, yaw=math.pi, speed=12.0,
+                      alive=True, half_length=3.5, half_width=1.7,
+                      grounded_once=True, push_x=0.0, push_z=0.0, team=2)
+
+        reports = runtime._resolve_tank_contacts((), 100.0, 1.0 / 30.0)
+
+        self.assertEqual(
+            [], [report for report in reports
+                 if int(report.get('bot_id', -1)) == 11])
+        # The wreck is genuinely shoved out of the overlap it started in.
+        self.assertLess(wreck['z'], -0.1)
+        self.assertLess(wreck['push_z'], 0.0)
+        self.assertGreater(driver['z'], 5.0)
+
+
+class WreckPushMassTests(unittest.TestCase):
+    """Who can shove a wreck, measured through the real contact loop.
+
+    ``_drive_into`` in the physics tests is the one-dimensional version of
+    this. It cannot see the Baumgarte separation, which is not a force and
+    would otherwise walk any wreck along at the pusher's inverse-mass share
+    whatever the hulls weigh. These cases run the whole worker tick.
+    """
+
+    def setUp(self):
+        self._modules = dict((key, value) for key, value in sys.modules.items()
+                             if key == 'gui' or key.startswith('gui.'))
+        self.module = _load()
+        self._native_attribute_factors = self.module.loadout.attribute_factors
+        self.module.loadout.attribute_factors = _plain_attribute_factors
+
+    def tearDown(self):
+        self.module.loadout.attribute_factors = self._native_attribute_factors
+        for key in list(sys.modules):
+            if key == 'gui' or key.startswith('gui.'):
+                sys.modules.pop(key, None)
+        sys.modules.update(self._modules)
+
+    def _travel(self, pusher_mass, pusher_hp, wreck_mass, ticks=180):
+        module = self.module
+        runtime = module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter({
+                'throttle': 1.0, 'turn': 0.0, 'fire_allowed': False,
+                'movement_intent': True, 'combat_mode': 'route',
+                'recovery_mode': 'drive', 'target_yaw': 0.0,
+                'move_position': (0.0, 0.0, 60.0)}),
+            direction_probe=lambda *unused, **kwargs: {
+                'clear': True, 'collision': False,
+                'water': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=lambda team, slot: (
+                (0.0, 0.0, 0.0 if slot == 0 else 12.0), 0.0),
+            baked_graph=_flat_open_graph())
+        runtime.battle_start({
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'bots': [{'id': 1, 'team': 1, 'slot': 0, 'name': 'Push',
+                      'vehicle': 'fake'},
+                     {'id': 2, 'team': 1, 'slot': 1, 'name': 'Dead',
+                      'vehicle': 'fake'}]})
+        pusher, wreck = runtime.states[1], runtime.states[2]
+        pusher.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0, alive=True,
+                      grounded_once=True, push_x=0.0, push_z=0.0)
+        wreck.update(x=0.0, y=0.0, z=8.0, yaw=0.0, speed=0.0, alive=False,
+                     health=0, grounded_once=True, push_x=0.0, push_z=0.0)
+
+        def pin():
+            runtime._physics_params[1]['mass'] = float(pusher_mass)
+            runtime._physics_params[1]['powerW'] = (
+                float(pusher_hp) * 735.49875)
+            runtime._physics_params[2]['mass'] = float(wreck_mass)
+            pusher['mass'] = float(pusher_mass)
+            wreck['mass'] = float(wreck_mass)
+            wreck['alive'] = False
+            wreck['health'] = 0
+            wreck['speed'] = 0.0
+
+        pin()
+        start = wreck['z']
+        for tick in range(ticks):
+            runtime.update(1.0 / 30.0, tick / 30.0)
+            pin()
+        return wreck['z'] - start
+
+    def test_a_heavy_hull_shoves_a_light_wreck_down_the_road(self):
+        self.assertGreater(self._travel(68000.0, 1050.0, 32000.0), 10.0)
+
+    def test_a_heavy_hull_still_shoves_an_equally_heavy_wreck(self):
+        self.assertGreater(self._travel(68000.0, 1050.0, 68000.0), 5.0)
+
+    def test_a_medium_cannot_walk_a_heavy_wreck_along(self):
+        # Only the first contact's separation, then the tracks hold.
+        self.assertLess(self._travel(32000.0, 500.0, 68000.0), 1.0)
+
+    def test_a_light_cannot_walk_a_heavy_wreck_along(self):
+        self.assertLess(self._travel(21000.0, 430.0, 68000.0), 1.0)
+
+
+class HumanShovedWreckTests(unittest.TestCase):
+    """The player's own hull must be able to move a wreck too."""
+
+    def setUp(self):
+        self._modules = dict((key, value) for key, value in sys.modules.items()
+                             if key == 'gui' or key.startswith('gui.'))
+        self.module = _load()
+        self._native_attribute_factors = self.module.loadout.attribute_factors
+        self.module.loadout.attribute_factors = _plain_attribute_factors
+
+    def tearDown(self):
+        self.module.loadout.attribute_factors = self._native_attribute_factors
+        for key in list(sys.modules):
+            if key == 'gui' or key.startswith('gui.'):
+                sys.modules.pop(key, None)
+        sys.modules.update(self._modules)
+
+    def _runtime(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                {'throttle': 0.0, 'turn': 0.0, 'fire_allowed': False}),
+            direction_probe=lambda *unused, **kwargs: {
+                'clear': True, 'collision': False,
+                'water': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start({
+            'round_id': 5, 'map': '01_karelia', 'bot_authority_id': 1,
+            'bots': [{'id': 11, 'team': 2, 'slot': 0, 'name': 'Dead'}]})
+        return runtime
+
+    def _player(self, speed):
+        return {'id': 1, 'team': 1, 'vehicle': 'fake', 'alive': True,
+                'x': 0.0, 'y': 0.0, 'z': -5.0, 'yaw': 0.0, 'speed': speed,
+                'effective_params': _effective_params_snapshot(mass=68000.0)}
+
+    def test_a_player_driving_into_a_wreck_transfers_real_momentum(self):
+        runtime = self._runtime()
+        wreck = runtime.states[11]
+        wreck.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0, alive=False,
+                     health=0, mass=25000.0, grounded_once=True,
+                     push_x=0.0, push_z=0.0)
+
+        runtime._resolve_tank_contacts(
+            [self._player(9.0)], 100.0, 1.0 / 30.0)
+
+        # A shove the tracks cannot hold becomes real velocity, not just the
+        # separation the solver would have applied to any mass at all.
+        self.assertGreater(wreck['push_z'], 0.0)
+        self.assertGreater(wreck['z'], 0.0)
+
+    def test_a_creeping_player_cannot_break_the_tracks_loose(self):
+        runtime = self._runtime()
+        wreck = runtime.states[11]
+        wreck.update(x=0.0, y=0.0, z=-1.4, yaw=0.0, speed=0.0, alive=False,
+                     health=0, mass=68000.0, grounded_once=True,
+                     push_x=0.0, push_z=0.0)
+        before = wreck['z']
+
+        runtime._resolve_tank_contacts(
+            [self._player(0.05)], 100.0, 1.0 / 30.0)
+
+        self.assertEqual(0.0, wreck['push_z'])
+        self.assertEqual(before, wreck['z'])
 
 
 class BotOwnStationaryVisionTests(unittest.TestCase):

@@ -616,6 +616,15 @@ class ServerPayloadTest(unittest.TestCase):
             '[{"team":1,"slot":2,"vehicle":"ussr:R11_MS-1"}]',
             environment[core.SERVER_BOT_LINEUP_ENV_0922])
 
+    def test_server_receives_profile_exclusions_and_clears_inherited_values(self):
+        name = "ussr:R11_MS-1"
+        key = core.SERVER_BOT_EXCLUDED_VEHICLES_ENV_0922
+        environment = core.server_environment(
+            core.PORT_0_9_22, "/game", {}, bot_excluded_vehicles=[name])
+        self.assertEqual('["ussr:R11_MS-1"]', environment[key])
+        self.assertEqual("[]", core.server_environment(
+            core.PORT_0_9_22, "/game", environment)[key])
+
     def test_single_player_server_is_explicitly_loopback_only(self):
         environment = core.server_environment(
             core.PORT_0_9_22, "/game", {}, loopback_only=True)
@@ -2102,6 +2111,30 @@ class GameProcessTest(unittest.TestCase):
             is_running=lambda: True, timeout=1.0, poll=0.1,
             clock=lambda: next(ticks), sleep=lambda unused: None))
 
+    def test_worker_loader_failure_explains_unsigned_and_signed_status(self):
+        for code in (0xc0000135, -1073741515):
+            hint = core.worker_startup_exit_hint(code)
+            self.assertIn("0xC0000135", hint)
+            self.assertIn("x86", hint)
+            self.assertIn("does not identify", hint)
+        for code in (None, 0, 3, 1):
+            self.assertEqual("", core.worker_startup_exit_hint(code))
+
+    def test_launcher_ready_deadline_allows_starter_to_record_timeout(self):
+        native = os.path.join(os.path.dirname(__file__), "..", "..",
+                              "native", "offline_worker_starter.c")
+        with open(native) as stream:
+            definitions = dict(
+                (parts[1], int(parts[2]))
+                for line in stream
+                for parts in [line.split()]
+                if len(parts) == 3 and parts[0] == "#define"
+                and parts[2].isdigit())
+        starter_seconds = (definitions["WORKER_READY_TIMEOUT_MS"] +
+                           definitions["PROCDUMP_ATTACH_TIMEOUT_MS"]) / 1000.0
+        self.assertGreater(core.WORKER_READY_TIMEOUT_SECONDS_0922,
+                           starter_seconds + 5.0)
+
     def test_worker_ready_requires_a_live_process_and_marker(self):
         game_root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, game_root, True)
@@ -2435,3 +2468,122 @@ class VehicleOverlayFetchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResetStateNameTests(unittest.TestCase):
+    """A confirmed reset removes copies of earned progress too."""
+
+    def test_the_clients_rotated_and_quarantined_copies_are_reset(self):
+        for name in ("garage_state.json", "garage_state.json.tmp",
+                     "garage_state.backup1.json",
+                     "garage_state.rejected-20260908-000000-000.json",
+                     "garage_state.shrunk-20260908-000000-000.json",
+                     "postbattle_state.backup2.json"):
+            self.assertTrue(core._reset_state_name(name), name)
+
+    def test_files_that_are_not_this_mods_state_are_left_alone(self):
+        for name in ("garage_state", "vehicle_profiles.json", "python.log",
+                     "garage_state.json.zip", "other_state.backup1.json"):
+            self.assertFalse(core._reset_state_name(name), name)
+
+
+class WorkerClientPathsTest(unittest.TestCase):
+    """A hidden worker starts on paths.xml without an isolated-path retry."""
+
+    def test_worker_clears_inherited_resource_overrides(self):
+        inherited = {"BW_RES_PATH": "old-worker-res",
+                     "WOT_OFFLINE_WORKER_RES_PATH": "old-worker-res"}
+        environment = core.worker_environment(
+            "/game", "192.168.1.3", 28783, environment=inherited)
+        self.assertNotIn("BW_RES_PATH", environment)
+        self.assertNotIn("WOT_OFFLINE_WORKER_RES_PATH", environment)
+        self.assertEqual("192.168.1.3",
+                         environment[core.CLIENT_SERVER_HOST_ENV_0922])
+        self.assertEqual("28783",
+                         environment[core.CLIENT_SERVER_PORT_ENV_0922])
+        self.assertEqual("old-worker-res", inherited["BW_RES_PATH"])
+
+    def test_worker_success_or_failure_never_starts_an_isolation_retry(self):
+        import wot_launcher
+
+        for ready in (True, False):
+            with self.subTest(ready=ready):
+                window = object.__new__(wot_launcher.LauncherWindow)
+                window._active_report_session = None
+                window._stop_requested = False
+                window._stop_requested_roles = set()
+                window._log = mock.Mock()
+                window._log_worker_failure = mock.Mock()
+                window._observe_process_exit = mock.Mock(return_value=None)
+                window._stop_worker = mock.Mock()
+                window._crash_capture_environment = lambda value, role: value
+                with mock.patch.dict(wot_launcher.os.environ, {}, clear=True), \
+                        mock.patch.object(wot_launcher.os.path, "isfile", return_value=True), \
+                        mock.patch.object(core, "worker_ready_marker_token", return_value=None), \
+                        mock.patch.object(core, "wait_for_worker_ready", return_value=ready), \
+                        mock.patch.object(core, "prepare_worker_resource_root", create=True, return_value=[]), \
+                        mock.patch.object(core, "worker_resource_path_list", create=True, return_value=["old-worker-res"]), \
+                        mock.patch.object(wot_launcher.subprocess, "Popen") as spawn:
+                    self.assertEqual(ready, window._start_worker(
+                        "/game", "127.0.0.1", 28782))
+                self.assertEqual(1, spawn.call_count)
+                environment = spawn.call_args.kwargs["env"]
+                self.assertNotIn("BW_RES_PATH", environment)
+                self.assertNotIn("WOT_OFFLINE_WORKER_RES_PATH", environment)
+                if ready:
+                    window._stop_worker.assert_not_called()
+                else:
+                    window._stop_worker.assert_called_once_with(room_owned=False)
+
+
+class ExitCodeDescriptionTest(unittest.TestCase):
+    def test_a_missing_runtime_dll_reads_as_one(self):
+        text = core.describe_exit_code(3221225781)
+        self.assertIn("0xC0000135", text)
+        self.assertIn("DirectX 9", text)
+
+    def test_an_abort_names_the_client_fatal_error(self):
+        self.assertIn("abort", core.describe_exit_code(3))
+
+    def test_an_ordinary_code_is_left_alone(self):
+        self.assertEqual("0", core.describe_exit_code(0))
+        self.assertEqual("7", core.describe_exit_code(7))
+
+    def test_an_unlisted_windows_status_is_still_named_as_one(self):
+        self.assertIn("Windows fatal status",
+                      core.describe_exit_code(0xC0000409))
+
+
+class WorkerReadyTimeoutMarginTest(unittest.TestCase):
+    """Report 20260909-234646 arrived with no hidden-worker log at all.
+
+    The launcher and the native starter both waited 60 s for the ready
+    marker, so whichever noticed first was a race and the starter's own
+    explanation could be cut off before it was ever written.
+    """
+
+    def test_the_launcher_outwaits_the_starter(self):
+        self.assertGreater(
+            core.WORKER_READY_TIMEOUT_SECONDS_0922,
+            core.WORKER_STARTER_READY_TIMEOUT_SECONDS_0922)
+        self.assertGreaterEqual(
+            core.WORKER_READY_TIMEOUT_SECONDS_0922 -
+            core.WORKER_STARTER_READY_TIMEOUT_SECONDS_0922, 5.0)
+
+    def test_the_starter_still_gets_its_full_original_budget(self):
+        # Extending the launcher's side rather than shortening this one is
+        # what keeps a slow machine's existing 60 s to become ready.
+        self.assertEqual(
+            60.0, core.WORKER_STARTER_READY_TIMEOUT_SECONDS_0922)
+
+    def test_the_constant_matches_the_native_starter(self):
+        source = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            'native', 'offline_worker_starter.c')
+        with io.open(source, encoding='utf-8') as stream:
+            text = stream.read()
+        expected = int(
+            core.WORKER_STARTER_READY_TIMEOUT_SECONDS_0922 * 1000)
+        self.assertIn(
+            '#define WORKER_READY_TIMEOUT_MS %d' % expected, text)
