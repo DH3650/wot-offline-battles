@@ -22,9 +22,14 @@ import shutil
 import sys
 
 from trainer.apply_crew_templates import (
-    DEFAULT_GARAGE, DEFAULT_TEMPLATES, DEFAULT_VEHICLE_DB, CLIENT_PROCESSES,
-    TemplateError, client_running, load_templates, normalize_combo,
-    plan_vehicle, save_templates, write_garage)
+    DEFAULT_CLIENT_DIR, DEFAULT_SLOT, DEFAULT_TEMPLATES, DEFAULT_VEHICLE_DB,
+    CLIENT_PROCESSES, LEGACY_GARAGE, TemplateError, client_running,
+    list_save_slots, load_templates, normalize_combo, plan_vehicle,
+    save_templates, slot_garage_path, write_garage)
+from trainer.artefact_db import DEFAULT_ARTEFACT_DB, ensure_artefact_db
+from trainer.inventory_stock import (
+    DEFAULT_STOCK_COUNT, apply_stock, plan_stock, stock_rows,
+    stock_table_text)
 from trainer.skills_db import (
     ROLE_NAMES_CN, SKILL_NAMES_CN, SKILLS_BY_ROLES, describe_role,
     describe_skill, skills_for_roles)
@@ -541,6 +546,22 @@ def skill_table_text():
     return '\n'.join(lines)
 
 
+def slot_menu(current_slot):
+    """Pick which save slot to edit. Returns the chosen slot id or None."""
+    items = []
+    for entry in list_save_slots():
+        label = entry['id']
+        if entry['name'] != entry['id']:
+            label += ' (%s)' % entry['name']
+        if not entry['has_garage']:
+            label += '  — 无 garage_state.json'
+        if entry['id'] == current_slot:
+            label += '  ◀ 当前'
+        items.append((entry['id'], label))
+    return menu('选择要编辑的存档', items,
+                subtitle='当前: %s' % (current_slot or '(自定义路径)'))
+
+
 def backup_menu(garage_path):
     backups = sorted(glob.glob(garage_path + '.trainer-backup-*'))
     if not backups:
@@ -643,101 +664,313 @@ def _filter_summary(filters):
     return '  '.join(parts)
 
 
+def _load_state(garage_path):
+    with open(garage_path, 'rb') as stream:
+        return json.load(stream)
+
+
+def crew_menu(state, vehicles, templates, slot, garage_path):
+    """车组管理子菜单 (原主循环); 返回可能更新过的模板。"""
+    rows = vehicle_rows(state, vehicles)
+    selected = {row['key'] for row in rows if row['ready'] > 0}
+    filters = {'nations': set(), 'tiers': set(), 'classes': set(), 'text': ''}
+    while True:
+        ready_total = sum(1 for row in rows if row['ready'] > 0)
+        effective = effective_selection(rows, selected, filters)
+        subtitle = '存档: %s\n%s' % (slot or '(自定义路径)', garage_path)
+        summary = _filter_summary(filters)
+        if summary:
+            subtitle += '\n筛选中: ' + summary
+        choice = menu('乘员技能模板工具 — 车组管理', [
+            ('1', '选择车辆 (已选 %d, 可选 %d)' % (len(effective), ready_total)),
+            ('2', '设置筛选 (系别/等级/车型)'),
+            ('3', '预览变更'),
+            ('4', '应用写入'),
+            ('5', '编辑技能模板'),
+            ('6', '技能对照表'),
+            ('q', '返回主菜单'),
+        ], subtitle=subtitle)
+        if choice in (None, 'q'):
+            return templates
+        if choice == '1':
+            result, filters = vehicle_picker(rows, selected, filters)
+            if result is not None:
+                selected = result
+        elif choice == '2':
+            filters = filter_menu(filters)
+        elif choice == '3':
+            text, count = build_report(state, vehicles, templates,
+                                       effective)
+            text_view('预览变更 (dry-run)', text)
+        elif choice == '4':
+            conflicted = sum(
+                row['total'] - row['ready'] - row['broken']
+                for row in rows if row['key'] in effective)
+            overwrite = False
+            if conflicted:
+                decision = menu(
+                    '提示: 选中范围内有 %d 个乘员已学技能' % conflicted, [
+                        ('s', '仅写白板乘员 (跳过他们, 默认)'),
+                        ('o', '覆盖: 已学技能的乘员也按模板重写'),
+                        ('x', '取消'),
+                    ], subtitle='已学技能的乘员默认不会被改动')
+                if decision in (None, 'x'):
+                    continue
+                overwrite = decision == 'o'
+            text, count = build_report(state, vehicles, templates,
+                                       effective, overwrite)
+            if count == 0:
+                text_view('应用写入', '选中车辆没有可应用的改动。')
+                continue
+            # 写入前: 先展示完整变更清单, 再要求显式确认
+            text_view('应用前请确认以下变更 (dry-run)', text)
+            question = '将对 %d 个乘员槽位写入模板 (筛选后 %d 辆车), 确认写入?' % (
+                count, len(effective))
+            if overwrite:
+                question = ('覆盖模式! %d 个已学技能的乘员将被重写。' %
+                            conflicted) + question
+            if confirm(question):
+                apply_changes(state, vehicles, templates, effective,
+                              garage_path, overwrite)
+            else:
+                text_view('已取消', '未做任何修改。')
+                # 写入后刷新行状态与默认选择 (保持原实现: 仅在取消分支)
+                rows = vehicle_rows(state, vehicles)
+                selected &= {row['key'] for row in rows
+                             if row['ready'] > 0}
+        elif choice == '5':
+            templates = template_menu(DEFAULT_TEMPLATES)
+        elif choice == '6':
+            text_view('技能对照表 (内部名 → 中文名)', skill_table_text())
+
+
+# ---- inventory (库存管理) -------------------------------------------------
+
+def artefact_row_matches(row, text):
+    text = (text or '').lower()
+    if not text:
+        return True
+    return text in row['name'].lower() or text in row['key'].lower()
+
+
+def format_artefact_row(row, chosen, width):
+    mark = '[x]' if chosen else '[ ]'
+    return _fit(' %s %s  [%s]  库存:%d' % (
+        mark, row['name'], row['key'], row['current']), width)
+
+
+def artefact_picker(rows, selected):
+    """配件勾选列表 (增量搜索)。Esc 放弃改动, Enter 确认。"""
+    selected = set(selected)
+    index = 0
+    top = 0
+    text = ''
+    while True:
+        visible = [row for row in rows if artefact_row_matches(row, text)]
+        index = max(0, min(index, len(visible) - 1))
+        width, height = terminal_size()
+        body = height - 7
+        if index < top:
+            top = index
+        elif index >= top + body:
+            top = index - body + 1
+        chosen = sum(1 for row in visible if row['cd'] in selected)
+        lines = [BOLD + '选择配件 (筛选结果 %d 种, 其中已选 %d / 全部 %d)' % (
+            len(visible), chosen, len(rows)) + RESET]
+        lines.append(DIM + '过滤: %s' % (text or '(输入即搜索)') + RESET)
+        lines.append('')
+        for i, row in enumerate(visible[top:top + body]):
+            actual = top + i
+            line = format_artefact_row(row, row['cd'] in selected, width - 2)
+            lines.append((REVERSE if actual == index else '') + line +
+                         (RESET if actual == index else ''))
+        lines.append('')
+        lines.append(DIM + '空格 勾选  A 全选结果  N 取消结果  / 清空搜索  '
+                           'Enter 确认  Esc 取消  (直接输入即搜索)' + RESET)
+        draw(lines)
+        pressed = read_key()
+        if pressed == 'up':
+            index -= 1
+        elif pressed == 'down':
+            index += 1
+        elif pressed == 'pageup':
+            index -= body
+        elif pressed == 'pagedown':
+            index += body
+        elif pressed == 'home':
+            index = 0
+        elif pressed == 'end':
+            index = len(visible) - 1
+        elif pressed == ' ' and visible:
+            selected.symmetric_difference_update({visible[index]['cd']})
+            if index < len(visible) - 1:
+                index += 1
+        elif pressed in ('a', 'A') and not text:
+            selected.update(row['cd'] for row in visible)
+        elif pressed in ('n', 'N') and not text:
+            selected.difference_update(row['cd'] for row in visible)
+        elif pressed == '/':
+            text = ''
+            index = top = 0
+        elif pressed == 'backspace':
+            text = text[:-1]
+            index = top = 0
+        elif pressed == 'enter':
+            return selected
+        elif pressed == 'esc':
+            return None
+        elif len(pressed) == 1 and pressed.isprintable():
+            text += pressed
+            index = top = 0
+
+
+def number_input(title, current, maximum=9999):
+    """数字输入框: Enter 确认 (空输入保持 current), Esc 取消。"""
+    buffer = ''
+    while True:
+        width, height = terminal_size()
+        lines = [BOLD + title + RESET, '']
+        shown = buffer if buffer else '(回车保持 %d)' % current
+        lines.append('  数量: ' + shown)
+        lines.append('')
+        lines.append(DIM + '0-9 输入  Backspace 删除  Enter 确认  Esc 取消'
+                     + RESET)
+        draw(lines)
+        pressed = read_key()
+        if pressed == 'enter':
+            if not buffer:
+                return current
+            return max(0, min(maximum, int(buffer)))
+        if pressed == 'esc':
+            return None
+        if pressed == 'backspace':
+            buffer = buffer[:-1]
+        elif len(pressed) == 1 and pressed.isdigit() and len(buffer) < 4:
+            buffer += pressed
+
+
+def stock_report(changes, count):
+    lines = []
+    for info, old, new in changes:
+        lines.append('%s [%s]: %d → %d' % (info.name, info.key, old, new))
+    lines.append('')
+    lines.append('共 %d 种配件的库存将设为 %d' % (len(changes), count))
+    return '\n'.join(lines)
+
+
+def inventory_menu(state, artefacts, garage_path):
+    """库存管理: 选择配件 (默认全选) → 设定数量 → 预览 → 写入。"""
+    selected = set(artefacts)  # 修改范围默认全选
+    count = DEFAULT_STOCK_COUNT
+    while True:
+        rows = stock_rows(state, artefacts)
+        choice = menu('库存管理 — 配件库存', [
+            ('1', '选择配件 (已选 %d / 共 %d)' % (len(selected), len(rows))),
+            ('2', '目标数量 (当前: %d)' % count),
+            ('3', '预览变更'),
+            ('4', '应用写入'),
+            ('5', '库存一览 (按类别/价格排序)'),
+            ('q', '返回主菜单'),
+        ], subtitle='库存为账户级, 作用于整个存档; 数量 0 表示删除该记录')
+        if choice in (None, 'q'):
+            return
+        if choice == '1':
+            result = artefact_picker(rows, selected)
+            if result is not None:
+                selected = result
+        elif choice == '2':
+            value = number_input(
+                '目标数量 (默认 %d)' % DEFAULT_STOCK_COUNT, count)
+            if value is not None:
+                count = value
+        elif choice == '3':
+            changes = plan_stock(state, artefacts, selected, count)
+            if changes:
+                text_view('预览变更 (dry-run)', stock_report(changes, count))
+            else:
+                text_view('预览变更',
+                          '选中配件的库存均已等于 %d, 无需改动。' % count)
+        elif choice == '4':
+            changes = plan_stock(state, artefacts, selected, count)
+            if not changes:
+                text_view('应用写入', '选中配件没有可应用的改动。')
+                continue
+            running = client_running()
+            if running:
+                text_view('错误', '客户端正在运行 (%s), 请先关闭游戏再写入。' %
+                          ', '.join(running))
+                continue
+            text_view('应用前请确认以下变更 (dry-run)',
+                      stock_report(changes, count))
+            if not confirm('将把 %d 种配件的库存设为 %d, 确认写入?' % (
+                    len(changes), count)):
+                text_view('已取消', '未做任何修改。')
+                continue
+            apply_stock(state, changes)
+            backup = write_garage(garage_path, state)
+            text_view('完成', '已写入 %d 种配件的库存。\n备份: %s\n\n'
+                      '请启动客户端进车库确认。' % (
+                          len(changes), os.path.basename(backup)))
+        elif choice == '5':
+            text_view('库存一览 (仓库数量, 不含已安装在车上的)',
+                      stock_table_text(state, artefacts))
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
-    garage_path = args[0] if args else DEFAULT_GARAGE
+    if args:
+        slot = None  # 显式路径, 不属于任何槽位
+        garage_path = args[0]
+    else:
+        slot = DEFAULT_SLOT
+        garage_path = slot_garage_path(slot)
     if not os.path.isfile(garage_path):
         print('找不到存档: %s' % garage_path)
+        if slot == DEFAULT_SLOT and os.path.isfile(LEGACY_GARAGE):
+            print('提示: 发现旧版存档 %s, 但游戏现在使用 saves\\<存档>\\ 目录;'
+                  ' 请先启动一次游戏完成迁移。' % LEGACY_GARAGE)
         return 1
     import argparse
     from trainer.apply_crew_templates import _ensure_vehicle_db
     templates = load_templates(DEFAULT_TEMPLATES)
     vehicles = _ensure_vehicle_db(argparse.Namespace(
         vehicle_db=DEFAULT_VEHICLE_DB, rebuild_db=False,
-        client_dir=r'C:\games\wot_0.9.22_cn'))
-    with open(garage_path, 'rb') as stream:
-        state = json.load(stream)
-
-    rows = vehicle_rows(state, vehicles)
-    selected = {row['key'] for row in rows if row['ready'] > 0}
-    filters = {'nations': set(), 'tiers': set(), 'classes': set(), 'text': ''}
+        client_dir=DEFAULT_CLIENT_DIR))
+    artefacts = ensure_artefact_db(
+        DEFAULT_ARTEFACT_DB, client_dir=DEFAULT_CLIENT_DIR)
+    state = _load_state(garage_path)
 
     with Screen():
         while True:
-            ready_total = sum(1 for row in rows if row['ready'] > 0)
-            effective = effective_selection(rows, selected, filters)
-            subtitle = garage_path
-            summary = _filter_summary(filters)
-            if summary:
-                subtitle += '\n筛选中: ' + summary
-            choice = menu('乘员技能模板工具', [
-                ('1', '选择车辆 (已选 %d, 可选 %d)' % (len(effective), ready_total)),
-                ('2', '设置筛选 (系别/等级/车型)'),
-                ('3', '预览变更'),
-                ('4', '应用写入'),
-                ('5', '编辑技能模板'),
-                ('6', '技能对照表'),
-                ('7', '恢复备份'),
+            choice = menu('车库助手 (Trainer)', [
+                ('1', '车组管理  按模板设置乘员技能'),
+                ('2', '库存管理  配件库存数量'),
+                ('3', '选择存档 (当前: %s)' % (slot or '(自定义路径)')),
+                ('4', '恢复备份'),
                 ('q', '退出'),
-            ], subtitle=subtitle)
+            ], subtitle='存档: %s\n%s' % (slot or '(自定义路径)', garage_path))
             if choice in (None, 'q'):
                 return 0
             if choice == '1':
-                result, filters = vehicle_picker(rows, selected, filters)
-                if result is not None:
-                    selected = result
+                templates = crew_menu(state, vehicles, templates, slot,
+                                      garage_path)
             elif choice == '2':
-                filters = filter_menu(filters)
+                inventory_menu(state, artefacts, garage_path)
             elif choice == '3':
-                text, count = build_report(state, vehicles, templates,
-                                           effective)
-                text_view('预览变更 (dry-run)', text)
-            elif choice == '4':
-                conflicted = sum(
-                    row['total'] - row['ready'] - row['broken']
-                    for row in rows if row['key'] in effective)
-                overwrite = False
-                if conflicted:
-                    decision = menu(
-                        '提示: 选中范围内有 %d 个乘员已学技能' % conflicted, [
-                            ('s', '仅写白板乘员 (跳过他们, 默认)'),
-                            ('o', '覆盖: 已学技能的乘员也按模板重写'),
-                            ('x', '取消'),
-                        ], subtitle='已学技能的乘员默认不会被改动')
-                    if decision in (None, 'x'):
-                        continue
-                    overwrite = decision == 'o'
-                text, count = build_report(state, vehicles, templates,
-                                           effective, overwrite)
-                if count == 0:
-                    text_view('应用写入', '选中车辆没有可应用的改动。')
+                new_slot = slot_menu(slot)
+                if new_slot is None or new_slot == slot:
                     continue
-                # 写入前: 先展示完整变更清单, 再要求显式确认
-                text_view('应用前请确认以下变更 (dry-run)', text)
-                question = '将对 %d 个乘员槽位写入模板 (筛选后 %d 辆车), 确认写入?' % (
-                    count, len(effective))
-                if overwrite:
-                    question = ('覆盖模式! %d 个已学技能的乘员将被重写。' %
-                                conflicted) + question
-                if confirm(question):
-                    apply_changes(state, vehicles, templates, effective,
-                                  garage_path, overwrite)
-                else:
-                    text_view('已取消', '未做任何修改。')
-                    # 写入后刷新行状态与默认选择
-                    rows = vehicle_rows(state, vehicles)
-                    selected &= {row['key'] for row in rows
-                                 if row['ready'] > 0}
-            elif choice == '5':
-                templates = template_menu(DEFAULT_TEMPLATES)
-            elif choice == '6':
-                text_view('技能对照表 (内部名 → 中文名)', skill_table_text())
-            elif choice == '7':
+                new_path = slot_garage_path(new_slot)
+                if not os.path.isfile(new_path):
+                    text_view('错误', '该存档还没有 garage_state.json:\n%s\n\n'
+                              '请先以此存档启动游戏进一次车库。' % new_path)
+                    continue
+                slot = new_slot
+                garage_path = new_path
+                state = _load_state(garage_path)
+            elif choice == '4':
                 backup_menu(garage_path)
-                with open(garage_path, 'rb') as stream:
-                    state = json.load(stream)
-                rows = vehicle_rows(state, vehicles)
-                selected = {row['key'] for row in rows if row['ready'] > 0}
+                state = _load_state(garage_path)
 
 
 if __name__ == '__main__':

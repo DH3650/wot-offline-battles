@@ -1,6 +1,7 @@
 """Apply per-role crew skill templates to the offline garage save.
 
-Reads ``garage_state.json``, selects vehicles by nation / tier / class /
+Reads the active save slot's ``garage_state.json`` (one per slot under
+``saves/<slot>/``), selects vehicles by nation / tier / class /
 name filters, and for every crew member who has NOT learned any skill yet
 writes the template for that slot's role combination: seven trained skills
 at 100% plus one skill in training at 0% (byte-identical in shape to what
@@ -31,6 +32,7 @@ import ctypes
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,9 +46,13 @@ from trainer.vehicle_db import (
     CLASS_NAMES_CN, NATION_NAMES_CN, NATIONS, build_vehicle_db,
     load_vehicle_db, save_vehicle_db)
 
-DEFAULT_GARAGE = os.path.join(
+USER_DATA_DIR = os.path.join(
     os.environ.get('APPDATA', ''), 'Wargaming.net', 'WorldOfTanks',
-    'offline_lan_0922', 'garage_state.json')
+    'offline_lan_0922')
+SAVES_ROOT = os.path.join(USER_DATA_DIR, 'saves')
+DEFAULT_SLOT = 'default'
+LEGACY_GARAGE = os.path.join(USER_DATA_DIR, 'garage_state.json')
+DEFAULT_GARAGE = os.path.join(SAVES_ROOT, DEFAULT_SLOT, 'garage_state.json')
 DEFAULT_CLIENT_DIR = r'C:\games\wot_0.9.22_cn'
 DEFAULT_TEMPLATES = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'templates.json')
@@ -56,9 +62,72 @@ DEFAULT_VEHICLE_DB = os.path.join(
 TRAINED_SKILL_COUNT = 7
 CLIENT_PROCESSES = ('WorldOfTanks.exe',)
 
+# A slot id becomes one directory name; mirror the launcher's rule so the
+# trainer and the game always agree on where a slot lives.
+_SLOT_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
+
 
 class TemplateError(ValueError):
     pass
+
+
+# ---- save slots -------------------------------------------------------------
+
+def valid_slot_id(value):
+    return bool(isinstance(value, str) and _SLOT_ID.match(value))
+
+
+def slot_garage_path(slot_id, saves_root=SAVES_ROOT):
+    """Return one save slot's garage_state.json path."""
+    if not valid_slot_id(slot_id):
+        raise TemplateError('invalid save slot id: %r' % (slot_id,))
+    return os.path.join(saves_root, slot_id, 'garage_state.json')
+
+
+def slot_display_name(slot_id, saves_root=SAVES_ROOT):
+    """Best-effort display name from the launcher-owned save.json."""
+    try:
+        with open(os.path.join(saves_root, slot_id, 'save.json'),
+                  'rb') as stream:
+            value = json.load(stream)
+    except (IOError, OSError, ValueError):
+        return slot_id
+    name = value.get('name') if isinstance(value, dict) else None
+    if isinstance(name, str) and name.strip():
+        return ' '.join(name.split())
+    return slot_id
+
+
+def list_save_slots(saves_root=SAVES_ROOT):
+    """Every save slot, default first: dicts with id/name/path/has_garage.
+
+    The default slot is always listed, even before the client has created
+    it on disk, so the picker can show why editing it is impossible.
+    """
+    entries = {DEFAULT_SLOT: {
+        'id': DEFAULT_SLOT,
+        'name': slot_display_name(DEFAULT_SLOT, saves_root),
+        'path': slot_garage_path(DEFAULT_SLOT, saves_root)}}
+    try:
+        names = sorted(os.listdir(saves_root))
+    except (IOError, OSError):
+        names = []
+    for name in names:
+        if name == DEFAULT_SLOT or not valid_slot_id(name):
+            continue
+        if not os.path.isdir(os.path.join(saves_root, name)):
+            continue
+        entries[name] = {
+            'id': name,
+            'name': slot_display_name(name, saves_root),
+            'path': slot_garage_path(name, saves_root)}
+    for entry in entries.values():
+        entry['has_garage'] = os.path.isfile(entry['path'])
+    ordered = [entries.pop(DEFAULT_SLOT)]
+    ordered.extend(sorted(
+        entries.values(), key=lambda entry: (entry['name'].lower(),
+                                             entry['id'])))
+    return ordered
 
 
 # ---- templates ------------------------------------------------------------
@@ -394,7 +463,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='apply_crew_templates',
         description='按角色组合模板设置离线车库乘员技能 (默认 dry-run)')
-    parser.add_argument('--garage', default=DEFAULT_GARAGE)
+    parser.add_argument('--garage', default=None,
+                        help='garage_state.json 的完整路径 (覆盖 --slot)')
+    parser.add_argument('--slot', default=DEFAULT_SLOT,
+                        help='存档槽位 id (默认 default; 存档位于 '
+                             'saves\\<槽位>\\garage_state.json)')
     parser.add_argument('--templates', default=DEFAULT_TEMPLATES)
     parser.add_argument('--vehicle-db', default=DEFAULT_VEHICLE_DB)
     parser.add_argument('--client-dir', default=DEFAULT_CLIENT_DIR)
@@ -427,12 +500,19 @@ def main(argv=None):
                 print('  %s' % describe_skill(skill))
         return 0
 
-    if not os.path.isfile(args.garage):
-        parser.error('garage state not found: %s' % args.garage)
+    if args.garage:
+        garage = args.garage
+    else:
+        try:
+            garage = slot_garage_path(args.slot)
+        except TemplateError as error:
+            parser.error(str(error))
+    if not os.path.isfile(garage):
+        parser.error('garage state not found: %s' % garage)
     templates = load_templates(args.templates)
     vehicles = _ensure_vehicle_db(args)
     matches = build_filters(args)
-    with open(args.garage, 'rb') as stream:
+    with open(garage, 'rb') as stream:
         state = json.load(stream)
 
     plans = plan_garage(state, vehicles, templates, matches,
@@ -459,8 +539,8 @@ def main(argv=None):
         record = state['vehicles'].get(key)
         for slot, _combo, _trained, _training, encoded in changes:
             record['crew'][str(slot)] = encoded
-    backup = write_garage(args.garage, state)
-    print('已写入 %s (备份: %s)' % (args.garage, backup))
+    backup = write_garage(garage, state)
+    print('已写入 %s (备份: %s)' % (garage, backup))
     return 0
 
 

@@ -12,8 +12,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from trainer.apply_crew_templates import (  # noqa: E402
-    DEFAULT_TEMPLATES, TemplateError, build_filters, load_templates,
-    main, normalize_combo, plan_garage, plan_vehicle)
+    DEFAULT_SLOT, DEFAULT_TEMPLATES, TemplateError, build_filters,
+    list_save_slots, load_templates, main, normalize_combo, plan_garage,
+    plan_vehicle, slot_garage_path, valid_slot_id)
 from trainer.tankman_codec import parse_tankman  # noqa: E402
 from trainer.vehicle_db import VehicleInfo  # noqa: E402
 
@@ -39,6 +40,52 @@ def make_info(crew):
         tier=5, clazz='mediumTank', crew=[tuple(slot) for slot in crew])
 
 
+class SaveSlotTest(unittest.TestCase):
+
+    def test_slot_id_validation(self):
+        self.assertTrue(valid_slot_id('default'))
+        self.assertTrue(valid_slot_id('Career-Mode_2'))
+        self.assertFalse(valid_slot_id(''))
+        self.assertFalse(valid_slot_id('../evil'))
+        self.assertFalse(valid_slot_id('a/b'))
+        self.assertFalse(valid_slot_id(None))
+
+    def test_slot_garage_path(self):
+        path = slot_garage_path('default', saves_root=r'C:\saves')
+        self.assertEqual(r'C:\saves\default\garage_state.json', path)
+        with self.assertRaises(TemplateError):
+            slot_garage_path('../evil', saves_root=r'C:\saves')
+
+    def test_list_save_slots_default_first(self):
+        root = tempfile.mkdtemp()
+        try:
+            for slot, name in (('default', '默认存档'), ('Career-Mode', None)):
+                directory = os.path.join(root, slot)
+                os.makedirs(directory)
+                with open(os.path.join(directory, 'garage_state.json'),
+                          'w') as stream:
+                    stream.write('{}')
+                if name:
+                    with open(os.path.join(directory, 'save.json'),
+                              'w') as stream:
+                        json.dump({'name': name}, stream)
+            slots = list_save_slots(saves_root=root)
+            self.assertEqual(['default', 'Career-Mode'],
+                             [entry['id'] for entry in slots])
+            self.assertEqual('默认存档', slots[0]['name'])
+            self.assertEqual('Career-Mode', slots[1]['name'])
+            self.assertTrue(all(entry['has_garage'] for entry in slots))
+        finally:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_list_save_slots_without_saves_dir(self):
+        slots = list_save_slots(saves_root=os.path.join(
+            tempfile.gettempdir(), 'no-such-saves-root-xyz'))
+        self.assertEqual(['default'], [entry['id'] for entry in slots])
+        self.assertFalse(slots[0]['has_garage'])
+
+
 class NormalizeComboTest(unittest.TestCase):
 
     def test_secondary_roles_are_sorted(self):
@@ -54,9 +101,7 @@ class TemplateFileTest(unittest.TestCase):
         self.assertGreaterEqual(len(TEMPLATES), 16)
 
     def test_every_garage_combo_has_a_template(self):
-        garage = os.path.join(
-            os.environ.get('APPDATA', ''), 'Wargaming.net', 'WorldOfTanks',
-            'offline_lan_0922', 'garage_state.json')
+        garage = slot_garage_path(DEFAULT_SLOT)
         vehicle_db = os.path.join(
             os.path.dirname(DEFAULT_TEMPLATES), 'vehicle_db.json')
         if not (os.path.isfile(garage) and os.path.isfile(vehicle_db)):

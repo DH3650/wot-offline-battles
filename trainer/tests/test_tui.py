@@ -42,6 +42,12 @@ def make_state(*blobs):
         str(slot): blob for slot, blob in enumerate(blobs)}}}}
 
 
+def make_state_with_stock():
+    state = make_state(NO_SKILL_BLOB)
+    state['owned'] = {'9': {'5625': 5}}
+    return state
+
+
 class CrewStatusTest(unittest.TestCase):
 
     def test_counts_skill_less_members(self):
@@ -131,7 +137,7 @@ class ScriptedFlowTest(unittest.TestCase):
             json.dump(state, stream)
             path = stream.name
         try:
-            result, screen = self._run_main(['3', 'esc', 'q'], path)
+            result, screen = self._run_main(['1', '3', 'esc', 'q', 'q'], path)
         finally:
             os.unlink(path)
         self.assertEqual(0, result)
@@ -148,10 +154,11 @@ class ScriptedFlowTest(unittest.TestCase):
             json.dump(state, stream)
             path = stream.name
         try:
-            # 菜单1 勾选该车(空格→Enter) → 菜单4 → 冲突菜单选 o(覆盖)
-            # → esc 看完变更清单 → y 确认 → 完成后 esc → q 退出
+            # 进车组管理 → 菜单1 勾选该车(空格→Enter) → 菜单4 → 冲突菜单选 o(覆盖)
+            # → esc 看完变更清单 → y 确认 → 完成后 esc → q 返回 → q 退出
             result, screen = self._run_main(
-                ['1', ' ', 'enter', '4', 'o', 'esc', 'y', 'esc', 'q'], path)
+                ['1', '1', ' ', 'enter', '4', 'o', 'esc', 'y', 'esc', 'q', 'q'],
+                path)
             with open(path, 'rb') as stream:
                 written = json.load(stream)
         finally:
@@ -175,7 +182,7 @@ class ScriptedFlowTest(unittest.TestCase):
         try:
             # 白板车默认已勾选 → 菜单4 → esc 看完清单 → n 拒绝 → esc 离开"已取消" → q
             result, screen = self._run_main(
-                ['1', 'enter', '4', 'esc', 'n', 'esc', 'q'], path)
+                ['1', '1', 'enter', '4', 'esc', 'n', 'esc', 'q', 'q'], path)
             with open(path, 'rb') as stream:
                 written = json.load(stream)
         finally:
@@ -196,7 +203,7 @@ class ScriptedFlowTest(unittest.TestCase):
         try:
             # 菜单1 勾选该车 → 菜单4 → 冲突菜单选 s(仅白板) → 无可写 → esc → q
             result, screen = self._run_main(
-                ['1', ' ', 'enter', '4', 's', 'esc', 'q'], path)
+                ['1', '1', ' ', 'enter', '4', 's', 'esc', 'q', 'q'], path)
             with open(path, 'rb') as stream:
                 written = json.load(stream)
         finally:
@@ -212,7 +219,7 @@ class ScriptedFlowTest(unittest.TestCase):
             json.dump(state, stream)
             path = stream.name
         try:
-            result, screen = self._run_main(['5', 'esc', 'q'], path)
+            result, screen = self._run_main(['1', '5', 'esc', 'q', 'q'], path)
         finally:
             os.unlink(path)
         self.assertEqual(0, result)
@@ -231,7 +238,128 @@ class ScriptedFlowTest(unittest.TestCase):
         finally:
             os.unlink(path)
         self.assertEqual(0, result)
-        self.assertIn('乘员技能模板工具', screen)
+        self.assertIn('车库助手', screen)
+        self.assertNotIn('白板', screen)  # 顶层菜单不渲染车辆行
+
+    def test_switch_slot_reloads_garage(self):
+        import tempfile
+        paths = []
+        try:
+            for state in (make_state(NO_SKILL_BLOB), make_state(SKILLED_BLOB)):
+                stream = tempfile.NamedTemporaryFile(
+                    'w', suffix='.json', delete=False)
+                with stream:
+                    json.dump(state, stream)
+                paths.append(stream.name)
+            slots = [
+                {'id': 'default', 'name': 'default', 'path': paths[0],
+                 'has_garage': True},
+                {'id': 'Career-Mode', 'name': 'Career Mode',
+                 'path': paths[1], 'has_garage': True},
+            ]
+            paths_by_id = {entry['id']: entry['path'] for entry in slots}
+            with mock.patch.object(tui, 'list_save_slots',
+                                   return_value=slots), \
+                    mock.patch.object(tui, 'slot_garage_path',
+                                      side_effect=lambda s: paths_by_id[s]):
+                # 进车组管理看计数 → q 返回 → 菜单3 选存档 → ↓ 选第二个 → Enter
+                # → 再进车组管理看计数 → q 返回 → q 退出
+                result, screen = self._run_main(
+                    ['1', 'q', '3', 'down', 'enter', '1', 'q', 'q'], paths[0])
+        finally:
+            for path in paths:
+                os.unlink(path)
+        self.assertEqual(0, result)
+        self.assertIn('选择要编辑的存档', screen)
+        # 切换后载入新存档: 白板计数从 1 变为 0
+        self.assertIn('已选 1, 可选 1', screen)
+        self.assertIn('已选 0, 可选 0', screen)
+        self.assertIn('存档: Career-Mode', screen)
+
+    def _unlink_with_backups(self, path):
+        import glob as glob_module
+        for candidate in [path] + glob_module.glob(
+                path + '.trainer-backup-*'):
+            os.unlink(candidate)
+
+    def test_inventory_apply_writes_stock(self):
+        import tempfile
+        state = make_state_with_stock()
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.json', delete=False) as stream:
+            json.dump(state, stream)
+            path = stream.name
+        try:
+            # 库存管理 → 预览 → 应用 → 看完清单 → y 确认 → 完成 → 返回 → 退出
+            result, screen = self._run_main(
+                ['2', '3', 'esc', '4', 'esc', 'y', 'esc', 'q', 'q'], path)
+            with open(path, 'rb') as stream:
+                written = json.load(stream)
+        finally:
+            self._unlink_with_backups(path)
+        self.assertEqual(0, result)
+        self.assertIn('库存管理', screen)
+        self.assertIn('中型坦克炮输弹机', screen)
+        # 默认全选: 已有 5 的改为 200, 没有的(deluxRammer)补为 200
+        self.assertEqual(200, written['owned']['9']['5625'])
+        self.assertEqual(200, written['owned']['9']['11769'])
+
+    def test_inventory_custom_count(self):
+        import tempfile
+        state = make_state_with_stock()
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.json', delete=False) as stream:
+            json.dump(state, stream)
+            path = stream.name
+        try:
+            # 目标数量改为 50 → 应用 → 确认
+            result, screen = self._run_main(
+                ['2', '2', '5', '0', 'enter', '4', 'esc', 'y', 'esc',
+                 'q', 'q'], path)
+            with open(path, 'rb') as stream:
+                written = json.load(stream)
+        finally:
+            self._unlink_with_backups(path)
+        self.assertEqual(0, result)
+        self.assertIn('目标数量', screen)
+        self.assertEqual(50, written['owned']['9']['5625'])
+
+    def test_inventory_deselect_all_has_no_changes(self):
+        import tempfile
+        state = make_state_with_stock()
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.json', delete=False) as stream:
+            json.dump(state, stream)
+            path = stream.name
+        try:
+            # 选择配件 → N 取消全部 → 应用 → 无改动提示
+            result, screen = self._run_main(
+                ['2', '1', 'n', 'enter', '4', 'esc', 'q', 'q'], path)
+            with open(path, 'rb') as stream:
+                written = json.load(stream)
+        finally:
+            os.unlink(path)
+        self.assertEqual(0, result)
+        self.assertIn('选择配件', screen)
+        self.assertIn('没有可应用的改动', screen)
+        self.assertEqual(5, written['owned']['9']['5625'])
+
+    def test_inventory_stock_table(self):
+        import tempfile
+        state = make_state_with_stock()
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.json', delete=False) as stream:
+            json.dump(state, stream)
+            path = stream.name
+        try:
+            result, screen = self._run_main(
+                ['2', '5', 'esc', 'q', 'q'], path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(0, result)
+        self.assertIn('库存一览', screen)
+        self.assertIn('输弹机:', screen)
+        self.assertIn('库存 5', screen)
 
 
 if __name__ == '__main__':

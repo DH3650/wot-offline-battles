@@ -1,0 +1,534 @@
+{
+ "1017": {
+  "artefact_id": 3,
+  "compact_descr": 1017,
+  "item_type": 9,
+  "key": "antifragmentationLining_heavy",
+  "name": "防崩落内衬(重型)",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:antifragmentationLining_heavy/name"
+ },
+ "10233": {
+  "artefact_id": 39,
+  "compact_descr": 10233,
+  "item_type": 9,
+  "key": "enhancedVertical_springs_class3",
+  "name": "三级加强型竖直螺旋弹簧",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedVertical_springs_class3/name"
+ },
+ "10489": {
+  "artefact_id": 40,
+  "compact_descr": 10489,
+  "item_type": 9,
+  "key": "enhancedVertical_elastic_elements",
+  "name": "增强型竖直板簧悬挂装置",
+  "price": 20000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedVertical_elastic_elements/name"
+ },
+ "10745": {
+  "artefact_id": 41,
+  "compact_descr": 10745,
+  "item_type": 9,
+  "key": "enhancedHorizontal_elastic_elements",
+  "name": "增强型板簧悬挂装置",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedHorizontal_elastic_elements/name"
+ },
+ "11001": {
+  "artefact_id": 42,
+  "compact_descr": 11001,
+  "item_type": 9,
+  "key": "antifragmentationLining_superheavy",
+  "name": "防崩落内衬(超重型)",
+  "price": 750000,
+  "tags": [],
+  "user_string": "#artefacts:antifragmentationLining_superheavy/name"
+ },
+ "11257": {
+  "artefact_id": 43,
+  "compact_descr": 11257,
+  "item_type": 9,
+  "key": "deluxToolbox",
+  "name": "增强型工具箱",
+  "price": null,
+  "tags": [
+   "toolbox",
+   "deluxe"
+  ],
+  "user_string": "#artefacts:deluxToolbox/name"
+ },
+ "11513": {
+  "artefact_id": 44,
+  "compact_descr": 11513,
+  "item_type": 9,
+  "key": "deluxImprovedVentilation",
+  "name": "通风系统",
+  "price": null,
+  "tags": [
+   "ventilation",
+   "deluxe"
+  ],
+  "user_string": "#artefacts:deluxImprovedVentilation/name"
+ },
+ "11769": {
+  "artefact_id": 45,
+  "compact_descr": 11769,
+  "item_type": 9,
+  "key": "deluxRammer",
+  "name": "改进型装填系统",
+  "price": null,
+  "tags": [
+   "rammer",
+   "deluxe"
+  ],
+  "user_string": "#artefacts:deluxRammer/name"
+ },
+ "12025": {
+  "artefact_id": 46,
+  "compact_descr": 12025,
+  "item_type": 9,
+  "key": "deluxCoatedOptics",
+  "name": "试验型观察镜",
+  "price": null,
+  "tags": [
+   "coatedOptics",
+   "deluxe"
+  ],
+  "user_string": "#artefacts:deluxCoatedOptics/name"
+ },
+ "12281": {
+  "artefact_id": 47,
+  "compact_descr": 12281,
+  "item_type": 9,
+  "key": "deluxAimingStabilizer",
+  "name": "稳定设备系统",
+  "price": null,
+  "tags": [
+   "aimingStabilizer",
+   "deluxe"
+  ],
+  "user_string": "#artefacts:deluxAimingStabilizer/name"
+ },
+ "12537": {
+  "artefact_id": 48,
+  "compact_descr": 12537,
+  "item_type": 9,
+  "key": "deluxEnhancedAimDrives",
+  "name": "耐磨型炮控系统",
+  "price": null,
+  "tags": [
+   "enhancedAimDrives",
+   "deluxe"
+  ],
+  "user_string": "#artefacts:deluxEnhancedAimDrives/name"
+ },
+ "1273": {
+  "artefact_id": 4,
+  "compact_descr": 1273,
+  "item_type": 9,
+  "key": "stereoscope",
+  "name": "炮队镜",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:stereoscope/name"
+ },
+ "1529": {
+  "artefact_id": 5,
+  "compact_descr": 1529,
+  "item_type": 9,
+  "key": "coatedOptics",
+  "name": "高级光学观察镜",
+  "price": 500000,
+  "tags": [
+   "r��yө�',"
+  ],
+  "user_string": "#artefacts:coatedOptics/name"
+ },
+ "1785": {
+  "artefact_id": 6,
+  "compact_descr": 1785,
+  "item_type": 9,
+  "key": "camouflageNet",
+  "name": "伪装网",
+  "price": 100000,
+  "tags": [],
+  "user_string": "#artefacts:camouflageNet/name"
+ },
+ "2041": {
+  "artefact_id": 7,
+  "compact_descr": 2041,
+  "item_type": 9,
+  "key": "enhancedSuspension_Vikkers",
+  "name": "增强型维克斯悬挂装置",
+  "price": 20000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedSuspension_Vikkers/name"
+ },
+ "2297": {
+  "artefact_id": 8,
+  "compact_descr": 2297,
+  "item_type": 9,
+  "key": "enhancedSuspension_candle",
+  "name": "增强型烛式悬挂装置",
+  "price": 40000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedSuspension_candle/name"
+ },
+ "249": {
+  "artefact_id": 0,
+  "compact_descr": 249,
+  "item_type": 9,
+  "key": "toolbox",
+  "name": "工具箱",
+  "price": 500000,
+  "tags": [
+   "toolbox"
+  ],
+  "user_string": "#artefacts:toolbox/name"
+ },
+ "2553": {
+  "artefact_id": 9,
+  "compact_descr": 2553,
+  "item_type": 9,
+  "key": "enhancedSuspension_Christie",
+  "name": "增强型克里斯蒂悬挂装置",
+  "price": 80000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedSuspension_Christie/name"
+ },
+ "2809": {
+  "artefact_id": 10,
+  "compact_descr": 2809,
+  "item_type": 9,
+  "key": "enhancedTorsions1t",
+  "name": "增强型扭杆1吨级",
+  "price": 100000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedTorsions1t/name"
+ },
+ "3065": {
+  "artefact_id": 11,
+  "compact_descr": 3065,
+  "item_type": 9,
+  "key": "enhancedTorsions3t",
+  "name": "增强型扭杆3吨级",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedTorsions3t/name"
+ },
+ "3321": {
+  "artefact_id": 12,
+  "compact_descr": 3321,
+  "item_type": 9,
+  "key": "enhancedTorsions5t",
+  "name": "增强型扭杆5+吨级",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedTorsions5t/name"
+ },
+ "3577": {
+  "artefact_id": 13,
+  "compact_descr": 3577,
+  "item_type": 9,
+  "key": "enhancedSprings",
+  "name": "强力弹簧",
+  "price": 20000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedSprings/name"
+ },
+ "3833": {
+  "artefact_id": 14,
+  "compact_descr": 3833,
+  "item_type": 9,
+  "key": "enhancedLevers",
+  "name": "增强型操纵杆",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedLevers/name"
+ },
+ "4089": {
+  "artefact_id": 15,
+  "compact_descr": 4089,
+  "item_type": 9,
+  "key": "enhancedBelwillWashers",
+  "name": "增强型贝勒维尔垫圈",
+  "price": 600000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedBelwillWashers/name"
+ },
+ "4345": {
+  "artefact_id": 16,
+  "compact_descr": 4345,
+  "item_type": 9,
+  "key": "enhancedLongitudinalTorsions",
+  "name": "增强型扭杆",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedLongitudinalTorsions/name"
+ },
+ "4601": {
+  "artefact_id": 17,
+  "compact_descr": 4601,
+  "item_type": 9,
+  "key": "improvedVentilation_class1",
+  "name": "1级改进型通风系统",
+  "price": 50000,
+  "tags": [
+   "ventilation"
+  ],
+  "user_string": "#artefacts:improvedVentilation_class1/name"
+ },
+ "4857": {
+  "artefact_id": 18,
+  "compact_descr": 4857,
+  "item_type": 9,
+  "key": "improvedVentilation_class2",
+  "name": "2级改进型通风系统",
+  "price": 150000,
+  "tags": [
+   "ventilation"
+  ],
+  "user_string": "#artefacts:improvedVentilation_class2/name"
+ },
+ "505": {
+  "artefact_id": 1,
+  "compact_descr": 505,
+  "item_type": 9,
+  "key": "antifragmentationLining_light",
+  "name": "防崩落内衬(轻型)",
+  "price": 50000,
+  "tags": [],
+  "user_string": "#artefacts:antifragmentationLining_light/name"
+ },
+ "5113": {
+  "artefact_id": 19,
+  "compact_descr": 5113,
+  "item_type": 9,
+  "key": "improvedVentilation_class3",
+  "name": "3级改进型通风系统",
+  "price": 600000,
+  "tags": [
+   "ventilation"
+  ],
+  "user_string": "#artefacts:improvedVentilation_class3/name"
+ },
+ "5369": {
+  "artefact_id": 20,
+  "compact_descr": 5369,
+  "item_type": 9,
+  "key": "grousers",
+  "name": "附加履带齿",
+  "price": 250000,
+  "tags": [],
+  "user_string": "#artefacts:grousers/name"
+ },
+ "5625": {
+  "artefact_id": 21,
+  "compact_descr": 5625,
+  "item_type": 9,
+  "key": "mediumCaliberTankRammer",
+  "name": "中型坦克炮输弹机",
+  "price": 200000,
+  "tags": [
+   "rammer"
+  ],
+  "user_string": "#artefacts:mediumCaliberTankRammer/name"
+ },
+ "5881": {
+  "artefact_id": 22,
+  "compact_descr": 5881,
+  "item_type": 9,
+  "key": "largeCaliberTankRammer",
+  "name": "重型坦克炮输弹机",
+  "price": 500000,
+  "tags": [
+   "rammer"
+  ],
+  "user_string": "#artefacts:largeCaliberTankRammer/name"
+ },
+ "6137": {
+  "artefact_id": 23,
+  "compact_descr": 6137,
+  "item_type": 9,
+  "key": "mediumCaliberHowitzerRammer",
+  "name": "中型火炮输弹机",
+  "price": 300000,
+  "tags": [
+   "rammer"
+  ],
+  "user_string": "#artefacts:mediumCaliberHowitzerRammer/name"
+ },
+ "6393": {
+  "artefact_id": 24,
+  "compact_descr": 6393,
+  "item_type": 9,
+  "key": "largeCaliberHowitzerRammer",
+  "name": "重型火炮输弹机",
+  "price": 600000,
+  "tags": [
+   "rammer"
+  ],
+  "user_string": "#artefacts:largeCaliberHowitzerRammer/name"
+ },
+ "6649": {
+  "artefact_id": 25,
+  "compact_descr": 6649,
+  "item_type": 9,
+  "key": "enhancedAimDrives",
+  "name": "改进型炮控系统",
+  "price": 500000,
+  "tags": [
+   "enhancedAimDrives"
+  ],
+  "user_string": "#artefacts:enhancedAimDrives/name"
+ },
+ "6905": {
+  "artefact_id": 26,
+  "compact_descr": 6905,
+  "item_type": 9,
+  "key": "wetCombatPack_class1",
+  "name": "1级“水套”",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:wetCombatPack_class1/name"
+ },
+ "7161": {
+  "artefact_id": 27,
+  "compact_descr": 7161,
+  "item_type": 9,
+  "key": "wetCombatPack_class2",
+  "name": "2级“水套”",
+  "price": 600000,
+  "tags": [],
+  "user_string": "#artefacts:wetCombatPack_class2/name"
+ },
+ "7417": {
+  "artefact_id": 28,
+  "compact_descr": 7417,
+  "item_type": 9,
+  "key": "carbonDioxide",
+  "name": "充二氧化碳气的油箱",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:carbonDioxide/name"
+ },
+ "761": {
+  "artefact_id": 2,
+  "compact_descr": 761,
+  "item_type": 9,
+  "key": "antifragmentationLining_medium",
+  "name": "防崩落内衬(中型)",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:antifragmentationLining_medium/name"
+ },
+ "7673": {
+  "artefact_id": 29,
+  "compact_descr": 7673,
+  "item_type": 9,
+  "key": "filterCyclone",
+  "name": "燃油滤清器",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:filterCyclone/name"
+ },
+ "7929": {
+  "artefact_id": 30,
+  "compact_descr": 7929,
+  "item_type": 9,
+  "key": "aimingStabilizer_Mk1",
+  "name": "火炮垂直稳定器 Mk 1",
+  "price": 500000,
+  "tags": [
+   "j)��\u0004�i���7�"
+  ],
+  "user_string": "#artefacts:aimingStabilizer_Mk1/name"
+ },
+ "8185": {
+  "artefact_id": 31,
+  "compact_descr": 8185,
+  "item_type": 9,
+  "key": "aimingStabilizer_Mk2",
+  "name": "火炮垂直稳定器 Mk 2",
+  "price": 600000,
+  "tags": [
+   "j)��\u0004�i���7�"
+  ],
+  "user_string": "#artefacts:aimingStabilizer_Mk2/name"
+ },
+ "8441": {
+  "artefact_id": 32,
+  "compact_descr": 8441,
+  "item_type": 9,
+  "key": "enhancedVertical_springs",
+  "name": "一级加强型竖直螺旋弹簧",
+  "price": 20000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedVertical_springs/name"
+ },
+ "8697": {
+  "artefact_id": 33,
+  "compact_descr": 8697,
+  "item_type": 9,
+  "key": "enhancedHorizontal_springs",
+  "name": "一级增强水平螺旋弹簧",
+  "price": 20000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedHorizontal_springs/name"
+ },
+ "8953": {
+  "artefact_id": 34,
+  "compact_descr": 8953,
+  "item_type": 9,
+  "key": "enhancedSprings_class2",
+  "name": "二级增强型板簧悬挂装置",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedSprings_class2/name"
+ },
+ "9209": {
+  "artefact_id": 35,
+  "compact_descr": 9209,
+  "item_type": 9,
+  "key": "enhancedSprings_class3",
+  "name": "三级增强型板簧悬挂装置",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedSprings_class3/name"
+ },
+ "9465": {
+  "artefact_id": 36,
+  "compact_descr": 9465,
+  "item_type": 9,
+  "key": "enhancedHorizontal_springs_class2",
+  "name": "二级增强水平螺旋弹簧",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedHorizontal_springs_class2/name"
+ },
+ "9721": {
+  "artefact_id": 37,
+  "compact_descr": 9721,
+  "item_type": 9,
+  "key": "enhancedHorizontal_springs_class3",
+  "name": "三级增强水平螺旋弹簧",
+  "price": 500000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedHorizontal_springs_class3/name"
+ },
+ "9977": {
+  "artefact_id": 38,
+  "compact_descr": 9977,
+  "item_type": 9,
+  "key": "enhancedVertical_springs_class2",
+  "name": "二级加强型竖直螺旋弹簧",
+  "price": 200000,
+  "tags": [],
+  "user_string": "#artefacts:enhancedVertical_springs_class2/name"
+ }
+}
