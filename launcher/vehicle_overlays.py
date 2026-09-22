@@ -9,6 +9,7 @@ exits. An existing overlay from another tool is always a conflict.
 
 from __future__ import annotations
 
+import collections
 import copy
 import datetime
 import errno
@@ -19,6 +20,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -57,10 +59,25 @@ PROFILE_STORE_NAME = "vehicle_profiles.json"
 PROFILE_STORE_APPDATA_PARTS = (
     "Wargaming.net", "WorldOfTanks", "offline_lan_0922")
 PROFILE_STORE_SCHEMA = 1
+VEHICLE_DATA_CACHE_NAME = "vehicle_data_cache.sqlite3"
+VEHICLE_DATA_CACHE_SCHEMA = 1
+TRAINER_USER_ROOT_ENV = "WOT_TRAINER_USER_ROOT"
 ORIGINAL_PROFILE_LABEL = "Original vehicle values"
 MAX_PROFILE_NAME_LENGTH = 64
 MAX_OVERLAY_MEMBERS = 1024
 MAX_OVERLAY_MANIFEST_BYTES = 32 * 1024 * 1024
+
+# Reading one vehicle's editable topology is deliberately strict, but it is
+# also expensive: it parses every vehicle and shared component definition for
+# that nation.  The launcher can open and close the editor several times while
+# the immutable stock package stays unchanged, so retain those derived values
+# in-process.  The package identity makes replacement/update of scripts.pkg an
+# automatic invalidation boundary.  Callers receive deep copies because the UI
+# annotates field records with profile-specific current values.
+_VEHICLE_CATALOG_CACHE = {"key": None, "value": None}
+_VEHICLE_FIELD_CACHE_LIMIT = 32
+_VEHICLE_FIELD_CACHE = {
+    "package_key": None, "values": collections.OrderedDict()}
 
 _COMPONENT_MEMBER = re.compile(
     r"^scripts/item_defs/vehicles/([a-z][a-z0-9_]*)/components/"
@@ -242,6 +259,149 @@ def profile_store_path(game_root, environment=None):
     return _contained_path(
         root, os.path.join(root, PROFILE_STORE_NAME),
         "The vehicle profile store")
+
+
+def vehicle_data_cache_path(game_root, environment=None):
+    """Shared trainer index under the repository's private user directory."""
+    environment = os.environ if environment is None else environment
+    root = environment.get(TRAINER_USER_ROOT_ENV)
+    if not isinstance(root, str) or not root.strip():
+        root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ".user", "trainer")
+    root = os.path.abspath(root.strip())
+    return _contained_path(
+        root, os.path.join(root, VEHICLE_DATA_CACHE_NAME),
+        "The vehicle data cache")
+
+
+def _vehicle_data_cache_connection(game_root):
+    path = vehicle_data_cache_path(game_root)
+    directory = os.path.dirname(path)
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    connection = sqlite3.connect(path, timeout=5.0)
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS cache_meta ("
+        "schema_version INTEGER NOT NULL, target_version TEXT NOT NULL, "
+        "target_build TEXT NOT NULL)")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS cache_values ("
+        "kind TEXT NOT NULL, cache_key TEXT NOT NULL, data TEXT NOT NULL, "
+        "PRIMARY KEY (kind, cache_key))")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS source_members ("
+        "member TEXT PRIMARY KEY, data BLOB NOT NULL)")
+    row = connection.execute(
+        "SELECT schema_version, target_version, target_build "
+        "FROM cache_meta LIMIT 1").fetchone()
+    expected = (VEHICLE_DATA_CACHE_SCHEMA, TARGET_VERSION, TARGET_BUILD)
+    if row != expected:
+        connection.execute("DELETE FROM cache_values")
+        connection.execute("DELETE FROM source_members")
+        connection.execute("DELETE FROM cache_meta")
+        connection.execute(
+            "INSERT INTO cache_meta VALUES (?, ?, ?)", expected)
+    # This project pins one immutable client build.  Cache compatibility is
+    # therefore defined by schema/target version/build above, not by the mtime
+    # of the containing scripts.pkg.  A copy, antivirus scan, or timestamp
+    # repair must not discard the one-time imported member cache.
+    connection.execute(
+        "DELETE FROM cache_values "
+        "WHERE kind = 'meta' AND cache_key = 'source_signature'")
+    connection.commit()
+    return connection
+
+
+def _vehicle_data_cache_get(game_root, kind, cache_key):
+    """Read one derived stock value; cache failure falls back to scripts.pkg."""
+    try:
+        connection = _vehicle_data_cache_connection(game_root)
+        try:
+            row = connection.execute(
+                "SELECT data FROM cache_values WHERE kind = ? AND cache_key = ?",
+                (kind, cache_key)).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        value = json.loads(row[0])
+        return value if isinstance(value, list) else None
+    except (IOError, OSError, TypeError, ValueError, sqlite3.Error):
+        return None
+
+
+def _vehicle_data_cache_put(game_root, kind, cache_key, value):
+    """Persist one JSON-safe stock value without making cache I/O mandatory."""
+    try:
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"))
+        connection = _vehicle_data_cache_connection(game_root)
+        try:
+            connection.execute(
+                "INSERT OR REPLACE INTO cache_values VALUES (?, ?, ?)",
+                (kind, cache_key, payload))
+            connection.commit()
+        finally:
+            connection.close()
+        return True
+    except (IOError, OSError, TypeError, ValueError, sqlite3.Error):
+        return False
+
+
+def _vehicle_source_cache_get(game_root, member):
+    try:
+        connection = _vehicle_data_cache_connection(game_root)
+        try:
+            row = connection.execute(
+                "SELECT data FROM source_members WHERE member = ?",
+                (member,)).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return bytes(row[0])
+    except (IOError, OSError, TypeError, ValueError, sqlite3.Error):
+        return None
+
+
+def _vehicle_source_cache_put(game_root, member, data):
+    try:
+        connection = _vehicle_data_cache_connection(game_root)
+        try:
+            connection.execute(
+                "INSERT OR REPLACE INTO source_members VALUES (?, ?)",
+                (member, sqlite3.Binary(data)))
+            connection.commit()
+        finally:
+            connection.close()
+        return True
+    except (IOError, OSError, TypeError, ValueError, sqlite3.Error):
+        return False
+
+
+def _game_root_from_package_path(package_path):
+    root = os.path.abspath(package_path)
+    for unused_part in SOURCE_PACKAGE.split("/"):
+        root = os.path.dirname(root)
+    return root
+
+
+def _restore_cached_choices(value):
+    result = copy.deepcopy(value)
+    for choice in result:
+        choice["tags"] = tuple(choice.get("tags", ()))
+    return result
+
+
+def _restore_cached_fields(value):
+    result = copy.deepcopy(value)
+    for field in result:
+        field["affectedVehicles"] = tuple(field.get("affectedVehicles", ()))
+        field["affectedVehicleLabels"] = tuple(
+            field.get("affectedVehicleLabels", ()))
+    return result
 
 
 def _normalize_profile_name(raw_name):
@@ -541,6 +701,15 @@ def _require_target(game_root, require_closed=False, is_running=None):
 
 def _read_source_member(package_path, member):
     _validate_member(member)
+    game_root = _game_root_from_package_path(package_path)
+    data = _vehicle_source_cache_get(game_root, member)
+    if data is not None:
+        try:
+            return data, packed_xml.read_packed_xml(data)
+        except (TypeError, ValueError, OverflowError):
+            # A damaged derived row is replaceable; fall through to the pinned
+            # package and overwrite it with a verified Packed XML member.
+            data = None
     try:
         with zipfile.ZipFile(package_path, "r") as archive:
             matches = [info for info in archive.infolist()
@@ -549,7 +718,9 @@ def _read_source_member(package_path, member):
                 raise VehicleOverlayError(
                     "The original package must contain exactly one %s." % member)
             data = archive.read(matches[0])
-        return data, packed_xml.read_packed_xml(data)
+        root = packed_xml.read_packed_xml(data)
+        _vehicle_source_cache_put(game_root, member, data)
+        return data, root
     except VehicleOverlayError:
         raise
     except (IOError, OSError, KeyError, ValueError,
@@ -752,6 +923,16 @@ def list_vehicle_members(game_root):
 def list_vehicle_choices(game_root):
     """List real vehicle definitions as nation/vehicle choices."""
     status, package_path = _require_target(game_root)
+    cache_key = (
+        "persistent", os.path.normcase(vehicle_data_cache_path(status["path"])))
+    if _VEHICLE_CATALOG_CACHE["key"] == cache_key:
+        return copy.deepcopy(_VEHICLE_CATALOG_CACHE["value"])
+    cached = _vehicle_data_cache_get(status["path"], "catalog", "all")
+    if cached is not None:
+        choices = _restore_cached_choices(cached)
+        _VEHICLE_CATALOG_CACHE["key"] = cache_key
+        _VEHICLE_CATALOG_CACHE["value"] = copy.deepcopy(choices)
+        return choices
     try:
         with zipfile.ZipFile(package_path, "r") as archive:
             counts = {}
@@ -778,6 +959,9 @@ def list_vehicle_choices(game_root):
             "nation", "vehicle", "member", "tags", "vehicleClass", "level"))
         choice["label"] = label
         choices.append(choice)
+    _VEHICLE_CATALOG_CACHE["key"] = cache_key
+    _VEHICLE_CATALOG_CACHE["value"] = copy.deepcopy(choices)
+    _vehicle_data_cache_put(status["path"], "catalog", "all", choices)
     return choices
 
 
@@ -1333,6 +1517,23 @@ def list_vehicle_field_choices(game_root, vehicle_member):
     if selected_match is None or "/components/" in vehicle_member:
         raise VehicleOverlayError("Select one original vehicle definition.")
     nation, vehicle = selected_match.groups()
+    package_key = (
+        "persistent", os.path.normcase(vehicle_data_cache_path(status["path"])))
+    if _VEHICLE_FIELD_CACHE["package_key"] != package_key:
+        _VEHICLE_FIELD_CACHE["package_key"] = package_key
+        _VEHICLE_FIELD_CACHE["values"] = collections.OrderedDict()
+    cached = _VEHICLE_FIELD_CACHE["values"].get(vehicle_member)
+    if cached is not None:
+        _VEHICLE_FIELD_CACHE["values"].move_to_end(vehicle_member)
+        return copy.deepcopy(cached)
+    cached = _vehicle_data_cache_get(
+        status["path"], "vehicle_fields", vehicle_member)
+    if cached is not None:
+        result = _restore_cached_fields(cached)
+        _VEHICLE_FIELD_CACHE["values"][vehicle_member] = copy.deepcopy(result)
+        while len(_VEHICLE_FIELD_CACHE["values"]) > _VEHICLE_FIELD_CACHE_LIMIT:
+            _VEHICLE_FIELD_CACHE["values"].popitem(last=False)
+        return result
     component_members = dict(
         (category, "scripts/item_defs/vehicles/%s/components/%s.xml" %
          (nation, category))
@@ -1513,9 +1714,15 @@ def list_vehicle_field_choices(game_root, vehicle_member):
                 nation, vehicle, category, member, field, True,
                 component, users))
 
-    return sorted(records, key=lambda record: (
+    result = sorted(records, key=lambda record: (
         _CATEGORY_ORDER[record["category"]], record["fieldLabel"],
         record["member"], record["fieldPath"]))
+    _VEHICLE_FIELD_CACHE["values"][vehicle_member] = copy.deepcopy(result)
+    while len(_VEHICLE_FIELD_CACHE["values"]) > _VEHICLE_FIELD_CACHE_LIMIT:
+        _VEHICLE_FIELD_CACHE["values"].popitem(last=False)
+    _vehicle_data_cache_put(
+        status["path"], "vehicle_fields", vehicle_member, result)
+    return result
 
 
 def list_editable_fields(game_root, member):
@@ -1523,6 +1730,266 @@ def list_editable_fields(game_root, member):
     unused_status, package_path = _require_target(game_root)
     unused_data, root = _read_source_member(package_path, member)
     return _editable_fields_from_root(member, root)
+
+
+def source_package_signature(game_root):
+    """Return ``(mtime_ns, size)`` of the stock package, for cache keys."""
+    unused_status, package_path = _require_target(game_root)
+    stat = os.stat(package_path)
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+# A module's ``unlocks`` child is named after the category it researches;
+# the stock XML never states the target, which is the next module of that
+# category in the vehicle's own list order.
+_MODULE_UNLOCK_CHILD = {
+    "chassis": "chassis",
+    "engines": "engine",
+    "fuelTanks": "fuelTank",
+    "guns": "gun",
+    "radios": "radio",
+    "turrets": "turret",
+}
+
+
+def _child_number(element, name):
+    """Return one child of ``element`` as a float, or None."""
+    if element is None:
+        return None
+    encoded = name.encode("utf-8")
+    values = [value for current, value in element.children
+              if current == encoded]
+    if len(values) != 1:
+        return None
+    value = values[0]
+    try:
+        if value.value_type == packed_xml.TYPE_INTEGER:
+            return float(int(value.value))
+        if value.value_type == packed_xml.TYPE_ELEMENT:
+            return None
+        return float(_scalar_text(value))
+    except (TypeError, ValueError, OverflowError, VehicleOverlayError):
+        return None
+
+
+def _shared_component_element(shared_roots, category, name):
+    root = shared_roots.get(category)
+    if root is None:
+        return None
+    shared = _element_child(root, "shared")
+    if shared is None:
+        return None
+    return _element_child(shared, name)
+
+
+def _module_entries(container, require_shared_scalar=True):
+    """Ordered ``(name, element-or-None)`` module entries of one section."""
+    entries = []
+    seen = set()
+    if container is None:
+        return entries
+    for raw_name, value in container.children:
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if name in seen or _SAFE_SEGMENT.fullmatch(name) is None:
+            continue
+        if value.value_type == packed_xml.TYPE_ELEMENT:
+            element = value.value
+        else:
+            if require_shared_scalar:
+                try:
+                    if _scalar_text(value) != "shared":
+                        continue
+                except VehicleOverlayError:
+                    continue
+            element = None
+        seen.add(name)
+        entries.append((name, element))
+    return entries
+
+
+def _module_stat(category, name, element, shared_roots, stat):
+    """One numeric module property; the shared table fills local gaps."""
+    for holder in (element,
+                   _shared_component_element(shared_roots, category, name)):
+        value = _child_number(holder, stat)
+        if value is not None:
+            return value
+    return 0.0
+
+
+def _unlock_price(unlocks, key):
+    """One ``<unlocks><key><cost>`` price; the child wraps ``cost``."""
+    if unlocks is None:
+        return None
+    encoded = key.encode("utf-8")
+    values = [value for current, value in unlocks.children
+              if current == encoded]
+    if len(values) != 1:
+        return None
+    value = values[0]
+    if value.value_type == packed_xml.TYPE_ELEMENT:
+        return _child_number(value.value, "cost")
+    return None
+
+
+def _module_unlock_costs(category, entries):
+    """Research price of each module: its predecessor's unlock charge."""
+    key = _MODULE_UNLOCK_CHILD[category]
+    costs = [0.0] * len(entries)
+    for index in range(1, len(entries)):
+        element = entries[index - 1][1]
+        unlocks = (_element_child(element, "unlocks")
+                   if element is not None else None)
+        costs[index] = _unlock_price(unlocks, key) or 0.0
+    return costs
+
+
+def _gun_unlock_costs(gun_entries, turret_element):
+    """Gun research prices; a turret prices the trailing guns it adds."""
+    costs = _module_unlock_costs("guns", gun_entries)
+    extra = []
+    unlocks = (_element_child(turret_element, "unlocks")
+               if turret_element is not None else None)
+    if unlocks is not None:
+        # Duplicate ``gun`` children are read one by one instead of through
+        # the uniqueness-checking helper.
+        for raw_name, value in unlocks.children:
+            if raw_name != b"gun" or value.value_type != \
+                    packed_xml.TYPE_ELEMENT:
+                continue
+            number = _child_number(value.value, "cost")
+            if number is not None:
+                extra.append(number)
+    index = len(costs) - 1
+    for cost in reversed(extra):
+        while index >= 0 and costs[index] > 0:
+            index -= 1
+        if index < 0:
+            break
+        costs[index] = cost
+        index -= 1
+    return costs
+
+
+def _top_module_name(candidates):
+    """Pick by (level, research cost, price, XML order), highest first.
+
+    This mirrors #1513's TopModulesChecker (vehicle_configuration in the
+    client mod): a unique highest level wins; research prices break level
+    ties.  Offline, the shop price and later XML order stand in for the
+    client's valuable-parameter fallback.
+    """
+    if not candidates:
+        return None
+    best = None
+    best_key = None
+    for index, candidate in enumerate(candidates):
+        key = (candidate["level"], candidate["cost"], candidate["price"],
+               index)
+        if best_key is None or key > best_key:
+            best_key = key
+            best = candidate["name"]
+    return best
+
+
+def vehicle_top_components(game_root, vehicle_member):
+    """Resolve one stock vehicle's elite (top-of-tree) module names.
+
+    Returns a JSON-friendly dict with the top module per category and the
+    shell names referenced by the top gun.  Guns are chosen within the top
+    turret's own list, the same pairing #1513's TopModulesChecker enforces.
+    """
+    unused_status, package_path = _require_target(game_root)
+    match = _VEHICLE_MEMBER.fullmatch(vehicle_member)
+    if match is None or "/components/" in vehicle_member:
+        raise VehicleOverlayError("Select one original vehicle definition.")
+    nation, unused_vehicle = match.groups()
+    try:
+        with zipfile.ZipFile(package_path, "r") as archive:
+            counts = {}
+            for info in archive.infolist():
+                counts[info.filename] = counts.get(info.filename, 0) + 1
+            if counts.get(vehicle_member) != 1:
+                raise VehicleOverlayError(
+                    "A vehicle topology member is missing or repeated: %s" %
+                    vehicle_member)
+            root = packed_xml.read_packed_xml(archive.read(vehicle_member))
+            shared_roots = {}
+            for category in ("chassis", "engines", "fuelTanks", "guns",
+                             "radios", "turrets"):
+                member = ("scripts/item_defs/vehicles/%s/components/%s.xml"
+                          % (nation, category))
+                if counts.get(member) == 1:
+                    shared_roots[category] = packed_xml.read_packed_xml(
+                        archive.read(member))
+    except VehicleOverlayError:
+        raise
+    except (IOError, OSError, KeyError, TypeError, ValueError,
+            zipfile.BadZipFile) as error:
+        raise VehicleOverlayError(
+            "The original vehicle topology is unreadable: %s" % error)
+
+    def candidates(category, entries, costs=None):
+        if costs is None:
+            costs = _module_unlock_costs(category, entries)
+        return [{
+            "name": name,
+            "level": _module_stat(
+                category, name, element, shared_roots, "level"),
+            "cost": costs[index],
+            "price": _module_stat(
+                category, name, element, shared_roots, "price"),
+        } for index, (name, element) in enumerate(entries)]
+
+    result = {"guns": None, "shells": []}
+    for category in ("chassis", "engines", "fuelTanks", "radios"):
+        entries = _module_entries(_element_child(root, category))
+        result[category] = _top_module_name(candidates(category, entries))
+
+    best_turret = None
+    best_turret_key = None
+    top_turret_element = None
+    running = 0
+    for raw_name, value in root.children:
+        try:
+            group_name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if (re.fullmatch(r"turrets\d+", group_name) is None or
+                value.value_type != packed_xml.TYPE_ELEMENT):
+            continue
+        entries = _module_entries(value.value)
+        group_candidates = candidates("turrets", entries)
+        for index, candidate in enumerate(group_candidates):
+            key = (candidate["level"], candidate["cost"],
+                   candidate["price"], running + index)
+            if best_turret_key is None or key > best_turret_key:
+                best_turret_key = key
+                best_turret = candidate["name"]
+                top_turret_element = entries[index][1]
+        running += len(entries)
+    result["turrets"] = best_turret
+
+    if best_turret is not None:
+        turret_root = top_turret_element
+        if turret_root is None:
+            turret_root = _shared_component_element(
+                shared_roots, "turrets", best_turret)
+        gun_entries = _module_entries(
+            _element_child(turret_root, "guns"),
+            require_shared_scalar=False)
+        costs = _gun_unlock_costs(gun_entries, top_turret_element)
+        result["guns"] = _top_module_name(
+            candidates("guns", gun_entries, costs))
+        if result["guns"] is not None:
+            guns_root = shared_roots.get("guns")
+            if guns_root is not None:
+                result["shells"] = sorted(_gun_shell_references(
+                    guns_root, (result["guns"],)))
+    return result
 
 
 def _manifest_scalar(value):
@@ -2000,6 +2467,13 @@ def _build_member(package_path, entry):
 def _read_optional_source_root(package_path, member):
     """Read one derived sibling only when it exists exactly once."""
     _validate_member(member)
+    game_root = _game_root_from_package_path(package_path)
+    cached = _vehicle_source_cache_get(game_root, member)
+    if cached is not None:
+        try:
+            return packed_xml.read_packed_xml(cached)
+        except (TypeError, ValueError, OverflowError):
+            cached = None
     try:
         with zipfile.ZipFile(package_path, "r") as archive:
             matches = [info for info in archive.infolist()
@@ -2010,7 +2484,10 @@ def _read_optional_source_root(package_path, member):
                 raise VehicleOverlayError(
                     "The original package must contain at most one %s." %
                     member)
-            return packed_xml.read_packed_xml(archive.read(matches[0]))
+            data = archive.read(matches[0])
+            root = packed_xml.read_packed_xml(data)
+            _vehicle_source_cache_put(game_root, member, data)
+            return root
     except VehicleOverlayError:
         raise
     except (IOError, OSError, KeyError, TypeError, ValueError,
@@ -2020,15 +2497,25 @@ def _read_optional_source_root(package_path, member):
             error)
 
 
-def _equal_mode_peer(package_path, member, field_path):
+def _equal_mode_peer(package_path, member, field_path, source_roots=None):
     """Return a travel/Siege peer only for one identical scalar contract."""
     peer = _siege_peer_member(member)
     if peer is None:
         return None
-    peer_root = _read_optional_source_root(package_path, peer)
+    if source_roots is not None and peer in source_roots:
+        peer_root = source_roots[peer]
+    else:
+        peer_root = _read_optional_source_root(package_path, peer)
+        if source_roots is not None:
+            source_roots[peer] = peer_root
     if peer_root is None:
         return None
-    unused_data, source_root = _read_source_member(package_path, member)
+    if source_roots is not None and member in source_roots:
+        source_root = source_roots[member]
+    else:
+        unused_data, source_root = _read_source_member(package_path, member)
+        if source_roots is not None:
+            source_roots[member] = source_root
     try:
         source_rule = _field_rule(member, field_path)
         peer_rule = _field_rule(peer, field_path)
@@ -2048,10 +2535,15 @@ def _equal_mode_peer(package_path, member, field_path):
 
 
 def _merge_saved_edit(entries, package_path, member, field_path,
-                      replacement_value):
+                      replacement_value, source_roots=None):
     """Merge one validated logical scalar edit into an entry dictionary."""
     rule = _field_rule(member, field_path)
-    unused_data, source_root = _read_source_member(package_path, member)
+    if source_roots is not None and member in source_roots:
+        source_root = source_roots[member]
+    else:
+        unused_data, source_root = _read_source_member(package_path, member)
+        if source_roots is not None:
+            source_roots[member] = source_root
     original = _find_value(source_root, field_path)
     _validate_original(original, rule)
     unused_replacement, manifest_value = _parse_replacement(
@@ -2089,14 +2581,15 @@ def _merge_saved_edit(entries, package_path, member, field_path,
     return manifest_value
 
 
-def _expand_equal_mode_edits(entries, package_path):
+def _expand_equal_mode_edits(entries, package_path, source_roots=None):
     """Keep stock-identical travel/Siege scalar leaves synchronized."""
     pending = []
     snapshot = copy.deepcopy(entries)
     for member in sorted(snapshot):
         for edit in snapshot[member]["edits"]:
             field_path = edit["fieldPath"]
-            peer = _equal_mode_peer(package_path, member, field_path)
+            peer = _equal_mode_peer(
+                package_path, member, field_path, source_roots)
             if peer is None:
                 continue
             peer_entry = snapshot.get(peer, {})
@@ -2115,7 +2608,8 @@ def _expand_equal_mode_edits(entries, package_path):
                     peer, field_path, edit["replacementValue"]))
     for member, field_path, replacement in pending:
         _merge_saved_edit(
-            entries, package_path, member, field_path, replacement)
+            entries, package_path, member, field_path, replacement,
+            source_roots)
     return entries
 
 
@@ -3141,25 +3635,48 @@ def list_vehicle_profile_field_choices(game_root, profile_name,
     return result
 
 
-def apply_profile_edit(game_root, profile_name, member, field_path,
-                       replacement_value, is_running=None):
-    """Save one logical edit without leaving modified data in res_mods."""
+def apply_profile_edits(game_root, profile_name, changes, is_running=None):
+    """Atomically save many logical edits, rebuilding only changed members."""
     status, package_path = _require_target(
         game_root, require_closed=True, is_running=is_running)
-
+    changes = list(changes)
+    if not changes:
+        return {"changedFields": 0, "changedMembers": ()}
     store, unused_exists = _load_profile_store(status["path"])
     profile_index = _profile_index(store, profile_name)
     profile = store["profiles"][profile_index]
     entries = copy.deepcopy(_entry_map(_profile_manifest(profile)))
-    manifest_value = _merge_saved_edit(
-        entries, package_path, member, field_path, replacement_value)
-    peer = _equal_mode_peer(package_path, member, field_path)
-    if peer is not None:
-        _merge_saved_edit(
-            entries, package_path, peer, field_path, manifest_value)
-    _expand_equal_mode_edits(entries, package_path)
+    previous_entries = copy.deepcopy(entries)
+    source_roots = {}
+    for change in changes:
+        if not isinstance(change, dict):
+            raise VehicleOverlayError(
+                "Each vehicle profile change must be an object.")
+        try:
+            member = change["member"]
+            field_path = change["fieldPath"]
+            replacement_value = change["replacementValue"]
+        except KeyError as error:
+            raise VehicleOverlayError(
+                "A vehicle profile change is missing %s." % error.args[0])
+        manifest_value = _merge_saved_edit(
+            entries, package_path, member, field_path, replacement_value,
+            source_roots)
+        peer = _equal_mode_peer(
+            package_path, member, field_path, source_roots)
+        if peer is not None:
+            _merge_saved_edit(
+                entries, package_path, peer, field_path, manifest_value,
+                source_roots)
+    _expand_equal_mode_edits(entries, package_path, source_roots)
 
-    for owned_member in sorted(entries):
+    changed_members = sorted(
+        owned_member for owned_member, entry in entries.items()
+        if previous_entries.get(owned_member, {}).get("edits") !=
+        entry.get("edits"))
+    if not changed_members:
+        return {"changedFields": 0, "changedMembers": ()}
+    for owned_member in changed_members:
         output, normalized_edits = _build_member(
             package_path, entries[owned_member])
         entries[owned_member]["edits"] = normalized_edits
@@ -3168,8 +3685,89 @@ def apply_profile_edit(game_root, profile_name, member, field_path,
     profile["members"] = [entries[name] for name in sorted(entries)]
     profile["updatedAt"] = _now()
     _save_profile_store(status["path"], store)
+    return {
+        "changedFields": len(changes),
+        "changedMembers": tuple(changed_members),
+    }
+
+
+def remove_profile_edits(game_root, profile_name, fields, is_running=None):
+    """Atomically remove selected logical edits while retaining all others."""
+    status, package_path = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    fields = list(fields)
+    if not fields:
+        return {"removedFields": 0, "changedMembers": ()}
+    store, unused_exists = _load_profile_store(status["path"])
+    profile = store["profiles"][_profile_index(store, profile_name)]
+    entries = copy.deepcopy(_entry_map(_profile_manifest(profile)))
+    source_roots = {}
+    removed = 0
+    changed_members = set()
+
+    def remove_one(member, field_path):
+        nonlocal removed
+        entry = entries.get(member)
+        if entry is None:
+            return
+        kept = [edit for edit in entry["edits"]
+                if edit["fieldPath"] != field_path]
+        if len(kept) == len(entry["edits"]):
+            return
+        removed += len(entry["edits"]) - len(kept)
+        changed_members.add(member)
+        if kept:
+            entry["edits"] = kept
+        else:
+            entries.pop(member, None)
+
+    for field in fields:
+        if not isinstance(field, dict):
+            raise VehicleOverlayError(
+                "Each removed vehicle profile field must be an object.")
+        try:
+            member = field["member"]
+            field_path = field["fieldPath"]
+        except KeyError as error:
+            raise VehicleOverlayError(
+                "A removed vehicle profile field is missing %s." %
+                error.args[0])
+        rule = _field_rule(member, field_path)
+        if member in source_roots:
+            source_root = source_roots[member]
+        else:
+            unused_data, source_root = _read_source_member(
+                package_path, member)
+            source_roots[member] = source_root
+        original = _find_value(source_root, field_path)
+        _validate_original(original, rule)
+        remove_one(member, field_path)
+        peer = _equal_mode_peer(
+            package_path, member, field_path, source_roots)
+        if peer is not None:
+            remove_one(peer, field_path)
+
+    if not removed:
+        return {"removedFields": 0, "changedMembers": ()}
+    profile["members"] = [entries[name] for name in sorted(entries)]
+    profile["updatedAt"] = _now()
+    _save_profile_store(status["path"], store)
+    return {
+        "removedFields": removed,
+        "changedMembers": tuple(sorted(changed_members)),
+    }
+
+
+def apply_profile_edit(game_root, profile_name, member, field_path,
+                       replacement_value, is_running=None):
+    """Save one logical edit without leaving modified data in res_mods."""
+    apply_profile_edits(game_root, profile_name, ({
+        "member": member,
+        "fieldPath": field_path,
+        "replacementValue": replacement_value,
+    },), is_running=is_running)
     return inspect_profile_field(
-        status["path"], profile["name"], member, field_path)
+        game_root, profile_name, member, field_path)
 
 
 def ensure_original_vehicle_data(game_root, is_running=None):

@@ -1,0 +1,72 @@
+{
+  "schema": 2,
+  "level_styles": {
+    "1": {"name": "Lv1", "color": "blue", "color_cn": "蓝色"},
+    "2": {"name": "Lv2", "color": "purple", "color_cn": "紫色"},
+    "3": {"name": "Lv3", "color": "gold", "color_cn": "金色"}
+  },
+  "categories": {
+    "mobility": {
+      "tag": "机动",
+      "rules": [
+        {"name": "前进速度", "field": "speedLimits/forward", "operation": "add", "value": [10, 20, 30], "maximum": 90, "rounding": "round", "digits": 0},
+        {"name": "倒车速度", "field": "speedLimits/backward", "operation": "add", "value": [10, 20, 30], "maximum": 60, "rounding": "round", "digits": 0},
+        {"name": "发动机功率", "component_categories": ["engines"], "field": "**/power", "operation": "multiply", "value": [1.8, 2.4, 4], "rounding": "round", "digits": 0},
+        {"name": "车体转向速度", "component_categories": ["chassis"], "field": "**/rotationSpeed", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "round", "digits": 0},
+        {"name": "履带地形适应性", "component_categories": ["chassis"], "field": "**/terrainResistance", "operation": "multiply", "value": [0.6, 0.4, 0.01], "minimum": 0.01, "rounding": "truncate", "digits": 2}
+      ]
+    },
+    "firepower": {
+      "tag": "火控",
+      "rules": [
+        {"name": "装填时间", "component_categories": ["guns"], "field": "**/reloadTime", "operation": "multiply", "value": [0.6666666666666666, 0.5, 0.3333333333333333], "minimum": 0.1, "rounding": "truncate", "digits": 2},
+        {"name": "弹夹射速", "component_categories": ["guns"], "field": "**/clip/rate", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "truncate", "digits": 0},
+        {"name": "瞄准时间", "component_categories": ["guns"], "field": "**/aimingTime", "operation": "multiply", "value": [0.6666666666666666, 0.5, 0.3333333333333333], "minimum": 0.05, "rounding": "truncate", "digits": 2},
+        {"name": "火炮精度", "component_categories": ["guns"], "field": "**/shotDispersionRadius", "operation": "multiply", "value": [0.6666666666666666, 0.5, 0.3333333333333333], "minimum": 0.01, "rounding": "truncate", "digits": 2},
+        {"name": "移动与转向扩圈", "component_categories": ["guns"], "field": "**/shotDispersionFactors/*", "operation": "multiply", "value": [0.6666666666666666, 0.5, 0.3333333333333333], "minimum": 0, "rounding": "truncate", "digits": 2},
+        {"name": "炮弹穿深", "component_categories": ["guns"], "field": "**/piercingPower", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "round", "digits": 0},
+        {"name": "炮弹飞行速度", "component_categories": ["guns"], "field": "**/shots/*/speed", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "round", "digits": 0},
+        {"name": "炮塔或火炮转速", "component_categories": ["guns"], "field": "**/rotationSpeed", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "truncate", "digits": 3},
+        {"name": "备弹量", "component_categories": ["guns"], "field": "**/maxAmmo", "operation": "multiply", "value": [2, 3, 4], "rounding": "round", "digits": 0}
+      ]
+    },
+    "gun_depression": {
+      "tag": "俯角",
+      "rules": [
+        {"name": "火炮俯角", "component_categories": ["guns"], "field": "**/pitchLimits/maxPitch", "operation": "add", "value": [5, 10, 15], "maximum": 25, "sequence": "pitch_curve_values", "rounding": "truncate", "digits": 0}
+      ]
+    },
+    "damage": {
+      "tag": "伤害",
+      "rules": [
+        {"name": "炮弹伤害", "component_categories": ["shells"], "field": "*/damage/*", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "round", "digits": 0},
+        {"name": "高爆弹爆炸半径", "component_categories": ["shells"], "field": "*/explosionRadius", "operation": "multiply", "value": [1, 1, 1.2], "rounding": "truncate", "digits": 0}
+      ]
+    },
+    "armor": {
+      "tag": "装甲",
+      "rules": [
+        {"name": "装甲厚度", "field": "**/armor/*", "operation": ["add", "add", "add"], "value": [120, 200, 400], "rounding": "round", "digits": 0}
+      ]
+    },
+    "observation": {
+      "tag": "观察",
+      "rules": [
+        {"name": "观察范围", "field": "**/circularVisionRadius", "operation": "equal", "value": [480, 680, 900], "rounding": "round", "digits": 0}
+      ]
+    },
+    "survivability": {
+      "tag": "生存",
+      "rules": [
+        {"name": "生命值与模块耐久", "field": "**/*Health", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "round", "digits": 0}
+      ]
+    },
+    "concealment": {
+      "tag": "隐蔽",
+      "rules": [
+        {"name": "静止与移动隐蔽", "field": "invisibility/*", "operation": "multiply", "value": [1.5, 2, 3], "rounding": "truncate", "digits": 3, "maximum": 0.999},
+        {"name": "开火后隐蔽", "component_categories": ["guns"], "field": "**/invisibilityFactorAtShot", "operation": "multiply", "value": [1.5, 2, 3], "maximum": 0.999, "rounding": "truncate", "digits": 3}
+      ]
+    }
+  }
+}

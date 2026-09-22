@@ -57,7 +57,16 @@ class VehicleOverlayTest(unittest.TestCase):
     SHELLS = "scripts/item_defs/vehicles/ussr/components/shells.xml"
 
     def setUp(self):
-        environment = mock.patch.dict(os.environ, {"APPDATA": ""})
+        vehicle_overlays._VEHICLE_CATALOG_CACHE.update(
+            key=None, value=None)
+        vehicle_overlays._VEHICLE_FIELD_CACHE.update(
+            package_key=None, values=vehicle_overlays.collections.OrderedDict())
+        self.cache_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache_root, True)
+        environment = mock.patch.dict(os.environ, {
+            "APPDATA": "",
+            vehicle_overlays.TRAINER_USER_ROOT_ENV: self.cache_root,
+        })
         environment.start()
         self.addCleanup(environment.stop)
         self.game = tempfile.mkdtemp()
@@ -844,6 +853,58 @@ class VehicleOverlayTest(unittest.TestCase):
                          explosion_radius["fieldLabel"])
         self.assertEqual(self.SHELLS, explosion_radius["member"])
 
+    def test_vehicle_browser_reuses_unchanged_stock_data_without_sharing_state(
+            self):
+        with mock.patch.object(
+                vehicle_overlays, "_vehicle_roster_from_archive",
+                wraps=vehicle_overlays._vehicle_roster_from_archive) as roster:
+            first_choices = vehicle_overlays.list_vehicle_choices(self.game)
+            vehicle_overlays._VEHICLE_CATALOG_CACHE.update(
+                key=None, value=None)
+            second_choices = vehicle_overlays.list_vehicle_choices(self.game)
+
+        self.assertEqual(1, roster.call_count)
+        first_choices[0]["label"] = "changed by caller"
+        self.assertNotEqual("changed by caller", second_choices[0]["label"])
+
+        with mock.patch.object(
+                vehicle_overlays, "_vehicle_roster_from_archive",
+                wraps=vehicle_overlays._vehicle_roster_from_archive) as roster:
+            first_fields = vehicle_overlays.list_vehicle_field_choices(
+                self.game, self.VEHICLE)
+            vehicle_overlays._VEHICLE_FIELD_CACHE.update(
+                package_key=None,
+                values=vehicle_overlays.collections.OrderedDict())
+            second_fields = vehicle_overlays.list_vehicle_field_choices(
+                self.game, self.VEHICLE)
+
+        self.assertEqual(1, roster.call_count)
+        first_fields[0]["currentValue"] = "changed by caller"
+        self.assertNotIn("currentValue", second_fields[0])
+
+    def test_vehicle_data_cache_uses_the_resolved_trainer_user_root(self):
+        cache_root = os.path.join(self.game, "private-trainer-data")
+        path = vehicle_overlays.vehicle_data_cache_path(
+            self.game, environment={
+                vehicle_overlays.TRAINER_USER_ROOT_ENV: cache_root})
+
+        self.assertEqual(os.path.join(
+            cache_root, vehicle_overlays.VEHICLE_DATA_CACHE_NAME), path)
+
+    def test_source_member_is_exported_once_then_read_from_user_cache(self):
+        package = os.path.join(
+            self.game, *vehicle_overlays.SOURCE_PACKAGE.split("/"))
+        first_data, unused_root = vehicle_overlays._read_source_member(
+            package, self.VEHICLE)
+
+        with mock.patch.object(
+                vehicle_overlays.zipfile, "ZipFile",
+                side_effect=AssertionError("scripts.pkg was reopened")):
+            second_data, unused_root = vehicle_overlays._read_source_member(
+                package, self.VEHICLE)
+
+        self.assertEqual(first_data, second_data)
+
     def test_vehicle_browser_shows_the_stock_name_and_exact_resource_id(self):
         class _Translations(object):
             @staticmethod
@@ -1516,7 +1577,7 @@ class VehicleOverlayTest(unittest.TestCase):
                 self.game, self.GUNS, "shared/Gun-A/reloadTime", "3",
                 is_running=lambda: False)
 
-    def test_changed_original_package_contract_refuses_a_saved_edit(self):
+    def test_changed_package_bytes_do_not_discard_pinned_member_cache(self):
         vehicle_overlays.apply_vehicle_edit(
             self.game, self.VEHICLE, "speedLimits/forward", "40",
             is_running=lambda: False)
@@ -1526,11 +1587,12 @@ class VehicleOverlayTest(unittest.TestCase):
         self.members[self.VEHICLE] = packed.write_packed_xml(root)
         self._write_package()
 
-        with self.assertRaisesRegex(
-                vehicle_overlays.VehicleOverlayError, "original scripts.pkg"):
-            vehicle_overlays.apply_vehicle_edit(
-                self.game, self.VEHICLE, "speedLimits/backward", "12",
-                is_running=lambda: False)
+        # The supported client build is immutable. A timestamp or container
+        # rewrite must not invalidate sourceMember bytes imported earlier.
+        result = vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE, "speedLimits/backward", "12",
+            is_running=lambda: False)
+        self.assertEqual("12", result["currentValue"])
 
     def test_named_profile_edits_stay_out_of_res_mods_until_activation(self):
         vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")
@@ -1546,6 +1608,72 @@ class VehicleOverlayTest(unittest.TestCase):
             vehicle_overlays.manifest_path(self.game)))
         self.assertTrue(os.path.isfile(
             vehicle_overlays.profile_store_path(self.game)))
+
+    def test_profile_batch_rebuilds_one_changed_member_and_saves_once(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Batch MS-1")
+        changes = [
+            {"member": self.VEHICLE,
+             "fieldPath": "speedLimits/forward", "replacementValue": "40"},
+            {"member": self.VEHICLE,
+             "fieldPath": "speedLimits/backward", "replacementValue": "12"},
+        ]
+
+        with mock.patch.object(
+                vehicle_overlays, "_build_member",
+                wraps=vehicle_overlays._build_member) as build, \
+                mock.patch.object(
+                    vehicle_overlays, "_read_source_member",
+                    wraps=vehicle_overlays._read_source_member) as source, \
+                mock.patch.object(
+                    vehicle_overlays, "_save_profile_store",
+                    wraps=vehicle_overlays._save_profile_store) as save:
+            result = vehicle_overlays.apply_profile_edits(
+                self.game, "Batch MS-1", changes,
+                is_running=lambda: False)
+
+        self.assertEqual(2, result["changedFields"])
+        self.assertEqual((self.VEHICLE,), result["changedMembers"])
+        self.assertEqual(1, build.call_count)
+        self.assertEqual(2, source.call_count)
+        self.assertEqual(1, save.call_count)
+        current = vehicle_overlays.list_vehicle_profile_field_choices(
+            self.game, "Batch MS-1", self.VEHICLE)
+        values = dict((record["fieldPath"], record["currentValue"])
+                      for record in current if record["member"] == self.VEHICLE)
+        self.assertEqual("40", values["speedLimits/forward"])
+        self.assertEqual("12", values["speedLimits/backward"])
+
+    def test_profile_can_remove_selected_fields_without_touching_other_edits(
+            self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Selective")
+        vehicle_overlays.apply_profile_edits(
+            self.game, "Selective", [
+                {"member": self.VEHICLE,
+                 "fieldPath": "speedLimits/forward",
+                 "replacementValue": "40"},
+                {"member": self.GUNS,
+                 "fieldPath": "shared/Gun-A/reloadTime",
+                 "replacementValue": "2.5"},
+            ], is_running=lambda: False)
+
+        with mock.patch.object(
+                vehicle_overlays, "_save_profile_store",
+                wraps=vehicle_overlays._save_profile_store) as save:
+            result = vehicle_overlays.remove_profile_edits(
+                self.game, "Selective", [{
+                    "member": self.VEHICLE,
+                    "fieldPath": "speedLimits/forward",
+                }], is_running=lambda: False)
+
+        self.assertEqual(1, result["removedFields"])
+        self.assertEqual(1, save.call_count)
+        speed = vehicle_overlays.inspect_profile_field(
+            self.game, "Selective", self.VEHICLE, "speedLimits/forward")
+        reload_time = vehicle_overlays.inspect_profile_field(
+            self.game, "Selective", self.GUNS,
+            "shared/Gun-A/reloadTime")
+        self.assertEqual("32", speed["currentValue"])
+        self.assertEqual("2.5", reload_time["currentValue"])
 
     def test_profile_field_choices_include_all_current_values_in_one_snapshot(self):
         vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")

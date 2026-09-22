@@ -114,6 +114,214 @@ class RowTest(unittest.TestCase):
         self.assertIn('[ ]', line)
 
 
+class EnhancementRowTest(unittest.TestCase):
+
+    def setUp(self):
+        self.choice = {
+            'nation': 'ussr', 'vehicle': 'R04_T-34',
+            'member': 'scripts/item_defs/vehicles/ussr/R04_T-34.xml',
+            'tags': ('mediumTank',), 'vehicleClass': 'mediumTank',
+            'level': 5, 'label': 'T-34',
+        }
+
+    def test_complete_roster_rows_use_single_choice_filters(self):
+        row = tui.enhancement_rows([self.choice])[0]
+        filters = {'nations': {'ussr'}, 'tiers': {5},
+                   'classes': {'mediumTank'}, 'text': ''}
+        self.assertTrue(tui.enhancement_row_matches(row, filters, 't-34'))
+        filters['tiers'] = {10}
+        self.assertFalse(tui.enhancement_row_matches(row, filters, ''))
+
+    def test_custom_tag_is_rendered_as_lv_s(self):
+        text = tui._colored_tags([{
+            'tag': '火力', 'level': 'custom', 'exact': False,
+        }], {'level_styles': {}})
+        self.assertEqual(tui.GREEN + '[火力 Lv.S]' + tui.RESET, text)
+
+    def test_picker_only_evaluates_the_highlighted_vehicle(self):
+        choices = []
+        for index in range(10):
+            choice = dict(self.choice)
+            choice['vehicle'] = 'Tank%d' % index
+            choice['member'] = 'vehicles/Tank%d.xml' % index
+            choice['label'] = 'Tank %d' % index
+            choices.append(choice)
+        tag_index = mock.Mock()
+        tag_index.tags.return_value = []
+        tag_index.cached_tags.return_value = []
+        filters = {'nations': set(), 'tiers': set(),
+                   'classes': set(), 'text': ''}
+        with mock.patch.object(tui, 'read_key', return_value='esc'), \
+                mock.patch.object(tui, 'draw'), \
+                mock.patch.object(tui, 'terminal_size', return_value=(120, 30)):
+            tui.enhancement_vehicle_picker(
+                tui.enhancement_rows(choices), filters, tag_index,
+                {'level_styles': {}})
+        self.assertEqual(1, tag_index.tags.call_count)
+        self.assertEqual(9, tag_index.cached_tags.call_count)
+
+    def test_entering_enhancement_only_prunes_and_never_preloads(self):
+        tag_index = mock.Mock()
+        rows = tui.enhancement_rows([self.choice])
+        tui._prepare_tag_cache(tag_index, rows)
+        tag_index.prune_vehicles.assert_called_once_with([self.choice])
+        tag_index.preload.assert_not_called()
+        tag_index.stale_vehicles.assert_not_called()
+
+
+class VehicleEditSessionTest(unittest.TestCase):
+
+    def setUp(self):
+        self.presets = {
+            'level_styles': {
+                '1': {'name': 'Lv1', 'color_cn': '蓝色'},
+                '2': {'name': 'Lv2', 'color_cn': '紫色'},
+                '3': {'name': 'Lv3', 'color_cn': '金色'},
+            },
+            'categories': {
+                'mobility': {'tag': '机动'},
+                'armor': {'tag': '装甲'},
+            },
+        }
+        self.vehicle = {
+            'member': 'vehicles/Tank.xml', 'vehicle': 'Tank', 'label': 'Tank',
+            'nation': 'ussr'}
+        self.plan = {
+            'profile': 'SPG', 'vehicle': self.vehicle,
+            'presetCategory': 'mobility,armor', 'presetLevel': 'combined',
+            'selections': [
+                {'category': 'mobility', 'level': '1'},
+                {'category': 'armor', 'level': '2'},
+            ],
+            'changes': [{
+                'fieldPath': 'x', 'label': 'Field',
+                'currentValue': '1', 'replacementValue': '2',
+            }],
+            'affectedVehicles': [],
+        }
+
+    def test_current_levels_are_shown_on_every_category_with_colors(self):
+        captured = {}
+
+        def choose(title, items, subtitle=''):
+            captured['items'] = dict(items)
+            captured['subtitle'] = subtitle
+            return 'q'
+
+        tags = [{
+            'category': 'mobility', 'tag': '机动',
+            'level': '2', 'exact': True,
+        }]
+        with mock.patch.object(tui, 'menu', side_effect=choose):
+            result = tui.vehicle_edit_session(
+                'game', 'SPG', self.vehicle, self.presets, tags)
+
+        self.assertFalse(result)
+        self.assertIn(tui.PURPLE + 'Lv2' + tui.RESET,
+                      captured['items']['mobility'])
+        self.assertIn('[未套用]', captured['items']['armor'])
+        self.assertIn('当前已套用', captured['subtitle'])
+        self.assertIn(tui.PURPLE + 'Lv2' + tui.RESET,
+                      captured['subtitle'])
+
+    def test_level_labels_use_configured_terminal_colors(self):
+        self.assertEqual(tui.BLUE + 'Lv1' + tui.RESET,
+                         tui._level_label('1', self.presets))
+        self.assertEqual(tui.PURPLE + 'Lv2' + tui.RESET,
+                         tui._level_label('2', self.presets))
+        self.assertEqual(tui.GOLD + 'Lv3' + tui.RESET,
+                         tui._level_label('3', self.presets))
+        self.assertEqual(tui.GREEN + 'Lv.S' + tui.RESET,
+                         tui._level_label('S', self.presets))
+
+    def test_details_escape_returns_to_editor_without_discarding(self):
+        with mock.patch.object(
+                tui, 'menu', side_effect=['mobility', '1', 'details', 'q']), \
+                mock.patch.object(
+                    tui, '_build_combined_vehicle_plan', return_value=self.plan), \
+                mock.patch.object(tui, 'text_view') as viewed:
+            result = tui.vehicle_edit_session(
+                'game', 'SPG', self.vehicle, self.presets)
+        self.assertFalse(result)
+        self.assertTrue(any('方案细则' in call.args[0]
+                            for call in viewed.call_args_list))
+
+    def test_multiple_categories_are_applied_once(self):
+        with mock.patch.object(
+                tui, 'menu', side_effect=[
+                    'mobility', '1', 'armor', '2', 'apply', 'a']), \
+                mock.patch.object(
+                    tui, '_build_combined_vehicle_plan', return_value=self.plan), \
+                mock.patch.object(tui, 'text_view'), \
+                mock.patch.object(
+                    tui.vehicle_modifications, 'apply_plan',
+                    return_value='backup') as applied:
+            result = tui.vehicle_edit_session(
+                'game', 'SPG', self.vehicle, self.presets)
+        self.assertTrue(result)
+        applied.assert_called_once_with(
+            tui.vehicle_overlays, 'game', self.plan)
+
+    def test_shared_modules_are_individually_kept_or_removed(self):
+        plan = dict(self.plan)
+        plan['action'] = 'remove'
+        plan['vehicle'] = dict(self.vehicle)
+        plan['changes'] = [
+            {'member': 'vehicle.xml', 'fieldPath': 'speedLimits/forward',
+             'label': 'Forward', 'shared': False,
+             'affectedVehicles': ('Tank',), 'nation': 'ussr'},
+            {'member': 'engines.xml', 'fieldPath': 'shared/E1/power',
+             'label': 'Power', 'shared': True, 'component': 'E1',
+             'affectedVehicles': ('Tank', 'Tank2'), 'nation': 'ussr'},
+            {'member': 'guns.xml', 'fieldPath': 'shared/G1/reloadTime',
+             'label': 'Reload', 'shared': True, 'component': 'G1',
+             'affectedVehicles': ('Tank', 'Tank3'), 'nation': 'ussr'},
+        ]
+
+        with mock.patch.object(
+                tui, 'menu', side_effect=['keep', 'remove']):
+            selected = tui._choose_category_removals(plan)
+
+        self.assertEqual(
+            ['speedLimits/forward', 'shared/G1/reloadTime'],
+            [change['fieldPath'] for change in selected['changes']])
+        self.assertEqual(
+            ['ussr:Tank', 'ussr:Tank3'], selected['affectedVehicles'])
+
+    def test_existing_category_can_be_removed_from_the_edit_session(self):
+        removal = dict(self.plan)
+        removal.update({
+            'action': 'remove', 'presetCategory': 'mobility',
+            'presetLevel': 'off',
+            'selections': [{'category': 'mobility', 'level': 'off'}],
+        })
+        removal['changes'] = [{
+            'member': 'vehicle.xml', 'fieldPath': 'speedLimits/forward',
+            'label': 'Forward', 'currentValue': '60',
+            'replacementValue': '40', 'shared': False,
+            'affectedVehicles': ('Tank',), 'nation': 'ussr',
+        }]
+        with mock.patch.object(
+                tui, 'menu', side_effect=['mobility', 'remove', 'a']), \
+                mock.patch.object(
+                    tui.vehicle_overlays,
+                    'list_vehicle_profile_field_choices', return_value=[]), \
+                mock.patch.object(
+                    tui.vehicle_modifications, 'plan_category_removal',
+                    return_value=removal), \
+                mock.patch.object(tui, 'text_view'), \
+                mock.patch.object(
+                    tui.vehicle_modifications, 'apply_plan',
+                    return_value='backup') as applied:
+            result = tui.vehicle_edit_session(
+                'game', 'SPG', self.vehicle, self.presets)
+
+        self.assertEqual('remove', result['action'])
+        self.assertEqual(['ussr:Tank'], result['affectedVehicles'])
+        applied.assert_called_once_with(
+            tui.vehicle_overlays, 'game', result)
+
+
 class ScriptedFlowTest(unittest.TestCase):
     """Drive the screens with a scripted key sequence, no real console."""
 
@@ -265,7 +473,7 @@ class ScriptedFlowTest(unittest.TestCase):
                 # 进车组管理看计数 → q 返回 → 菜单3 选存档 → ↓ 选第二个 → Enter
                 # → 再进车组管理看计数 → q 返回 → q 退出
                 result, screen = self._run_main(
-                    ['1', 'q', '3', 'down', 'enter', '1', 'q', 'q'], paths[0])
+                    ['1', 'q', '4', 'down', 'enter', '1', 'q', 'q'], paths[0])
         finally:
             for path in paths:
                 os.unlink(path)
@@ -275,6 +483,23 @@ class ScriptedFlowTest(unittest.TestCase):
         self.assertIn('已选 1, 可选 1', screen)
         self.assertIn('已选 0, 可选 0', screen)
         self.assertIn('存档: Career-Mode', screen)
+
+    def test_vehicle_enhancement_entry_is_wired(self):
+        import tempfile
+        state = make_state(NO_SKILL_BLOB)
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.json', delete=False) as stream:
+            json.dump(state, stream)
+            path = stream.name
+        try:
+            with mock.patch.object(
+                    tui, 'vehicle_enhancement_menu', return_value='SPG') as opened:
+                result, screen = self._run_main(['3', 'q'], path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(0, result)
+        opened.assert_called_once_with(tui.DEFAULT_CLIENT_DIR, None)
+        self.assertIn('车辆强化', screen)
 
     def _unlink_with_backups(self, path):
         import glob as glob_module
