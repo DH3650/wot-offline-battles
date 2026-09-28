@@ -37,6 +37,7 @@ from trainer.skills_db import (
 from trainer.tankman_codec import TankmanFormatError, parse_tankman
 from trainer.vehicle_db import (
     CLASS_NAMES_CN, NATION_NAMES_CN, VEHICLE_CLASS_TAGS)
+from trainer import gun_marks
 from trainer import vehicle_modifications
 from launcher import vehicle_overlays
 
@@ -1469,6 +1470,117 @@ def artefact_picker(rows, selected):
             index = top = 0
 
 
+def gun_marks_row_matches(state, text):
+    """Incremental-search predicate for the single-vehicle marks picker."""
+    if not text:
+        return True
+    wanted = text.lower()
+    info = state['info']
+    return any(wanted in value.lower() for value in (
+        info.name, info.key, state['typeName']))
+
+
+def format_gun_marks_row(state, width):
+    info = state['info']
+    nation = NATION_NAMES_CN.get(info.nation, info.nation)
+    clazz = CLASS_NAMES_CN.get(info.clazz, info.clazz)
+    return _fit(
+        ' %-3s %2d级 %-5s %-18s  场均 %5d  %d环  %d场' % (
+            nation, info.tier, clazz, info.name,
+            state['movingAvgDamage'], state['marksOnGun'], state['battles']),
+        width)
+
+
+def gun_marks_vehicle_picker(states):
+    """Searchable, single-choice list of eligible owned vehicles."""
+    index = top = 0
+    text = ''
+    while True:
+        visible = [state for state in states
+                   if gun_marks_row_matches(state, text)]
+        index = max(0, min(index, len(visible) - 1))
+        width, height = terminal_size()
+        body = max(1, height - 6)
+        if index < top:
+            top = index
+        elif index >= top + body:
+            top = index - body + 1
+        lines = [BOLD + '伤害标记计算器 — 选择车辆 (%d / %d)' % (
+            len(visible), len(states)) + RESET]
+        lines.append(DIM + '搜索: %s' % (text or '(直接输入车辆名称)') + RESET)
+        lines.append('')
+        for offset, state in enumerate(visible[top:top + body]):
+            actual = top + offset
+            line = format_gun_marks_row(state, width - 2)
+            lines.append((REVERSE if actual == index else '') + line +
+                         (RESET if actual == index else ''))
+        if not visible:
+            lines.append('  没有匹配车辆')
+        lines.append('')
+        lines.append(DIM +
+                     '↑↓/PgUp/PgDn 移动  Enter 选择  / 清空搜索  Esc 返回' +
+                     RESET)
+        draw(lines)
+        pressed = read_key()
+        if pressed == 'up':
+            index -= 1
+        elif pressed == 'down':
+            index += 1
+        elif pressed == 'pageup':
+            index -= body
+        elif pressed == 'pagedown':
+            index += body
+        elif pressed == 'home':
+            index = 0
+        elif pressed == 'end':
+            index = len(visible) - 1
+        elif pressed == 'enter' and visible:
+            return visible[index]
+        elif pressed == 'esc':
+            return None
+        elif pressed == '/':
+            text = ''
+            index = top = 0
+        elif pressed == 'backspace':
+            text = text[:-1]
+            index = top = 0
+        elif len(pressed) == 1 and pressed.isprintable():
+            text += pressed
+            index = top = 0
+
+
+def gun_marks_menu(state, vehicles, garage_path):
+    """Read the current save and display a repeatable marks projection."""
+    planned_damage = 3000
+    while True:
+        try:
+            progress = gun_marks.load_progress(
+                gun_marks.postbattle_path(garage_path))
+            states = gun_marks.vehicle_states(
+                vehicles, progress,
+                owned_type_cds=state.get('vehicles', {}).keys())
+        except gun_marks.GunMarksError as error:
+            text_view('伤害标记计算器 — 错误', str(error))
+            return
+        if not states:
+            text_view(
+                '伤害标记计算器',
+                '当前车库没有可计算伤害标记的 V–X 级车辆。')
+            return
+        selected = gun_marks_vehicle_picker(states)
+        if selected is None:
+            return
+        entered = number_input(
+            '预计以后每场综合伤害（直接伤害 + 最大一项协助）',
+            planned_damage, maximum=99999)
+        if entered is None:
+            continue
+        planned_damage = entered
+        result = gun_marks.projection(selected, planned_damage)
+        text_view('伤害标记计算结果',
+                  gun_marks.report_text(selected, result))
+
+
 def number_input(title, current, maximum=9999):
     """数字输入框: Enter 确认 (空输入保持 current), Esc 取消。"""
     buffer = ''
@@ -1490,7 +1602,8 @@ def number_input(title, current, maximum=9999):
             return None
         if pressed == 'backspace':
             buffer = buffer[:-1]
-        elif len(pressed) == 1 and pressed.isdigit() and len(buffer) < 4:
+        elif (len(pressed) == 1 and pressed.isdigit() and
+              len(buffer) < len(str(maximum))):
             buffer += pressed
 
 
@@ -1653,6 +1766,7 @@ def main(argv=None):
                 ('3', '车辆强化  分类挡位 / 自定义倍率'),
                 ('4', '选择存档 (当前: %s)' % (slot or '(自定义路径)')),
                 ('5', '恢复存档备份'),
+                ('6', '伤害标记计算器  当前场均 / 下一环 / 预计所需场次'),
                 ('q', '退出'),
             ], subtitle='存档: %s\n%s\n车辆属性方案跨存档共享' % (
                 slot or '(自定义路径)', garage_path))
@@ -1681,6 +1795,8 @@ def main(argv=None):
             elif choice == '5':
                 backup_menu(garage_path)
                 state = _load_state(garage_path)
+            elif choice == '6':
+                gun_marks_menu(state, vehicles, garage_path)
 
 
 if __name__ == '__main__':

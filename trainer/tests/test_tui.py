@@ -501,6 +501,24 @@ class ScriptedFlowTest(unittest.TestCase):
         opened.assert_called_once_with(tui.DEFAULT_CLIENT_DIR, None)
         self.assertIn('车辆强化', screen)
 
+    def test_gun_marks_entry_is_wired(self):
+        import tempfile
+        state = make_state(NO_SKILL_BLOB)
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.json', delete=False) as stream:
+            json.dump(state, stream)
+            path = stream.name
+        try:
+            with mock.patch.object(tui, 'gun_marks_menu') as opened:
+                result, screen = self._run_main(['6', 'q'], path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(0, result)
+        opened.assert_called_once()
+        self.assertEqual(state, opened.call_args.args[0])
+        self.assertEqual(path, opened.call_args.args[2])
+        self.assertIn('伤害标记计算器', screen)
+
     def _unlink_with_backups(self, path):
         import glob as glob_module
         for candidate in [path] + glob_module.glob(
