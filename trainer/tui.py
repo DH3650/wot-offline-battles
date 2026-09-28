@@ -37,6 +37,7 @@ from trainer.skills_db import (
 from trainer.tankman_codec import TankmanFormatError, parse_tankman
 from trainer.vehicle_db import (
     CLASS_NAMES_CN, NATION_NAMES_CN, VEHICLE_CLASS_TAGS)
+from trainer import garage_fix
 from trainer import gun_marks
 from trainer import vehicle_modifications
 from launcher import vehicle_overlays
@@ -1233,6 +1234,83 @@ def backup_menu(garage_path):
         os.path.basename(source), garage_path))
 
 
+def ammo_fix_menu(state, vehicles, garage_path):
+    """修整装弹: 按目标方案的载弹上限修剪超量车辆, 使存档通过校验。"""
+    from trainer.ammo_db import DEFAULT_AMMO_DB, ensure_ammo_db
+    try:
+        ammo_db = ensure_ammo_db(DEFAULT_AMMO_DB, DEFAULT_CLIENT_DIR)
+    except Exception as error:
+        text_view('错误', '无法构建载弹数据库:\n%s' % error)
+        return
+    try:
+        profiles_path = vehicle_overlays.profile_store_path(
+            DEFAULT_CLIENT_DIR)
+    except Exception:
+        profiles_path = None
+    profile_name, profile_label = _pick_target_profile(profiles_path)
+    if profile_name is None and profile_label is None:
+        return  # 用户放弃
+    if profile_name == 'STOCK':
+        profile_caps = {}
+    elif profile_name == 'ANY':
+        profile_caps = garage_fix.load_profile_caps(
+            profiles_path, vehicles, ammo_db, None)
+    else:
+        profile_caps = garage_fix.load_profile_caps(
+            profiles_path, vehicles, ammo_db, profile_name)
+    changes, skipped_unknown = garage_fix.plan_ammo_fix(
+        state, ammo_db.get('capacities'), profile_caps)
+    if not changes:
+        text_view('修整装弹', '按「%s」, 所有车辆的载弹都在上限之内, '
+                  '存档可通过校验, 无需修复。' % profile_label)
+        return
+    text = garage_fix.fix_report(changes, vehicles, skipped_unknown)
+    text_view('按「%s」以下车辆的载弹超过上限 (dry-run)' % profile_label,
+              text)
+    if not confirm('将 %d 辆车的载弹修剪到「%s」的上限, 确认写入存档?'
+                   % (len(changes), profile_label)):
+        text_view('已取消', '未做任何修改。')
+        return
+    running = client_running()
+    if running:
+        text_view('错误', '客户端正在运行 (%s), 请先关闭游戏再写入。'
+                  % ', '.join(running))
+        return
+    fixed = garage_fix.apply_ammo_fix(state, changes)
+    backup = write_garage(garage_path, state)
+    text_view('完成', '已按「%s」修剪 %d 辆车的载弹。\n备份: %s\n\n'
+              '弹药补给偏好 (shellsLayout) 未改动, 切回提高载弹的方案后\n'
+              '自动补给仍会按原数量购买。请启动客户端进车库确认。' % (
+                  profile_label, fixed, os.path.basename(backup)))
+
+
+def _pick_target_profile(profiles_path):
+    """(name, label) for the profile the user is about to launch.
+
+    Returns a sentinel ``name`` plus a human ``label``: ``'STOCK'`` for the
+    unmodified client, ``'ANY'`` for the conservative all-profile minimum,
+    or the actual profile name.  ``(None, None)`` means the user cancelled.
+    """
+    names = garage_fix.list_profiles(profiles_path) if profiles_path else []
+    items = [('1', '原始车辆数值 (不套用任何方案)')]
+    for index, name in enumerate(names, 2):
+        items.append((str(index), '方案: %s' % name))
+    if names:
+        items.append(('a', '任意方案 (按各方案下限, 最保守)'))
+    choice = menu('修整装弹 — 选择将要启动的方案', items,
+                  subtitle='载弹将按该方案的载弹上限判断 (q 返回)')
+    if choice in (None, 'q'):
+        return None, None
+    if choice == 'a':
+        return 'ANY', '任意方案下限'
+    if choice == '1':
+        return 'STOCK', '原始车辆数值'
+    index = int(choice) - 2
+    if 0 <= index < len(names):
+        return names[index], '方案 %s' % names[index]
+    return None, None
+
+
 # ---- main flow --------------------------------------------------------------
 
 def build_report(state, vehicles, templates, selected_keys, overwrite=False):
@@ -1767,6 +1845,7 @@ def main(argv=None):
                 ('4', '选择存档 (当前: %s)' % (slot or '(自定义路径)')),
                 ('5', '恢复存档备份'),
                 ('6', '伤害标记计算器  当前场均 / 下一环 / 预计所需场次'),
+                ('7', '修整装弹  切换车辆方案后使存档通过校验'),
                 ('q', '退出'),
             ], subtitle='存档: %s\n%s\n车辆属性方案跨存档共享' % (
                 slot or '(自定义路径)', garage_path))
@@ -1797,6 +1876,8 @@ def main(argv=None):
                 state = _load_state(garage_path)
             elif choice == '6':
                 gun_marks_menu(state, vehicles, garage_path)
+            elif choice == '7':
+                ammo_fix_menu(state, vehicles, garage_path)
 
 
 if __name__ == '__main__':

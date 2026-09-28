@@ -4,10 +4,13 @@
 
 - **车组管理**：把存档中**尚未学任何技能**的乘员，按其角色的预设模板设置为 7 个生效技能（100%）+ 1 个在练技能（0%）。
 - **库存管理**：查看并设定配件（输弹机、高级输弹机等 optional devices）的账户级库存数量（默认 200）。
+- **修整装弹**：车辆方案可提高主炮 `maxAmmo`，在该方案下打过的车会把超量弹药写进存档；切到其它方案后客户端校验「已装弹药 > 炮的载弹上限」，超过 8 辆违规时**整档被拒收**（成员技能、涂装、改装全部回出厂，文件被隔离为 `garage_state.rejected-*`）。本功能先让你选择**将要启动的方案**，再把超上限车辆的 `shells` 修剪到该方案的载弹上限。`shellsLayout`（自动补给偏好）不改动，切回高载弹方案后仍按原数量补弹。
 
 - 存档： `%APPDATA%\Wargaming.net\WorldOfTanks\offline_lan_0922\saves\<存档>\garage_state.json`（默认编辑 `default` 存档）
-- 客户端数据： `C:\games\wot_0.9.22_cn`（车辆库/配件目录/技能名静态提取，首次运行生成 `vehicle_db.json` / `artefact_db.json` 缓存）
+- 客户端数据： `C:\games\wot_0.9.22_cn`（车辆库/配件目录/技能名/载弹上限静态提取，首次运行生成 `vehicle_db.json` / `artefact_db.json` / `ammo_db.json` 缓存）
 - 已学技能的乘员一律跳过，不影响同车其他乘员。
+- 乘员技能与涂装保存在存档槽的 `garage_state.json` 中每辆车的 `crew` / `outfits` 字段，按车辆 typeCD 存储；车辆属性方案（`vehicle_profiles.json`）不包含乘员和涂装，切换方案不会搬运它们。
+- **切换车辆方案的标准流程**：在启动器切换方案 → 运行 trainer 主菜单 7「修整装弹」→ 选择你将要启动的方案（例如 France）→ 预览确认 → 再进游戏。只要存档通过校验，成员技能和涂装在方案之间天然保留，无需其它操作。
 
 ## 用法
 
@@ -107,6 +110,8 @@ python -m trainer.apply_crew_templates --apply --overwrite
 | `artefact_db.py` | 从 `scripts.pkg` 提取配件目录（optional devices，含中文名/单价，缓存 `artefact_db.json`） |
 | `inventory_stock.py` | 配件库存读写（`owned['9']`）与按类别分组的库存表格 |
 | `apply_crew_templates.py` | CLI 主程序：筛选 → 跳过策略 → 写入 |
+| `ammo_db.py` | 从 `scripts.pkg` 提取每辆车 (炮塔, 主炮) → 载弹上限（缓存 `ammo_db.json`，按客户端版本号失效） |
+| `garage_fix.py` | 载弹修剪：按目标车辆方案使存档通过客户端校验 |
 | `tui.py` | 全屏菜单界面（ANSI + msvcrt，纯标准库），复用 CLI 的全部逻辑 |
 | `tests/` | `python -m unittest discover -s trainer.tests -t .` |
 
