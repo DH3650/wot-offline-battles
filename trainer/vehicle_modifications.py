@@ -376,7 +376,7 @@ def plan_custom_vehicle(service, game_root, profile_name, vehicle, presets,
         formatting_matches = [rule for rule in _category_rules(
             presets, category) if rule_matches(field, rule)]
         if len(formatting_matches) == 1:
-            for key in ('rounding', 'digits', 'round'):
+            for key in ('rounding', 'digits', 'round', 'minimum', 'maximum'):
                 if key in formatting_matches[0]:
                     custom_rule[key] = formatting_matches[0][key]
         if field['fieldPath'].endswith('/pitchLimits/maxPitch'):
