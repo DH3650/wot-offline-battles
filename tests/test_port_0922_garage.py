@@ -2515,6 +2515,52 @@ class GarageSaveDurabilityTests(unittest.TestCase):
                 self.assertEqual(raw, stream.read())
             self.assertTrue(self._variants('rejected'))
 
+    def test_schema_8_updates_legacy_fields_without_overwriting_extensions(self):
+        unused_store, snapshot = self._save_career()
+        saved = self._saved()
+        vehicle_key = '50001'
+        saved['schema'] = 8
+        saved['futureRoot'] = {'owner': 'fork'}
+        saved['ledger']['wallet']['crystal'] = 27
+        saved['ledger']['premiumExpiryTime'] = 1900000000
+        saved['ledger']['personalMissions'] = {'regular': [1, 16]}
+        saved['vehicles'][vehicle_key][
+            'personalMissionVehicleSource'] = 'reward:15'
+        saved['battleCrewReceipts'] = [{
+            'receipt_id': 'fork-receipt',
+            'vehicle_id': 9,
+            'accelerated': False,
+            'income': {'premium': True},
+        }]
+        with open(self.path, 'w') as stream:
+            json.dump(saved, stream)
+
+        fresh = self._career_snapshot()
+        store = self._store()
+        self.assertTrue(store.apply(fresh))
+        self.assertNotIn('crystal', fresh['wallet'])
+        self.assertNotIn('premiumExpiryTime', fresh)
+        self.assertNotIn(
+            'personalMissionVehicleSource', fresh['vehicles'][0])
+
+        fresh['wallet']['credits'] = 249999
+        store.mark_dirty()
+        self.assertTrue(store.flush(fresh))
+
+        updated = self._saved()
+        self.assertEqual(8, updated['schema'])
+        self.assertEqual(249999, updated['ledger']['wallet']['credits'])
+        self.assertEqual(27, updated['ledger']['wallet']['crystal'])
+        self.assertEqual(1900000000,
+                         updated['ledger']['premiumExpiryTime'])
+        self.assertEqual({'regular': [1, 16]},
+                         updated['ledger']['personalMissions'])
+        self.assertEqual('reward:15', updated['vehicles'][vehicle_key][
+            'personalMissionVehicleSource'])
+        self.assertEqual({'premium': True},
+                         updated['battleCrewReceipts'][0]['income'])
+        self.assertEqual({'owner': 'fork'}, updated['futureRoot'])
+
     def _variants(self, marker):
         return sorted(
             name for name in os.listdir(self.directory)

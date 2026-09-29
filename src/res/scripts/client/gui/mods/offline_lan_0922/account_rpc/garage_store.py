@@ -23,7 +23,7 @@ import os
 import sys
 
 from gui.mods.offline_lan_0922 import config as port_config
-from gui.mods.offline_lan_0922.account_rpc import data, economy
+from gui.mods.offline_lan_0922.account_rpc import data, economy, save_adapter
 from gui.mods.offline_lan_0922.account_rpc.garage import (
     STOCKED_ITEM_TYPES, mirror_shells_layout)
 
@@ -44,8 +44,10 @@ except NameError:
 # researched items, the per-vehicle experience and which vehicles are owned.
 # Schema 7 preserves module stock as well as consumables and the actual award
 # needed to replay a settlement after the post-battle file failed to commit.
+# Schema 8 belongs to the downstream fork.  This build reads its legacy
+# projection and SaveDocumentAdapter keeps every extension it does not own.
 SCHEMA = 7
-READABLE_SCHEMAS = (3, 4, 5, 6, SCHEMA)
+READABLE_SCHEMAS = (3, 4, 5, 6, SCHEMA, 8)
 STATE_FILE_NAME = 'garage_state.json'
 
 # ``repair`` is (outstanding cost, remaining health): a vehicle a battle left
@@ -377,6 +379,7 @@ class GarageStore(object):
         # so this session may not write the file back at any price.
         self._vehicles_unrestored = False
         self._refusals_logged = set()
+        self._save_adapter = save_adapter.SaveDocumentAdapter()
 
     # ---- writing --------------------------------------------------------
 
@@ -439,11 +442,13 @@ class GarageStore(object):
         if not self._rotated:
             port_config.rotate_state_backup(self._path)
             self._rotated = True
+        write_payload = self._save_adapter.merge(payload)
         try:
-            port_config.write_json(self._path, payload)
+            port_config.write_json(self._path, write_payload)
         except (IOError, OSError) as error:
             _log('the garage state could not be saved: %s' % error)
             return False
+        self._save_adapter.commit(write_payload, payload)
         self._remember_saved(payload)
         return True
 
@@ -894,6 +899,10 @@ class GarageStore(object):
         self._battle_receipts = self._validated_battle_receipts(
             stored.get('battleCrewReceipts'))
         self._receipts_loaded = True
+        # Legacy schemas still use their existing whole-document migration.
+        # The adapter is only needed when this build is the older writer.
+        if stored.get('schema') > SCHEMA:
+            self._save_adapter.capture(stored, self._payload(snapshot))
         if ledger_only or skipped:
             self._restore_degraded = True
             self._vehicles_unrestored = bool(ledger_only)

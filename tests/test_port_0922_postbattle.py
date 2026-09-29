@@ -481,6 +481,40 @@ class PostBattleContractTests(unittest.TestCase):
             self.assertTrue(restarted.acknowledge(receipt['arena_unique_id']))
             self.assertFalse(restarted.accept(receipt))
 
+    def test_legacy_write_preserves_extended_postbattle_fields(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'postbattle_state.json')
+            store = postbattle_store.PostBattleStore(path=path)
+            first = _receipt(store.account_key)
+            self.assertTrue(store.accept(first))
+            saved = json.loads(Path(path).read_text(encoding='utf-8'))
+            saved['futureRoot'] = {'owner': 'fork'}
+            saved['progress']['crystal'] = 41
+            saved['pending'][0]['friendly_fire_costs'] = {
+                'credits_penalty': 3}
+            saved['pending'][0]['income'] = {'premium': True}
+            saved['pending'][0]['daily_missions'] = ['daily-1']
+            saved['pending'][0]['personal_missions'] = {'completed': [1]}
+            Path(path).write_text(json.dumps(saved), encoding='utf-8')
+
+            restarted = postbattle_store.PostBattleStore(path=path)
+            second = _receipt(restarted.account_key)
+            second['receipt_id'] = 'server:extended:2'
+            second['arena_unique_id'] += 1
+            self.assertTrue(restarted.accept(second))
+
+            updated = json.loads(Path(path).read_text(encoding='utf-8'))
+            rows = dict((row['receipt_id'], row) for row in updated['pending'])
+            preserved = rows[first['receipt_id']]
+            self.assertEqual(41, updated['progress']['crystal'])
+            self.assertEqual({'credits_penalty': 3},
+                             preserved['friendly_fire_costs'])
+            self.assertEqual({'premium': True}, preserved['income'])
+            self.assertEqual(['daily-1'], preserved['daily_missions'])
+            self.assertEqual({'completed': [1]},
+                             preserved['personal_missions'])
+            self.assertEqual({'owner': 'fork'}, updated['futureRoot'])
+
     def test_an_acknowledged_result_is_not_replayed_after_a_restart(self):
         """Only an unacknowledged receipt is persisted in full.
 

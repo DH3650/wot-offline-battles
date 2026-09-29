@@ -25,7 +25,7 @@ import time
 import uuid
 import zlib
 
-from gui.mods.offline_lan_0922.account_rpc import economy
+from gui.mods.offline_lan_0922.account_rpc import economy, save_adapter
 
 try:
     import cPickle as _pickle
@@ -916,6 +916,7 @@ class PostBattleStore(object):
         # remain readable after restart without pointing at a different crew.
         self._session_crew_xp = {}
         self._rotated = False
+        self._save_adapter = save_adapter.SaveDocumentAdapter()
         self._load()
 
     def set_progress_applier(self, callback):
@@ -1419,6 +1420,7 @@ class PostBattleStore(object):
                     if isinstance(row, dict):
                         self._update_record_extrema(row, receipt)
             self._trim_history_bodies()
+            self._save_adapter.capture(value, self._save_value())
         except (IOError, OSError, TypeError, ValueError) as error:
             # Keep a corrupt optional cache from preventing an offline login.
             return 'unreadable: %s' % error
@@ -1436,10 +1438,8 @@ class PostBattleStore(object):
                  'arena_unique_id': row['arena_unique_id']}
                 for row in self._history]
 
-    def _save(self):
-        if self._path is None:
-            return
-        value = {
+    def _save_value(self):
+        return {
             'schema': SCHEMA, 'accountKey': self._account_key,
             'pending': list(self._pending.values()),
             'pendingAwards': dict((key, self._awards[key])
@@ -1448,6 +1448,12 @@ class PostBattleStore(object):
             'history': self._archived_identities(),
             'progress': self._progress,
         }
+
+    def _save(self):
+        if self._path is None:
+            return
+        value = self._save_value()
+        write_value = self._save_adapter.merge(value)
         if not self._rotated:
             # The lifetime record is not reconstructible by playing, so keep
             # the previous file once per session before replacing it.
@@ -1456,4 +1462,5 @@ class PostBattleStore(object):
         # This file is a machine-owned cache rewritten on the terminal round
         # barrier.  Only ``_load`` reads it, so sorted and indented output
         # buys nothing and costs the embedded 2.7 runtime its C JSON encoder.
-        port_config.write_json(self._path, value, compact=True)
+        port_config.write_json(self._path, write_value, compact=True)
+        self._save_adapter.commit(write_value, value)
