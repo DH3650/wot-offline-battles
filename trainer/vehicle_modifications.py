@@ -1253,8 +1253,35 @@ class VehicleTagIndex(object):
         return tags
 
 
+def launcher_selected_profile():
+    """The vehicle profile name the launcher currently has selected, or None.
+
+    The launcher persists its profile combobox choice to ``launcher.json``.
+    Reading it here lets the trainer default to the profile the player last
+    launched with instead of always starting on ``SPG``.  The result is only a
+    name; ``default_profile`` still has to resolve it against this game root's
+    profile list.  ``None`` means the launcher is set to the stock
+    ``ORIGINAL_PROFILE_LABEL`` (unmodified data) or stores no selection.
+    """
+    try:
+        from launcher import core
+        settings = core.load_settings()
+    except Exception:
+        return None
+    selected = str(settings.get('vehicle_profile') or '').strip()
+    if not selected or selected == vehicle_overlays.ORIGINAL_PROFILE_LABEL:
+        return None
+    return selected
+
+
 def default_profile(service, game_root):
     names = service.list_vehicle_profiles(game_root)
+    selected = launcher_selected_profile()
+    if selected is not None:
+        folded = selected.casefold()
+        for name in names:
+            if name.casefold() == folded:
+                return name
     if 'SPG' in names:
         return 'SPG'
     return names[0] if names else None

@@ -6,7 +6,9 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
+from launcher import vehicle_overlays
 from trainer import vehicle_modifications as modifications
 
 
@@ -87,13 +89,14 @@ class PresetTest(unittest.TestCase):
             [change['fieldPath'] for change in plan['changes']])
         self.assertEqual('40', plan['changes'][0]['replacementValue'])
 
-    def test_default_multiplier_levels_are_one_point_five_two_three(self):
+    def test_observation_sets_fixed_vision_radius(self):
         values = []
         for level in ('1', '2', '3'):
-            rules = modifications.level_rules(
-                self.presets, 'observation', level)
-            values.append(rules[0]['value'])
-        self.assertEqual([1.5, 2, 3], values)
+            rule = modifications.level_rules(
+                self.presets, 'observation', level)[0]
+            self.assertEqual('equal', rule['operation'])
+            values.append(rule['value'])
+        self.assertEqual([480, 680, 900], values)
 
     def test_firepower_lower_is_better_levels_are_reciprocals(self):
         values = []
@@ -130,7 +133,7 @@ class PresetTest(unittest.TestCase):
         values = [modifications.level_rules(
             self.presets, 'observation', level)[0]['value']
                   for level in ('1', '2', '3')]
-        self.assertEqual([1.5, 2, 3], values)
+        self.assertEqual([480, 680, 900], values)
 
     def test_equal_uses_the_value_at_the_selected_level(self):
         presets = {'categories': {'fixed': {'rules': [{
@@ -194,12 +197,14 @@ class PresetTest(unittest.TestCase):
         self.assertTrue(all(left < right for left, right in zip(
             positions, positions[1:])))
 
-    def test_armor_fixed_levels(self):
-        self.assertEqual('multiply', modifications.level_rules(
+    def test_armor_adds_fixed_thickness_per_level(self):
+        self.assertEqual('add', modifications.level_rules(
             self.presets, 'armor', '1')[0]['operation'])
-        self.assertEqual('500', modifications.apply_operation(
+        self.assertEqual('243', modifications.apply_operation(
+            '123', modifications.level_rules(self.presets, 'armor', '1')[0]))
+        self.assertEqual('323', modifications.apply_operation(
             '123', modifications.level_rules(self.presets, 'armor', '2')[0]))
-        self.assertEqual('1000', modifications.apply_operation(
+        self.assertEqual('523', modifications.apply_operation(
             '123', modifications.level_rules(self.presets, 'armor', '3')[0]))
 
     def test_mobility_speed_adds_ten_per_level_with_caps(self):
@@ -213,11 +218,11 @@ class PresetTest(unittest.TestCase):
                        if rule['field'] == 'speedLimits/backward')
         self.assertEqual('60', modifications.apply_operation('45', reverse))
 
-    def test_track_resistance_is_truncated_to_three_decimals(self):
+    def test_track_resistance_is_truncated_to_two_decimals(self):
         rule = next(rule for rule in modifications.level_rules(
             self.presets, 'mobility', '1')
                     if rule['field'].endswith('terrainResistance'))
-        self.assertEqual('0.823 1.563 2.23', modifications.apply_operation(
+        self.assertEqual('0.74 1.4 2', modifications.apply_operation(
             '1.23456 2.34567 3.34567', rule))
 
 
@@ -272,7 +277,7 @@ class PlanAndTagTest(unittest.TestCase):
                       for change in plan['changes'])
         self.assertEqual('90', values['speedLimits/forward'])
         self.assertEqual('60', values['speedLimits/backward'])
-        self.assertEqual('0.411 0.781 1.152', values[
+        self.assertEqual('0.41 0.78 1.15', values[
             'chassis/C/terrainResistance'])
 
     def test_exact_and_custom_tags(self):
@@ -662,6 +667,53 @@ class BackupTest(unittest.TestCase):
                 'sourceMember'])
             self.assertEqual('keep', restored['profiles'][1]['members'][0][
                 'sourceMember'])
+
+
+class DefaultProfileTest(unittest.TestCase):
+
+    class Service(FakeService):
+        def __init__(self, names):
+            super(DefaultProfileTest.Service, self).__init__()
+            self.names = list(names)
+
+        def list_vehicle_profiles(self, unused_root):
+            return list(self.names)
+
+    def test_prefers_the_profile_selected_in_the_launcher(self):
+        service = self.Service(['SPG', 'France', 'Other'])
+        with mock.patch('launcher.core.load_settings',
+                        return_value={'vehicle_profile': 'France'}):
+            self.assertEqual(
+                'France', modifications.default_profile(service, 'game'))
+
+    def test_case_insensitive_match_returns_the_real_name(self):
+        service = self.Service(['SPG', 'France'])
+        with mock.patch('launcher.core.load_settings',
+                        return_value={'vehicle_profile': 'france'}):
+            self.assertEqual(
+                'France', modifications.default_profile(service, 'game'))
+
+    def test_stock_label_falls_back_to_spg(self):
+        service = self.Service(['SPG', 'France'])
+        with mock.patch(
+                'launcher.core.load_settings',
+                return_value={'vehicle_profile':
+                              vehicle_overlays.ORIGINAL_PROFILE_LABEL}):
+            self.assertEqual(
+                'SPG', modifications.default_profile(service, 'game'))
+
+    def test_missing_selection_falls_back_to_spg(self):
+        service = self.Service(['SPG', 'France'])
+        with mock.patch('launcher.core.load_settings', return_value={}):
+            self.assertEqual(
+                'SPG', modifications.default_profile(service, 'game'))
+
+    def test_stale_selection_falls_back_to_spg(self):
+        service = self.Service(['SPG'])
+        with mock.patch('launcher.core.load_settings',
+                        return_value={'vehicle_profile': 'France'}):
+            self.assertEqual(
+                'SPG', modifications.default_profile(service, 'game'))
 
 
 if __name__ == '__main__':
